@@ -1,0 +1,4 @@
+# Node-only local tests — do not push to Apps Script
+scripts/**
+.git/**
+**/.DS_Store
