@@ -22,7 +22,7 @@
  */
 
 const HOTWORD_V2 = {
-  version: '2.6.3',
+  version: '2.6.4',
 
   sheets: {
     usage: '使用说明',
@@ -161,10 +161,17 @@ const HOTWORD_V2 = {
   ],
 
   actionHeaders: [
-    '第一轮类型', '优先级', '游戏名称', 'Steam App ID', '发布阶段', 'Steam 发布日期', '距发售天数',
+    '第一轮类型', '优先级', '游戏名称', 'Trends 查询词', 'Trends 名称状态', 'Google Trends',
+    'Steam App ID', '发布阶段', 'Steam 发布日期', '距发售天数',
     'Steam Followers', 'Steam 7d Gain', '近似增长率', '评论数', 'Steam评分',
     '候选来源', '判定依据', '下一步动作', 'Steam URL'
-  ]
+  ],
+
+  /** 人工 Google Trends 研究默认环境（仅用于「今日行动」快捷链接） */
+  trendsExplore: {
+    date: 'today 3-m',
+    geo: ''
+  }
 };
 
 
@@ -294,7 +301,7 @@ function setupActionSheet_(ss) {
   if (!sheet) sheet = ss.insertSheet(HOTWORD_V2.sheets.action, 0);
 
   if (!sheet.getRange('A1').getDisplayValue()) {
-    sheet.getRange('A1:P1').merge();
+    sheet.getRange('A1:S1').merge();
     sheet.getRange('A1').setValue('今日行动：只看 1B 通过的候选；从这里开始手动做 Google Trends / Social');
   }
 
@@ -2884,6 +2891,276 @@ function buildHistoryIndex_(ss) {
 
 
 // ============================================================================
+// Google Trends 查询词（Steam 原名 → Trends OR 查询）
+// ============================================================================
+
+const TRENDS_QUERY_STATUS_ = {
+  AUTO: '✅ 自动',
+  REVIEW: '⚠️ Alias需确认'
+};
+
+/** 商店页版本后缀（整段移除，不当作游戏核心名） */
+const TRENDS_STORE_EDITION_SUFFIX_RES_ = [
+  /\s*[-–—]\s*(?:legacy|deluxe|ultimate|complete|collector'?s?|definitive|standard|gold|premium|special)\s+edition\s*$/i,
+  /\s+(?:legacy|deluxe|ultimate|complete|collector'?s?|definitive|standard|gold|premium|special)\s+edition\s*$/i
+];
+
+/** 触发人工复核的版本/重制词（可存在于原名，不一定从 Core Name 删除） */
+const TRENDS_VERSION_HINT_RE_ =
+  /\b(?:legacy|deluxe|ultimate|complete|collector'?s?|definitive|remastered|remaster|goty|game of the year)\b/i;
+
+/** 明显大型 IP / franchise：只用于保守标记复核，不激进截短 */
+const TRENDS_FRANCHISE_REVIEW_RE_ =
+  /\b(?:aliens|the lord of the rings|star wars|marvel|harry potter|pokemon|zelda|final fantasy|assassin'?s creed|call of duty|grand theft auto|warhammer|resident evil|silent hill|metal gear|mass effect|dragon age|need for speed|mortal kombat|street fighter|counter[\s-]?strike|diablo|overwatch|fortnite|minecraft|elder scrolls|fallout|borderlands|bioshock|half[\s-]?life|dead space|battlefield|halo|gears of war|god of war|horizon zero dawn|last of us|uncharted|spider[\s-]?man|batman|superman|tomb raider|hitman|far cry|watch dogs|saints row|dying light|payday|payday 2|total war|crusader kings|europa universalis|hearts of iron|football manager|fifa|nba 2k|madden|nhl|wwe|ufc|formula 1|f1)\b/i;
+
+/** 禁止单独作为 alias 的主标题 / 大型 IP（避免把影视、泛 IP 热度带入 Trends） */
+const TRENDS_FRANCHISE_MAIN_ALIAS_BLOCK_RE_ =
+  /\b(?:aliens|the lord of the rings|star wars|marvel|harry potter|pokemon|zelda|final fantasy|assassin'?s creed|call of duty|grand theft auto|warhammer|resident evil|silent hill|metal gear|mass effect|dragon age|need for speed|mortal kombat|street fighter|counter[\s-]?strike|diablo|overwatch|fortnite|minecraft|elder scrolls|fallout|borderlands|bioshock|half[\s-]?life|dead space|battlefield|halo|gears of war|god of war|horizon zero dawn|last of us|uncharted|spider[\s-]?man|batman|superman|tomb raider|hitman|far cry|watch dogs|saints row|dying light|payday|total war|crusader kings|europa universalis|hearts of iron|football manager|fifa|nba 2k|madden|nhl|wwe|ufc|formula 1|f1)\b/i;
+
+/** 冒号前主标题 alias 白名单：仅高置信、游戏特异性识别词 */
+const TRENDS_SHORT_MAIN_ALIAS_WHITELIST_RES_ = [
+  /^agent\s+\d+$/i
+];
+
+/** 已知 franchise 缩写（仅在高置信场景追加第三别名） */
+const TRENDS_FRANCHISE_ABBREV_RULES_ = [
+  {match: /^the lord of the rings\b/i, abbrev: 'LOTR'}
+];
+
+/**
+ * 由 Steam 原始游戏名生成 Google Trends OR 查询词。
+ * @param {string} gameName
+ * @return {{query: string, status: string}}
+ */
+function buildTrendsQuery_(gameName) {
+  const raw = String(gameName || '').trim();
+  if (!raw) return {query: '', status: TRENDS_QUERY_STATUS_.AUTO};
+
+  let working = stripTrendsNoise_(raw);
+  const hadVersionHint = TRENDS_VERSION_HINT_RE_.test(raw);
+
+  TRENDS_STORE_EDITION_SUFFIX_RES_.forEach(re => {
+    working = working.replace(re, '').trim();
+  });
+
+  working = working.replace(/\s*[-–—]\s*$/, '').trim();
+
+  const aliasCandidates = [];
+  let coreName = cleanTrendsDisplayName_(working);
+  let needsReview = hadVersionHint || TRENDS_FRANCHISE_REVIEW_RE_.test(raw);
+
+  const colonIdx = working.indexOf(':');
+  if (colonIdx > 0 && colonIdx < working.length - 1) {
+    const mainPart = working.slice(0, colonIdx).trim();
+    const subtitlePart = working.slice(colonIdx + 1).trim();
+    const mainClean = cleanTrendsDisplayName_(mainPart);
+    const subClean = cleanTrendsDisplayName_(subtitlePart);
+    coreName = cleanTrendsDisplayName_(mainClean + ' ' + subClean);
+
+    const mainAliasBlocked = isTrendsMainTitleAliasBlocked_(mainClean, mainPart);
+    const hasFranchiseAbbrevRule = TRENDS_FRANCHISE_ABBREV_RULES_.some(rule => rule.match.test(mainPart));
+
+    if (mainAliasBlocked) needsReview = true;
+
+    TRENDS_FRANCHISE_ABBREV_RULES_.forEach(rule => {
+      if (rule.match.test(mainPart) && subClean) {
+        aliasCandidates.push({
+          text: rule.abbrev + ' ' + subClean,
+          kind: 'franchise',
+          priority: 3
+        });
+        needsReview = true;
+      }
+    });
+
+    if (!mainAliasBlocked && isReasonableTrendsShortMainAlias_(mainClean, coreName, mainPart)) {
+      aliasCandidates.push({text: mainClean, kind: 'shortMain', priority: 2});
+    } else if ((!mainAliasBlocked || hasFranchiseAbbrevRule) && isReasonableTrendsSubtitleAlias_(subClean, coreName)) {
+      aliasCandidates.push({text: subClean, kind: 'subtitle', priority: 2});
+    } else if (mainAliasBlocked && !hasFranchiseAbbrevRule) {
+      needsReview = true;
+    }
+  }
+
+  if (!coreName) coreName = cleanTrendsDisplayName_(raw);
+  if (coreName.length > 42 || raw.length > 48) needsReview = true;
+
+  const terms = [coreName];
+  aliasCandidates
+    .sort((a, b) => a.priority - b.priority)
+    .forEach(item => {
+      if (terms.length >= 3) return;
+      const text = String(item.text || '').trim();
+      if (!text) return;
+      const key = normalizeTrendsTermKey_(text);
+      if (terms.some(t => normalizeTrendsTermKey_(t) === key)) return;
+      terms.push(text);
+    });
+
+  if (terms.length >= 3) needsReview = true;
+
+  return {
+    query: terms.join(' + '),
+    status: needsReview ? TRENDS_QUERY_STATUS_.REVIEW : TRENDS_QUERY_STATUS_.AUTO
+  };
+}
+
+/**
+ * 清理 Trends 展示用词：保留字母数字与空格，去掉搜索无意义标点。
+ * @param {string} text
+ * @return {string}
+ */
+function stripTrendsNoise_(text) {
+  return String(text || '')
+    .replace(/[™®©]/g, '')
+    .replace(/[\p{Extended_Pictographic}\uFE0F]/gu, '')
+    .replace(/[''\u2019]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function cleanTrendsDisplayName_(text) {
+  return stripTrendsNoise_(text)
+    .replace(/[\u2010-\u2015]/g, ' ')
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * 主标题是否禁止生成 alias（单词级默认禁止；大型 IP 禁止单独 alias）。
+ * @param {string} mainClean
+ * @param {string} mainPart
+ * @return {boolean}
+ */
+function isTrendsMainTitleAliasBlocked_(mainClean, mainPart) {
+  const words = String(mainClean || '').split(/\s+/).filter(Boolean);
+  if (!words.length) return true;
+  if (words.length === 1) return true;
+
+  const probe = String(mainPart || mainClean || '');
+  if (TRENDS_FRANCHISE_MAIN_ALIAS_BLOCK_RE_.test(probe)) return true;
+  if (TRENDS_FRANCHISE_MAIN_ALIAS_BLOCK_RE_.test(mainClean)) return true;
+  return false;
+}
+
+/**
+ * 主标题 alias 是否命中白名单（如 Agent 64）。
+ * @param {string} mainClean
+ * @return {boolean}
+ */
+function isTrendsShortMainAliasWhitelisted_(mainClean) {
+  return TRENDS_SHORT_MAIN_ALIAS_WHITELIST_RES_.some(re => re.test(String(mainClean || '').trim()));
+}
+
+/**
+ * @param {string} text
+ * @return {string}
+ */
+function normalizeTrendsTermKey_(text) {
+  return String(text || '')
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, '');
+}
+
+/**
+ * 主标题简称：仅当冒号前较短且能作为 Core Name 前缀时采用。
+ * @param {string} mainClean
+ * @param {string} coreName
+ * @return {boolean}
+ */
+function isReasonableTrendsShortMainAlias_(mainClean, coreName, mainPart) {
+  if (!mainClean || !coreName || mainClean === coreName) return false;
+
+  const words = mainClean.split(/\s+/).filter(Boolean);
+  if (!words.length || words.length > 2) return false;
+  if (mainClean.length < 2 || mainClean.length > 18) return false;
+
+  if (words.length === 1) {
+    if (!isTrendsShortMainAliasWhitelisted_(mainClean)) return false;
+  } else if (isTrendsMainTitleAliasBlocked_(mainClean, mainPart)) {
+    if (!isTrendsShortMainAliasWhitelisted_(mainClean)) return false;
+  }
+
+  const coreKey = normalizeTrendsTermKey_(coreName);
+  const mainKey = normalizeTrendsTermKey_(mainClean);
+  return coreKey.indexOf(mainKey) === 0;
+}
+
+/**
+ * 副标题 alias：仅当主标题不够短、且副标题在 Core Name 中足够明确时采用。
+ * @param {string} subClean
+ * @param {string} coreName
+ * @return {boolean}
+ */
+function isReasonableTrendsSubtitleAlias_(subClean, coreName) {
+  if (!subClean || !coreName || subClean === coreName) return false;
+  if (subClean.length < 8) return false;
+  if (subClean.split(/\s+/).length < 2) return false;
+  const coreKey = normalizeTrendsTermKey_(coreName);
+  const subKey = normalizeTrendsTermKey_(subClean);
+  return coreKey.indexOf(subKey) >= 0;
+}
+
+/**
+ * 生成 Google Trends Explore 链接；保留 ` + ` OR 语义，仅对每段别名做 URL encode。
+ * @param {string} query
+ * @return {string}
+ */
+function buildGoogleTrendsExploreUrl_(query) {
+  const q = String(query || '').trim();
+  if (!q) return '';
+
+  const parts = q.split(/\s+\+\s+/).map(p => p.trim()).filter(Boolean);
+  const encodedQuery = parts.map(p => encodeURIComponent(p)).join('%20%2B%20');
+
+  const params = ['q=' + encodedQuery];
+  if (HOTWORD_V2.trendsExplore.date) {
+    params.push('date=' + encodeURIComponent(HOTWORD_V2.trendsExplore.date));
+  }
+  if (HOTWORD_V2.trendsExplore.geo !== undefined && HOTWORD_V2.trendsExplore.geo !== null) {
+    params.push('geo=' + encodeURIComponent(HOTWORD_V2.trendsExplore.geo));
+  }
+
+  return 'https://trends.google.com/trends/explore?' + params.join('&');
+}
+
+/**
+ * @param {Object} rec
+ * @return {Array<*>}
+ */
+function actionRow_(rec) {
+  const trends = buildTrendsQuery_(rec.name);
+  const trendsUrl = buildGoogleTrendsExploreUrl_(trends.query);
+  const trendsLink = trendsUrl
+    ? '=HYPERLINK("' + trendsUrl.replace(/"/g, '""') + '","打开 Trends")'
+    : '';
+
+  return [
+    rec.firstRoundType,
+    rec.priority,
+    rec.name,
+    trends.query,
+    trends.status,
+    trendsLink,
+    rec.appId,
+    rec.releaseStage,
+    rec.releaseDate || '',
+    rec.daysToRelease,
+    rec.followers,
+    rec.gain7d,
+    rec.growthRate,
+    rec.reviews,
+    rec.rating,
+    rec.source,
+    rec.firstRoundReason,
+    rec.nextAction,
+    rec.url
+  ];
+}
+
+
+// ============================================================================
 // 输出到 Sheet
 // ============================================================================
 
@@ -3026,25 +3303,7 @@ function refreshTodayAction_(ss, actions, runTime, runId, counts) {
   sheet.getRange(3, 1, 1, HOTWORD_V2.actionHeaders.length).setValues([HOTWORD_V2.actionHeaders]);
 
   if (actions.length) {
-    const rows = actions.map(rec => [
-      rec.firstRoundType,
-      rec.priority,
-      rec.name,
-      rec.appId,
-      rec.releaseStage,
-      rec.releaseDate || '',
-      rec.daysToRelease,
-      rec.followers,
-      rec.gain7d,
-      rec.growthRate,
-      rec.reviews,
-      rec.rating,
-      rec.source,
-      rec.firstRoundReason,
-      rec.nextAction,
-      rec.url
-    ]);
-
+    const rows = actions.map(rec => actionRow_(rec));
     sheet.getRange(4, 1, rows.length, HOTWORD_V2.actionHeaders.length).setValues(rows);
   }
 
@@ -3195,13 +3454,13 @@ function applyActionFormatting_(sheet, dataRows) {
   // 今日行动只冻结前三行，不冻结列，避免主流程在最后格式化阶段被误记为 FAILED。
   sheet.setFrozenColumns(0);
 
-  sheet.getRange('A1:P1')
+  sheet.getRange('A1:S1')
     .setBackground('#0F766E')
     .setFontColor('#FFFFFF')
     .setFontWeight('bold')
     .setHorizontalAlignment('left');
 
-  sheet.getRange('A3:P3')
+  sheet.getRange('A3:S3')
     .setBackground('#1F4E78')
     .setFontColor('#FFFFFF')
     .setFontWeight('bold')
@@ -3209,9 +3468,9 @@ function applyActionFormatting_(sheet, dataRows) {
 
   sheet.getRange('D2:D2').setNumberFormat('yyyy-mm-dd hh:mm:ss');
   if (dataRows > 0) {
-    sheet.getRange(4, 6, dataRows, 1).setNumberFormat('yyyy-mm-dd');
-    sheet.getRange(4, 10, dataRows, 1).setNumberFormat('0.0%');
-    sheet.getRange(4, 12, dataRows, 1).setNumberFormat('0.0%');
+    sheet.getRange(4, 9, dataRows, 1).setNumberFormat('yyyy-mm-dd');
+    sheet.getRange(4, 13, dataRows, 1).setNumberFormat('0.0%');
+    sheet.getRange(4, 15, dataRows, 1).setNumberFormat('0.0%');
 
     const typeRange = sheet.getRange(4, 1, dataRows, 1);
     const types = typeRange.getDisplayValues();
@@ -3223,7 +3482,7 @@ function applyActionFormatting_(sheet, dataRows) {
     });
   }
 
-  const widths = [18, 12, 34, 14, 14, 15, 12, 16, 15, 14, 12, 12, 28, 55, 34, 48];
+  const widths = [18, 12, 34, 52, 16, 14, 14, 14, 15, 12, 16, 15, 14, 12, 12, 28, 55, 34, 48];
   widths.forEach((w, i) => sheet.setColumnWidth(i + 1, Math.min(420, w * 8)));
 }
 
