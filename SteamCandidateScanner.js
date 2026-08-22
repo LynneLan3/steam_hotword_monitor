@@ -28,6 +28,7 @@ const HOTWORD_V2 = {
     usage: '使用说明',
     metrics: '指标说明',
     action: '今日行动',
+    decisions: '候选决策',
     master: '候选主表',
     keywordPlan: '建站关键词规划',
     snapshot: 'Steam_每日快照',
@@ -35,7 +36,9 @@ const HOTWORD_V2 = {
     backtest: '1B规则回测',
     anomalies: '数据异常',
     log: '运行日志_V2',
-    history: '历史游戏库'
+    history: '历史游戏库',
+    sitePool: '站点项目池',
+    gscBinding: '项目GSC关联'
   },
 
   /**
@@ -52,17 +55,20 @@ const HOTWORD_V2 = {
    * 旧 V1 Tab 放在后面，再隐藏。
    */
   sheetUiOrder: [
+    '今日行动',
+    '站点项目池',
+    '项目GSC关联',
+    '候选决策',
+    '候选主表',
+    'Steam_每日快照',
+    '历史游戏库',
     '使用说明',
     '指标说明',
-    '今日行动',
-    '候选主表',
     '建站关键词规划',
     '规则配置',
     '1B规则回测',
-    'Steam_每日快照',
     '数据异常',
     '运行日志_V2',
-    '历史游戏库',
     '概览',
     'Steam_候选池',
     'Steam_抓取日志',
@@ -161,16 +167,32 @@ const HOTWORD_V2 = {
   ],
 
   actionHeaders: [
-    '第一轮类型', '优先级', '游戏名称', 'Trends 查询词', 'Trends 名称状态', 'Google Trends',
-    'Steam App ID', '发布阶段', 'Steam 发布日期', '距发售天数',
-    'Steam Followers', 'Steam 7d Gain', '近似增长率', '评论数', 'Steam评分',
-    '候选来源', '判定依据', '下一步动作', 'Steam URL'
+    '行动类型', '优先级', '游戏名称', 'Steam App ID', '第一轮类型',
+    'Steam Followers', 'Steam 7d Gain', '近似增长率',
+    '发布阶段', 'Steam发布日期', '距发售天数', '评论数', 'Steam评分',
+    'Google Trends链接', 'Trends结果', 'Social结果', 'SERP竞争', '关键词机会', 'Decision', '人工备注',
+    '当前阶段', '研究状态', '研究完成度', '人工动作', '触发原因', '上次人工检查日',
+    'Steam URL', '判定依据'
   ],
+
+  decisionHeaders: [
+    'Steam App ID', '游戏名称', '决策状态', '上次人工检查日', '上次检查7d Gain',
+    '上次检查类型', '下次复查日', '决策备注', '上次检查时决策状态',
+    '首次发现日期', '首次来源', '第一轮类型', '当前Steam阶段', '研究状态',
+    'Google Trends结果', 'Social结果', 'SERP竞争', '关键词机会', '人工备注',
+    'Decision', 'Decision日期', 'Next Action'
+  ],
+
+  sitePoolHeaders: ['Site ID', '游戏名称', 'Steam App ID', '当前状态', 'BUILD日期', 'Build状态', 'Repo URL', 'Vercel URL', '上线日期', '模板版本', 'GSC状态', 'GSC Site', 'GSC URL Prefix', 'GSC Last Sync', 'SEO阶段', 'Index状态', '首次曝光日期', 'Clicks', 'Impressions', 'CTR', 'Average Position'],
+  gscBindingHeaders: ['Site ID', '游戏名称', 'Steam App ID', '网站URL', 'GSC Property', 'GSC状态', '首次同步日期', '最近同步日期'],
+  /** Phase 4.4：独立 GSC 监控 Spreadsheet，只读。 */
+  GSC_SOURCE_SPREADSHEET_ID: '15GJGvPnJlXTSbO4aM_Yxvf0GxCgXrmZr0M5b9uZGIJU',
+  GSC_SOURCE_SHEET_NAME: '每日快照',
 
   /** 人工 Google Trends 研究默认环境（仅用于「今日行动」快捷链接） */
   trendsExplore: {
-    date: 'today 3-m',
-    geo: ''
+    date: 'today 1-m',
+    geo: 'US'
   }
 };
 
@@ -225,6 +247,13 @@ function setupSteamHotwordV2() {
   ensureSheetWithHeaders_(ss, HOTWORD_V2.sheets.anomalies, HOTWORD_V2.anomalyHeaders);
   ensureSheetWithHeaders_(ss, HOTWORD_V2.sheets.log, HOTWORD_V2.logHeaders);
   ensureSheetWithHeaders_(ss, HOTWORD_V2.sheets.history, ['Steam App ID', '游戏名称', 'Steam URL', '当前阶段', '备注']);
+  ensureSheetWithHeaders_(ss, HOTWORD_V2.sheets.decisions, HOTWORD_V2.decisionHeaders);
+  ensureSitePoolSchema_(ss);
+  setupSitePoolUi_(ss);
+  ensureSheetWithHeaders_(ss, HOTWORD_V2.sheets.gscBinding, HOTWORD_V2.gscBindingHeaders);
+  setupGscBindingUi_(ss);
+  setupCandidateDecisionUi_(ss);
+  setupCandidateDecisionBackendView_(ss);
 
   setupRulesSheet_(ss);
   setupActionSheet_(ss);
@@ -277,6 +306,9 @@ function setupRulesSheet_(ss) {
     ['CONTROL_MAX_PER_RUN', 3, '个', '每轮最多保留多少大盘对照', '历史逻辑：只保留少量样本'],
 
     ['FOLLOWER_HISTORY_MIN_DAYS', 5, '天', '至少需要多少天Followers历史才做1B', '防止把1–2天增长误当7d Gain'],
+    ['RECHECK_GAIN_GROWTH_MIN', 0.30, '比例', 'WATCH候选重新进入今日行动所需的7d Gain增长', '候选人工复查 V1'],
+    ['WATCH_RECHECK_DAYS_STRONG', 3, '天', '强信号 WATCH 的默认复查间隔', '候选人工复查 V1'],
+    ['WATCH_RECHECK_DAYS_NORMAL', 7, '天', '普通 WATCH 的默认复查间隔', '候选人工复查 V1'],
     ['DISCOVERY_PAGES', 1, '页/来源', '每个Steam来源抓取页数', '当前每页约50条，V2默认1页'],
     ['DAILY_HOUR', 8, '小时', '自动触发器运行小时', '表格/脚本时区下08:00–09:00窗口']
   ];
@@ -300,12 +332,101 @@ function setupActionSheet_(ss) {
   let sheet = ss.getSheetByName(HOTWORD_V2.sheets.action);
   if (!sheet) sheet = ss.insertSheet(HOTWORD_V2.sheets.action, 0);
 
+  sheet.getRange(1, 1, 1, sheet.getMaxColumns()).breakApart();
   if (!sheet.getRange('A1').getDisplayValue()) {
-    sheet.getRange('A1:S1').merge();
-    sheet.getRange('A1').setValue('今日行动：只看 1B 通过的候选；从这里开始手动做 Google Trends / Social');
+    sheet.getRange('A1').setValue('今日行动：只看首次或需要复查的 1B 候选；从这里开始手动做 Google Trends / Social');
   }
-
   sheet.getRange(3, 1, 1, HOTWORD_V2.actionHeaders.length).setValues([HOTWORD_V2.actionHeaders]);
+  const oldLastColumn = sheet.getLastColumn();
+  if (oldLastColumn > HOTWORD_V2.actionHeaders.length) {
+    sheet.getRange(1, HOTWORD_V2.actionHeaders.length + 1, sheet.getMaxRows(), oldLastColumn - HOTWORD_V2.actionHeaders.length).clearContent();
+  }
+  setupTodayActionUi_(ss);
+}
+
+function setupTodayActionUi_(ss) {
+  const sheet = ss.getSheetByName(HOTWORD_V2.sheets.action);
+  if (!sheet) return;
+  const headers = sheet.getRange(3, 1, 1, HOTWORD_V2.actionHeaders.length).getDisplayValues()[0];
+  const col = name => headers.indexOf(name) + 1;
+  const actionCol = col('行动类型');
+  const decisionCol = col('Decision');
+  // V3.3 列重排迁移：旧列（例如 W 列）的验证规则不能继续作用于新列。
+  // 先清空今日行动数据区的全部验证，再按当前表头重新绑定人工字段。
+  sheet.getRange(4, 1, Math.max(sheet.getMaxRows() - 3, 1), sheet.getMaxColumns()).clearDataValidations();
+  const editableOptions = {
+    'Trends结果': ['强', '中', '弱', '无', '未检查'],
+    'Social结果': ['强', '中', '弱', '无', '未检查'],
+    'SERP竞争': ['低', '中', '高', '未检查'],
+    '关键词机会': ['有', '无', '未检查'],
+    'Decision': ['BUILD', 'WATCH', 'REJECT']
+  };
+  Object.keys(editableOptions).forEach(name => {
+    const c = col(name);
+    if (c > 0) sheet.getRange(4, c, Math.max(sheet.getMaxRows() - 3, 1), 1)
+      .setDataValidation(SpreadsheetApp.newDataValidation().requireValueInList(editableOptions[name], true).setAllowInvalid(false).build())
+      .setBackground('#FFF2CC');
+  });
+  const noteCol = col('人工备注');
+  if (noteCol > 0) sheet.getRange(4, noteCol, Math.max(sheet.getMaxRows() - 3, 1), 1).setBackground('#FFF2CC');
+  const rangeFor = c => sheet.getRange(4, c, Math.max(sheet.getMaxRows() - 3, 1), 1);
+  let rules = sheet.getConditionalFormatRules();
+  const removeColumns = [actionCol, decisionCol];
+  rules = rules.filter(rule => !rule.getRanges().some(r =>
+    r.getSheet().getSheetId() === sheet.getSheetId() &&
+    (removeColumns.indexOf(r.getColumn()) >= 0 || r.getColumn() > HOTWORD_V2.actionHeaders.length)
+  ));
+  if (actionCol > 0) {
+    const actionRange = rangeFor(actionCol);
+    ['NEW', 'RESEARCHING', 'RECHECK_DUE', 'GAIN_GROWTH'].forEach(value => {
+      rules.push(SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo(value).setBackground('#FFF2CC').setRanges([actionRange]).build());
+    });
+  }
+  if (decisionCol > 0) {
+    const decisionRange = rangeFor(decisionCol);
+    rules.push(SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('BUILD').setBackground('#D9EAD3').setRanges([decisionRange]).build());
+    rules.push(SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('WATCH').setBackground('#CFE2F3').setRanges([decisionRange]).build());
+    rules.push(SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('REJECT').setBackground('#D9D9D9').setRanges([decisionRange]).build());
+  }
+  sheet.setConditionalFormatRules(rules);
+}
+
+function setupCandidateDecisionUi_(ss) {
+  const sheet = ss.getSheetByName(HOTWORD_V2.sheets.decisions);
+  if (!sheet) return;
+  const headers = sheet.getRange(1, 1, 1, Math.max(sheet.getLastColumn(), HOTWORD_V2.decisionHeaders.length)).getDisplayValues()[0];
+  const column = name => headers.indexOf(name) + 1;
+  const validation = (name, values) => {
+    const col = column(name);
+    if (col > 0) sheet.getRange(2, col, Math.max(sheet.getMaxRows() - 1, 1), 1)
+      .setDataValidation(SpreadsheetApp.newDataValidation().requireValueInList(values, true).setAllowInvalid(false).build());
+  };
+  validation('研究状态', ['待研究', '研究中', '已完成']);
+  validation('Google Trends结果', ['强', '中', '弱', '无', '未检查']);
+  validation('Social结果', ['强', '中', '弱', '无', '未检查']);
+  validation('SERP竞争', ['低', '中', '高', '未检查']);
+  validation('关键词机会', ['有', '无', '未检查']);
+  validation('Decision', ['BUILD', 'WATCH', 'REJECT']);
+  validation('Next Action', ['Google Trends', 'Social验证', 'SERP检查', 'Keyword Research', 'Site Build', 'Recheck', 'None']);
+
+  const decisionCol = column('Decision');
+  if (decisionCol > 0) {
+    const range = sheet.getRange(2, decisionCol, Math.max(sheet.getMaxRows() - 1, 1), 1);
+    const rules = sheet.getConditionalFormatRules().filter(rule =>
+      !rule.getRanges().some(r => r.getColumn() === decisionCol && r.getSheet().getSheetId() === sheet.getSheetId())
+    );
+    rules.push(SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('BUILD').setBackground('#D9EAD3').setRanges([range]).build());
+    rules.push(SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('WATCH').setBackground('#CFE2F3').setRanges([range]).build());
+    rules.push(SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('REJECT').setBackground('#D9D9D9').setRanges([range]).build());
+    sheet.setConditionalFormatRules(rules);
+  }
+}
+
+function setupCandidateDecisionBackendView_(ss) {
+  const sheet = ss.getSheetByName(HOTWORD_V2.sheets.decisions);
+  if (!sheet) return;
+  // 保留完整后台字段与历史数据，仅隐藏重复的系统展示列。
+  [3, 8, 9, 10, 11, 12, 13, 14].forEach(col => sheet.hideColumns(col));
 }
 
 function setupBacktestSheet_(ss) {
@@ -370,6 +491,9 @@ function getUsageGuideLines_() {
     '',
     '—— 各 Sheet 职责 ——',
     '今日行动：每天主要入口。这里只有值得进入第二轮验证的候选。进入今日行动 ≠ 一定建站。',
+    '候选决策：后台自动同步数据库，以 Steam App ID 唯一标识；日常无需打开或人工编辑。',
+    '每天操作：1.只打开今日行动；2.点击 Google Trends 链接；3.在同一行选择 Trends、Social、SERP、Keyword 结果；4.最后选择 BUILD / WATCH / REJECT；5.必要时写一句人工备注。其余字段自动记录。',
+    '今日行动复查规则：无人工记录的1B候选标记 NEW；WATCH 仅在到期或当前7d Gain较上次检查增长至少30%时出现；BUILD / REJECT 不再出现。',
     '指标说明：数据字典。查字段来源、公式、是否实验规则；不是每日操作入口。',
     '候选主表：系统当前所有候选及自动计算结果。用来回答“为什么推荐 / 为什么过滤”，不是每天逐行浏览的工作表。',
     '建站关键词规划：只有人工二次验证确认值得 BUILD 或重点 WATCH 后才进入。把游戏机会 → 搜索意图 → 页面结构 → URL / Page Type。不是候选发现入口。',
@@ -1179,8 +1303,16 @@ function runSteamHotword01B() {
     upsertMaster_(ss, active, startedAt, runId);
     appendSnapshots_(ss, active, startedAt, runId);
 
+    const decisions = syncCandidateDecisions_(ss, active, startedAt, rules);
     const actions = active
-      .filter(rec => rec.continueNext === '是')
+      .map(rec => {
+        const decision = decisions.get(String(rec.appId));
+        rec.todayAction = decideTodayAction_(rec, decision, startedAt, rules);
+        rec.todayAction.decision = decision;
+        rec.todayAction.lastCheckedDate = decision && decision.lastCheckedDate;
+        return rec;
+      })
+      .filter(rec => rec.todayAction.include)
       .sort(compareActions_);
 
     actionCount = actions.length;
@@ -3125,6 +3257,773 @@ function buildGoogleTrendsExploreUrl_(query) {
   return 'https://trends.google.com/trends/explore?' + params.join('&');
 }
 
+function normalizeDecisionStatus_(value) {
+  const status = String(value || '').trim().toUpperCase();
+  return ['WATCH', 'BUILD', 'REJECT'].indexOf(status) >= 0 ? status : '';
+}
+
+function isStrongWatchType_(type) {
+  return type === '🔥 趋势候选' || type === '🌱 Early候选';
+}
+
+function addDays_(date, days) {
+  const out = new Date(date.getTime());
+  out.setDate(out.getDate() + Number(days || 0));
+  return out;
+}
+
+function dateAtStart_(value) {
+  if (!value) return null;
+  const date = value instanceof Date ? new Date(value.getTime()) : new Date(value);
+  if (isNaN(date.getTime())) return null;
+  date.setHours(0, 0, 0, 0);
+  return date;
+}
+
+function decideTodayAction_(rec, decision, today, rules) {
+  if (rec.continueNext !== '是') return {include: false};
+  const status = normalizeDecisionStatus_(decision && decision.status);
+  if (!status) {
+    if (decision && (decision.researchStatus === '研究中' || decision.researchStatus === '已完成')) {
+      return {include: true, type: 'RESEARCHING', reason: decision.researchStatus === '已完成' ? '已完成研究但尚未填写最终Decision' : '人工研究尚未完成', humanAction: deriveHumanAction_(rec, decision, false)};
+    }
+    return {include: true, type: 'NEW', reason: '首次进入1B，尚无人工复查记录', humanAction: '检查 Google Trends'};
+  }
+  if (status === 'BUILD' || status === 'REJECT') return {include: false};
+
+  const todayStart = dateAtStart_(today) || dateAtStart_(new Date());
+  const due = dateAtStart_(decision.nextRecheckDate);
+  if (due && due.getTime() <= todayStart.getTime()) {
+    return {include: true, type: 'RECHECK_DUE', reason: 'WATCH已到下次复查日', humanAction: '重新验证趋势变化'};
+  }
+
+  const hasPreviousGain = decision.lastGain !== '' && decision.lastGain !== null && decision.lastGain !== undefined;
+  const previousGain = Number(decision.lastGain);
+  const currentGain = Number(rec.gain7d);
+  const minGrowth = Number(rules.RECHECK_GAIN_GROWTH_MIN);
+  const gainGrowth = previousGain === 0
+    ? currentGain > 0
+    : currentGain >= previousGain * (1 + minGrowth);
+  if (hasPreviousGain && previousGain >= 0 && isFiniteNumber_(previousGain) && isFiniteNumber_(currentGain) && gainGrowth) {
+    return {include: true, type: 'GAIN_GROWTH', reason: '当前7d Gain较上次检查增长≥' + Math.round(minGrowth * 100) + '%', humanAction: '重新验证趋势变化'};
+  }
+  return {include: false};
+}
+
+function isUnfinishedResearchValue_(value) {
+  const text = String(value || '').trim();
+  return !text || text === '未检查';
+}
+
+function deriveResearchStatus_(decision) {
+  const status = normalizeDecisionStatus_(decision && decision.status);
+  if (status) return '已完成';
+  const fields = [decision && decision.trendsResult, decision && decision.socialResult, decision && decision.serpCompetition, decision && decision.keywordOpportunity];
+  return fields.every(isUnfinishedResearchValue_) ? '待研究' : '研究中';
+}
+
+function deriveResearchCompletion_(decision) {
+  const status = deriveResearchStatus_(decision);
+  return status === '已完成' ? '已完成' : status === '研究中' ? '进行中' : '未开始';
+}
+
+function deriveHumanAction_(rec, decision, isWatchRecheck) {
+  if (isWatchRecheck) return '重新验证趋势变化';
+  if (isUnfinishedResearchValue_(decision && decision.trendsResult)) return '检查 Google Trends';
+  if ((rec.firstRoundType === '🌱 Early候选') && ['弱', '无'].indexOf(String(decision.trendsResult || '')) >= 0 && isUnfinishedResearchValue_(decision.socialResult)) return '检查 Social';
+  if (isUnfinishedResearchValue_(decision.serpCompetition)) return '检查 SERP';
+  if (isUnfinishedResearchValue_(decision.keywordOpportunity)) return '检查关键词';
+  return '继续验证';
+}
+
+function findMasterRecord_(ss, appId) {
+  const sheet = ss.getSheetByName(HOTWORD_V2.sheets.master);
+  if (!sheet || sheet.getLastRow() < 2) return null;
+  const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, HOTWORD_V2.masterHeaders.length).getValues();
+  return rows.find(row => String(row[1] || '').trim() === String(appId).trim()) || null;
+}
+
+function siteIdFromGameName_(name) {
+  return String(name || '').toLowerCase().normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '').replace(/-+/g, '-') || 'steam-candidate';
+}
+
+function upsertSitePoolRecord_(ss, gameName, appId, buildDate) {
+  const sheet = ensureSitePoolSchema_(ss);
+  const siteId = siteIdFromGameName_(gameName);
+  const values = sheet.getLastRow() < 2 ? [] : sheet.getRange(2, 1, sheet.getLastRow() - 1, HOTWORD_V2.sitePoolHeaders.length).getValues();
+  const index = values.findIndex(row => String(row[0] || '').trim() === siteId || String(row[2] || '').trim() === String(appId).trim());
+  if (index >= 0) {
+    const existing = values[index];
+    const row = [existing[0] || siteId, existing[1] || gameName, existing[2] || String(appId), existing[3] || 'BUILD_PENDING', existing[4] || buildDate,
+      existing[5] || 'BUILD_PENDING', existing[6] || '', existing[7] || '', existing[8] || '', existing[9] || '', existing[10] || 'NOT_CONNECTED',
+      existing[11] || '', existing[12] || '', existing[13] || '', existing[14] || 'WAITING_INDEX', existing[15] || 'UNKNOWN', existing[16] || '',
+      existing[17] || '', existing[18] || '', existing[19] || '', existing[20] || ''];
+    sheet.getRange(index + 2, 1, 1, row.length).setValues([row]);
+    upsertGscBindingRecord_(ss, row[0], row[1], row[2], row[7]);
+    return row;
+  }
+  const row = [siteId, gameName, String(appId), 'BUILD_PENDING', buildDate, 'BUILD_PENDING', '', '', '', '', 'NOT_CONNECTED', '', '', '', 'WAITING_INDEX', 'UNKNOWN', '', '', '', '', ''];
+  sheet.getRange(sheet.getLastRow() + 1, 1, 1, row.length).setValues([row]);
+  upsertGscBindingRecord_(ss, row[0], row[1], row[2], row[7]);
+  return row;
+}
+
+function upsertGscBindingRecord_(ss, siteId, gameName, appId, websiteUrl) {
+  const sheet = ensureSheetWithHeaders_(ss, HOTWORD_V2.sheets.gscBinding, HOTWORD_V2.gscBindingHeaders);
+  const values = sheet.getLastRow() < 2 ? [] : sheet.getRange(2, 1, sheet.getLastRow() - 1, HOTWORD_V2.gscBindingHeaders.length).getValues();
+  const index = values.findIndex(row => String(row[0] || '').trim() === String(siteId || '').trim());
+  if (index >= 0) {
+    const existing = values[index];
+    const row = [existing[0] || siteId, existing[1] || gameName, existing[2] || String(appId), existing[3] || websiteUrl || '',
+      existing[4] || '', existing[5] || 'NOT_CONNECTED', existing[6] || '', existing[7] || ''];
+    sheet.getRange(index + 2, 1, 1, row.length).setValues([row]);
+    return row;
+  }
+  const row = [siteId, gameName, String(appId), websiteUrl || '', '', 'NOT_CONNECTED', '', ''];
+  sheet.getRange(sheet.getLastRow() + 1, 1, 1, row.length).setValues([row]);
+  return row;
+}
+
+/**
+ * 为历史站点项目补建缺失的「项目GSC关联」记录。
+ * 只从「站点项目池」读取项目身份与 Vercel URL，不修改项目池，也不读取或写入 GSC 源表。
+ * @return {{created:number, skipped:number, missingWebsiteUrl:number}}
+ */
+function backfillProjectGscBindings() {
+  const emptyResult = {created: 0, skipped: 0, missingWebsiteUrl: 0};
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const poolSheet = ss && ss.getSheetByName(HOTWORD_V2.sheets.sitePool);
+  if (!poolSheet || poolSheet.getLastRow() < 2) return emptyResult;
+
+  const bindingSheet = ensureSheetWithHeaders_(ss, HOTWORD_V2.sheets.gscBinding, HOTWORD_V2.gscBindingHeaders);
+  const poolHeaders = poolSheet.getRange(1, 1, 1, Math.max(poolSheet.getLastColumn(), HOTWORD_V2.sitePoolHeaders.length)).getDisplayValues()[0];
+  const bindingHeaders = bindingSheet.getRange(1, 1, 1, Math.max(bindingSheet.getLastColumn(), HOTWORD_V2.gscBindingHeaders.length)).getDisplayValues()[0];
+  const poolColumn = name => poolHeaders.indexOf(name);
+  const bindingColumn = name => bindingHeaders.indexOf(name);
+  const requiredPoolColumns = ['Site ID', '游戏名称', 'Steam App ID', 'Vercel URL'];
+  const requiredBindingColumns = ['Site ID', '游戏名称', 'Steam App ID', '网站URL', 'GSC Property', 'GSC状态', '首次同步日期', '最近同步日期'];
+  if (requiredPoolColumns.some(name => poolColumn(name) < 0) || requiredBindingColumns.some(name => bindingColumn(name) < 0)) {
+    return emptyResult;
+  }
+
+  const existingSiteIds = new Set();
+  if (bindingSheet.getLastRow() >= 2) {
+    bindingSheet.getRange(2, 1, bindingSheet.getLastRow() - 1, bindingHeaders.length).getValues().forEach(row => {
+      const siteId = String(row[bindingColumn('Site ID')] || '').trim();
+      if (siteId) existingSiteIds.add(siteId);
+    });
+  }
+
+  const rowsToAppend = [];
+  const result = emptyResult;
+  const seenPoolSiteIds = new Set();
+  const poolRows = poolSheet.getRange(2, 1, poolSheet.getLastRow() - 1, poolHeaders.length).getValues();
+  poolRows.forEach(poolRow => {
+    const siteId = String(poolRow[poolColumn('Site ID')] || '').trim();
+    if (!siteId || seenPoolSiteIds.has(siteId)) return;
+    seenPoolSiteIds.add(siteId);
+    const websiteUrl = String(poolRow[poolColumn('Vercel URL')] || '').trim();
+    if (!websiteUrl) result.missingWebsiteUrl++;
+    if (existingSiteIds.has(siteId)) return;
+    const row = Array(bindingHeaders.length).fill('');
+    row[bindingColumn('Site ID')] = siteId;
+    row[bindingColumn('游戏名称')] = poolRow[poolColumn('游戏名称')] || '';
+    row[bindingColumn('Steam App ID')] = poolRow[poolColumn('Steam App ID')] || '';
+    row[bindingColumn('网站URL')] = websiteUrl;
+    row[bindingColumn('GSC Property')] = '';
+    row[bindingColumn('GSC状态')] = 'NOT_CONNECTED';
+    row[bindingColumn('首次同步日期')] = '';
+    row[bindingColumn('最近同步日期')] = '';
+    rowsToAppend.push(row);
+    existingSiteIds.add(siteId);
+  });
+
+  if (rowsToAppend.length) {
+    bindingSheet.getRange(bindingSheet.getLastRow() + 1, 1, rowsToAppend.length, bindingHeaders.length).setValues(rowsToAppend);
+  }
+  result.created = rowsToAppend.length;
+  result.skipped = poolRows.length - rowsToAppend.length;
+  return result;
+}
+
+function ensureSitePoolSchema_(ss) {
+  let sheet = ss.getSheetByName(HOTWORD_V2.sheets.sitePool);
+  if (!sheet) sheet = ss.insertSheet(HOTWORD_V2.sheets.sitePool);
+  const desired = HOTWORD_V2.sitePoolHeaders;
+  const oldLastColumn = Math.max(sheet.getLastColumn(), desired.length);
+  const currentHeaders = sheet.getRange(1, 1, 1, oldLastColumn).getDisplayValues()[0];
+  const sameOrder = desired.every((header, index) => currentHeaders[index] === header);
+  if (!sameOrder && sheet.getLastRow() >= 1) {
+    const oldValues = sheet.getLastRow() > 1 ? sheet.getRange(2, 1, sheet.getLastRow() - 1, oldLastColumn).getValues() : [];
+    const aliases = {
+      'Vercel URL': ['站点URL'],
+      Clicks: ['点击'],
+      Impressions: ['曝光']
+    };
+    const positions = desired.map(header => {
+      const direct = currentHeaders.indexOf(header);
+      if (direct >= 0) return direct;
+      const fallback = (aliases[header] || []).map(alias => currentHeaders.indexOf(alias)).find(index => index >= 0);
+      return fallback === undefined ? -1 : fallback;
+    });
+    const rows = oldValues.map(row => positions.map(position => position >= 0 ? row[position] : ''));
+    rows.forEach(row => {
+      if (!row[3]) row[3] = 'BUILD_PENDING';
+      if (!row[5]) row[5] = 'BUILD_PENDING';
+      if (!row[10]) row[10] = 'NOT_CONNECTED';
+      if (!row[14]) row[14] = 'WAITING_INDEX';
+      if (!row[15]) row[15] = 'UNKNOWN';
+    });
+    sheet.getRange(1, 1, 1, desired.length).setValues([desired]);
+    if (rows.length) sheet.getRange(2, 1, rows.length, desired.length).setValues(rows);
+  } else {
+    ensureSheetWithHeaders_(ss, HOTWORD_V2.sheets.sitePool, desired);
+  }
+  if (oldLastColumn > desired.length) sheet.getRange(1, desired.length + 1, sheet.getMaxRows(), oldLastColumn - desired.length).clearContent();
+  if (sheet.getLastRow() > 1) {
+    const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, desired.length).getValues();
+    rows.forEach(row => {
+      if (!row[3]) row[3] = 'BUILD_PENDING';
+      if (!row[5]) row[5] = 'BUILD_PENDING';
+      if (!row[10]) row[10] = 'NOT_CONNECTED';
+      if (!row[14]) row[14] = 'WAITING_INDEX';
+      if (!row[15]) row[15] = 'UNKNOWN';
+    });
+    sheet.getRange(2, 1, rows.length, desired.length).setValues(rows);
+  }
+  return sheet;
+}
+
+function setupSitePoolUi_(ss) {
+  const sheet = ss.getSheetByName(HOTWORD_V2.sheets.sitePool);
+  if (!sheet) return;
+  const headers = sheet.getRange(1, 1, 1, HOTWORD_V2.sitePoolHeaders.length).getDisplayValues()[0];
+  const validate = (name, values) => {
+    const col = headers.indexOf(name) + 1;
+    if (col > 0) sheet.getRange(2, col, Math.max(sheet.getMaxRows() - 1, 1), 1)
+      .setDataValidation(SpreadsheetApp.newDataValidation().requireValueInList(values, true).setAllowInvalid(false).build());
+  };
+  validate('Build状态', ['BUILD_PENDING', 'BUILDING', 'LIVE', 'FAILED']);
+  validate('GSC状态', ['NOT_CONNECTED', 'CONNECTED']);
+  validate('SEO阶段', ['WAITING_INDEX', 'INDEXING', 'EARLY_DATA', 'GROWING', 'FAILED']);
+  validate('Index状态', ['UNKNOWN', 'INDEXING', 'INDEXED', 'ISSUE']);
+}
+
+function setupGscBindingUi_(ss) {
+  const sheet = ss.getSheetByName(HOTWORD_V2.sheets.gscBinding);
+  if (!sheet) return;
+  const headers = sheet.getRange(1, 1, 1, HOTWORD_V2.gscBindingHeaders.length).getDisplayValues()[0];
+  const statusCol = headers.indexOf('GSC状态') + 1;
+  if (statusCol > 0) sheet.getRange(2, statusCol, Math.max(sheet.getMaxRows() - 1, 1), 1)
+    .setDataValidation(SpreadsheetApp.newDataValidation().requireValueInList(['NOT_CONNECTED', 'CONNECTED'], true).setAllowInvalid(false).build());
+  ['首次同步日期', '最近同步日期'].forEach(name => {
+    const col = headers.indexOf(name) + 1;
+    if (col > 0) sheet.getRange(1, col, sheet.getMaxRows(), 1).setNumberFormat('yyyy-mm-dd hh:mm:ss');
+  });
+}
+
+function emptyGscSnapshot_(siteId, status) {
+  return {siteId: String(siteId || ''), clicks: 0, impressions: 0, ctr: 0, averagePosition: 0, lastSync: '', status: status || 'no_match'};
+}
+
+function findGscSnapshotColumn_(headers, aliases) {
+  for (const alias of aliases) {
+    const index = headers.findIndex(header => String(header || '').trim().toLowerCase() === String(alias).toLowerCase());
+    if (index >= 0) return index;
+  }
+  return -1;
+}
+
+function numberOrZero_(value) {
+  const number = typeof value === 'number' ? value : Number(String(value || '').replace(/[% ,]/g, ''));
+  return isFinite(number) ? number : 0;
+}
+
+function normalizeGscUrl_(value) {
+  const text = String(value || '').trim();
+  if (!text) return '';
+  const match = text.match(/^([a-z][a-z0-9+.-]*:\/\/)([^/]+)(\/.*)?$/i);
+  if (!match) return text;
+  const path = (match[3] || '').replace(/\/+$/, '');
+  return match[1].toLowerCase() + match[2].toLowerCase() + path;
+}
+
+function objectValue_(object, names) {
+  if (!object) return '';
+  for (const name of names) {
+    if (object[name] !== undefined && object[name] !== null && String(object[name]).trim()) return object[name];
+  }
+  return '';
+}
+
+function gscBindingInfo_(siteOrBinding) {
+  if (typeof siteOrBinding === 'string') return {siteId: String(siteOrBinding).trim(), gameName: '', websiteUrl: '', gscProperty: ''};
+  return {
+    siteId: String(objectValue_(siteOrBinding, ['siteId', 'Site ID']) || '').trim(),
+    gameName: String(objectValue_(siteOrBinding, ['gameName', '游戏名称', 'name']) || '').trim(),
+    websiteUrl: String(objectValue_(siteOrBinding, ['websiteUrl', '网站URL', 'Vercel URL', 'url']) || '').trim(),
+    gscProperty: String(objectValue_(siteOrBinding, ['gscProperty', 'GSC Property', 'PropertyURL']) || '').trim()
+  };
+}
+
+function gscDateValue_(value) {
+  if (value instanceof Date && !isNaN(value.getTime())) return value.getTime();
+  const text = String(value || '').trim();
+  if (!text) return 0;
+  const time = new Date(text).getTime();
+  return isNaN(time) ? 0 : time;
+}
+
+function mapGscSnapshotRow_(headers, row, requestedSiteId, matchedSite, matchedPropertyURL) {
+  const siteIndex = findGscSnapshotColumn_(headers, ['Site', 'site', '站点', '网站']);
+  const propertyIndex = findGscSnapshotColumn_(headers, ['PropertyURL', 'Property URL', 'property_url', '网站URL']);
+  const clicksIndex = findGscSnapshotColumn_(headers, ['Clicks', 'clicks', '点击']);
+  const impressionsIndex = findGscSnapshotColumn_(headers, ['Impressions', 'impressions', '曝光']);
+  const ctrIndex = findGscSnapshotColumn_(headers, ['CTR', 'ctr', '点击率']);
+  const positionIndex = findGscSnapshotColumn_(headers, ['AveragePosition', 'Average Position', 'average_position', '平均排名', '平均位置']);
+  const latestDataIndex = findGscSnapshotColumn_(headers, ['LatestGSCDataDate', 'GSC Last Sync', 'Last Sync', 'last_sync', '最近同步日期', '同步日期']);
+  const runDateIndex = findGscSnapshotColumn_(headers, ['RunDate', 'run_date', '运行日期', 'Date', '日期']);
+  const firstImpressionIndex = findGscSnapshotColumn_(headers, ['FirstImpressionDate', 'first_impression_date', '首次曝光日期']);
+  const lastSync = latestDataIndex >= 0 && row[latestDataIndex] ? row[latestDataIndex] : runDateIndex >= 0 ? row[runDateIndex] || '' : '';
+  const clicks = clicksIndex >= 0 ? numberOrZero_(row[clicksIndex]) : 0;
+  const impressions = impressionsIndex >= 0 ? numberOrZero_(row[impressionsIndex]) : 0;
+  const ctr = ctrIndex >= 0 ? numberOrZero_(row[ctrIndex]) : 0;
+  const averagePosition = positionIndex >= 0 ? numberOrZero_(row[positionIndex]) : 0;
+  return {
+    siteId: String(requestedSiteId || ''), clicks, impressions, ctr, averagePosition, lastSync,
+    status: clicks || impressions || ctr || averagePosition ? 'ok' : 'valid_zero',
+    matchedSite: matchedSite || (siteIndex >= 0 ? row[siteIndex] || '' : ''),
+    matchedPropertyURL: matchedPropertyURL || (propertyIndex >= 0 ? row[propertyIndex] || '' : ''),
+    runDate: runDateIndex >= 0 ? row[runDateIndex] || '' : '',
+    firstImpressionDate: firstImpressionIndex >= 0 ? row[firstImpressionIndex] || '' : ''
+  };
+}
+
+/**
+ * GSC 数据读取准备层。只读独立 GSC Spreadsheet 的「每日快照」，不调用 API、不写入任何 Sheet。
+ * @param {string|Object} siteOrBinding Site ID 或「项目GSC关联」记录
+ * @return {{siteId:string, clicks:number, impressions:number, ctr:number, averagePosition:number, lastSync:*}}
+ */
+function loadGscSnapshot(siteOrBinding) {
+  const binding = gscBindingInfo_(siteOrBinding);
+  const empty = emptyGscSnapshot_(binding.siteId);
+  if (!binding.siteId) return empty;
+
+  let sheet;
+  try {
+    const sourceSpreadsheet = SpreadsheetApp.openById(HOTWORD_V2.GSC_SOURCE_SPREADSHEET_ID);
+    sheet = sourceSpreadsheet && sourceSpreadsheet.getSheetByName(HOTWORD_V2.GSC_SOURCE_SHEET_NAME);
+  } catch (error) {
+    return emptyGscSnapshot_(binding.siteId, 'source_error');
+  }
+  if (!sheet) return emptyGscSnapshot_(binding.siteId, 'source_error');
+
+  let values;
+  try {
+    values = sheet.getDataRange().getValues();
+  } catch (error) {
+    return emptyGscSnapshot_(binding.siteId, 'source_error');
+  }
+  if (!values || values.length < 2) return emptyGscSnapshot_(binding.siteId, 'no_match');
+  const headers = values[0].map(value => String(value || '').trim());
+  const siteIndex = findGscSnapshotColumn_(headers, ['Site', 'site', '站点', '网站']);
+  const propertyIndex = findGscSnapshotColumn_(headers, ['PropertyURL', 'Property URL', 'property_url', '网站URL']);
+  if (siteIndex < 0 || propertyIndex < 0) return emptyGscSnapshot_(binding.siteId, 'source_error');
+  const rows = values.slice(1).filter(row => row.some(value => String(value || '').trim()));
+  const property = normalizeGscUrl_(binding.gscProperty);
+  const website = normalizeGscUrl_(binding.websiteUrl);
+  const gameName = binding.gameName;
+  const byProperty = property
+    ? rows.filter(row => normalizeGscUrl_(row[propertyIndex]) === property)
+    : [];
+  const byWebsite = website
+    ? rows.filter(row => normalizeGscUrl_(row[propertyIndex]) === website)
+    : [];
+  const byName = gameName
+    ? rows.filter(row => String(row[siteIndex] || '').trim() === gameName)
+    : [];
+  const candidates = byProperty.length ? byProperty : byWebsite.length ? byWebsite : byName;
+  if (!candidates.length) return emptyGscSnapshot_(binding.siteId, 'no_match');
+
+  const distinctProperties = new Set(candidates.map(row => normalizeGscUrl_(row[propertyIndex])));
+  if (distinctProperties.size > 1) {
+    const ambiguous = emptyGscSnapshot_(binding.siteId, 'ambiguous');
+    ambiguous.matchedPropertyURL = Array.from(distinctProperties).join(' | ');
+    return ambiguous;
+  }
+  const latestDataIndex = findGscSnapshotColumn_(headers, ['LatestGSCDataDate']);
+  const runDateIndex = findGscSnapshotColumn_(headers, ['RunDate']);
+  const sorted = candidates.slice().sort((left, right) => {
+    const latestDiff = (latestDataIndex >= 0 ? gscDateValue_(right[latestDataIndex]) : 0) - (latestDataIndex >= 0 ? gscDateValue_(left[latestDataIndex]) : 0);
+    if (latestDiff) return latestDiff;
+    return (runDateIndex >= 0 ? gscDateValue_(right[runDateIndex]) : 0) - (runDateIndex >= 0 ? gscDateValue_(left[runDateIndex]) : 0);
+  });
+  const selected = sorted[0];
+  return mapGscSnapshotRow_(headers, selected, binding.siteId, selected[siteIndex], selected[propertyIndex]);
+}
+
+/**
+ * Apps Script 编辑器人工运行的真实 GSC 只读验收入口。
+ * 只读取当前 Steam Spreadsheet 的「项目GSC关联」，不写入任何 Sheet。
+ * @return {Object|null} loadGscSnapshot 的结果，未找到绑定时返回 null
+ */
+function debugRealGscReadAcceptance() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss && ss.getSheetByName(HOTWORD_V2.sheets.gscBinding);
+  if (!sheet || sheet.getLastRow() < 2 || sheet.getLastColumn() < 1) {
+    Logger.log('NO_ELIGIBLE_GSC_BINDING');
+    return null;
+  }
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getDisplayValues()[0];
+  const column = name => headers.indexOf(name);
+  const siteColumn = column('Site ID');
+  const gameColumn = column('游戏名称');
+  const websiteColumn = column('网站URL');
+  const propertyColumn = column('GSC Property');
+  if ([siteColumn, gameColumn, websiteColumn, propertyColumn].some(index => index < 0)) {
+    Logger.log('NO_ELIGIBLE_GSC_BINDING');
+    return null;
+  }
+  const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getDisplayValues();
+  const selected = rows.find(row => [siteColumn, websiteColumn, propertyColumn].every(index => String(row[index] || '').trim()));
+  if (!selected) {
+    Logger.log('NO_ELIGIBLE_GSC_BINDING');
+    return null;
+  }
+  const binding = {
+    siteId: String(selected[siteColumn]).trim(),
+    gameName: String(selected[gameColumn] || '').trim(),
+    websiteUrl: String(selected[websiteColumn]).trim(),
+    gscProperty: String(selected[propertyColumn]).trim()
+  };
+  Logger.log('TEST_BINDING\n' + JSON.stringify(binding));
+  const result = loadGscSnapshot(binding);
+  Logger.log('GSC_RESULT\n' + JSON.stringify(result));
+  const status = String(result && result.status || 'source_error').toLowerCase();
+  if (status === 'ok' || status === 'valid_zero') Logger.log('REAL_GSC_READ_ACCEPTANCE: PASS');
+  else Logger.log('REAL_GSC_READ_ACCEPTANCE: ' + status.toUpperCase());
+  return result;
+}
+
+/**
+ * 根据当前快照与项目池中上一周期的指标推导 SEO 阶段。
+ * FAILED 是人工保留状态，不会被自动阶段覆盖。
+ * @param {Object} snapshot
+ * @param {Object} previous
+ * @return {string}
+ */
+function calculateSeoStage(snapshot, previous) {
+  const oldStage = String(previous && (previous.seoStage || previous['SEO阶段']) || '').trim();
+  if (oldStage === 'FAILED') return 'FAILED';
+
+  const impressions = numberOrZero_(snapshot && snapshot.impressions);
+  const clicks = numberOrZero_(snapshot && snapshot.clicks);
+  if (impressions <= 0) return 'WAITING_INDEX';
+  if (clicks <= 0) return 'INDEXING';
+
+  const previousImpressions = numberOrZero_(previous && (previous.impressions || previous['Impressions']));
+  const previousClicks = numberOrZero_(previous && (previous.clicks || previous['Clicks']));
+  const hasPrevious = previous && (previousImpressions > 0 || previousClicks > 0);
+  if (hasPrevious && (impressions > previousImpressions || clicks > previousClicks)) return 'GROWING';
+  return 'EARLY_DATA';
+}
+
+/**
+ * 将既有 GSC 监控快照同步到站点项目池。
+ * 只更新 GSC 指标与自动 SEO 阶段，不触碰项目身份、URL 和 GSC Property。
+ * @return {{updated:number, skipped:number, missingProjects:number}}
+ */
+function syncProjectPoolGsc() {
+  const emptyResult = {updated: 0, validZero: 0, noMatch: 0, ambiguous: 0, sourceError: 0, skipped: 0};
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const bindingSheet = ss && ss.getSheetByName(HOTWORD_V2.sheets.gscBinding);
+  const poolSheet = ss && ensureSitePoolSchema_(ss);
+  if (!bindingSheet || !poolSheet || bindingSheet.getLastRow() < 2 || poolSheet.getLastRow() < 2) {
+    return emptyResult;
+  }
+
+  const bindingHeaders = bindingSheet.getRange(1, 1, 1, Math.max(bindingSheet.getLastColumn(), HOTWORD_V2.gscBindingHeaders.length)).getDisplayValues()[0];
+  const bindingSiteColumn = bindingHeaders.indexOf('Site ID');
+  if (bindingSiteColumn < 0) return emptyResult;
+
+  const poolHeaders = poolSheet.getRange(1, 1, 1, HOTWORD_V2.sitePoolHeaders.length).getDisplayValues()[0];
+  const poolColumn = name => poolHeaders.indexOf(name);
+  const requiredColumns = ['Site ID', 'GSC Last Sync', 'Clicks', 'Impressions', 'CTR', 'Average Position', 'SEO阶段'];
+  if (requiredColumns.some(name => poolColumn(name) < 0)) return emptyResult;
+
+  const bindings = bindingSheet.getRange(2, 1, bindingSheet.getLastRow() - 1, bindingHeaders.length).getValues();
+  const poolRows = poolSheet.getRange(2, 1, poolSheet.getLastRow() - 1, HOTWORD_V2.sitePoolHeaders.length).getValues();
+  const poolBySiteId = new Map();
+  poolRows.forEach((row, index) => {
+    const siteId = String(row[poolColumn('Site ID')] || '').trim();
+    if (siteId && !poolBySiteId.has(siteId)) poolBySiteId.set(siteId, index);
+  });
+
+  const writeColumns = ['GSC Last Sync', 'Clicks', 'Impressions', 'CTR', 'Average Position'];
+  const result = emptyResult;
+  bindings.forEach(binding => {
+    const siteId = String(binding[bindingSiteColumn] || '').trim();
+    if (!siteId) return;
+    const poolIndex = poolBySiteId.get(siteId);
+    if (poolIndex === undefined) {
+      result.skipped++;
+      return;
+    }
+
+    const snapshot = loadGscSnapshot({
+      siteId: siteId,
+      '游戏名称': binding[bindingHeaders.indexOf('游戏名称')],
+      '网站URL': binding[bindingHeaders.indexOf('网站URL')],
+      'GSC Property': binding[bindingHeaders.indexOf('GSC Property')]
+    });
+    const status = snapshot && snapshot.status;
+    if (status !== 'ok' && status !== 'valid_zero') {
+      if (status === 'no_match') result.noMatch++;
+      else if (status === 'ambiguous') result.ambiguous++;
+      else result.sourceError++;
+      result.skipped++;
+      return;
+    }
+    if (status === 'valid_zero') result.validZero++;
+
+    const previous = {
+      seoStage: poolRows[poolIndex][poolColumn('SEO阶段')],
+      clicks: poolRows[poolIndex][poolColumn('Clicks')],
+      impressions: poolRows[poolIndex][poolColumn('Impressions')]
+    };
+    const rowNumber = poolIndex + 2;
+    writeColumns.forEach(name => {
+      const value = name === 'GSC Last Sync' ? snapshot.lastSync : snapshot[name === 'Average Position' ? 'averagePosition' : name.toLowerCase()];
+      if (name !== 'GSC Last Sync' || snapshot.lastSync) {
+        poolSheet.getRange(rowNumber, poolColumn(name) + 1).setValue(value === undefined ? 0 : value);
+      }
+    });
+    const seoColumn = poolColumn('SEO阶段');
+    if (String(previous.seoStage || '').trim() !== 'FAILED') {
+      poolSheet.getRange(rowNumber, seoColumn + 1).setValue(calculateSeoStage(snapshot, previous));
+    }
+    result.updated++;
+  });
+  return result;
+}
+
+function readCandidateDecisions_(ss) {
+  const sheet = ss.getSheetByName(HOTWORD_V2.sheets.decisions);
+  const out = new Map();
+  if (!sheet || sheet.getLastRow() < 2) return out;
+  sheet.getRange(2, 1, sheet.getLastRow() - 1, HOTWORD_V2.decisionHeaders.length).getValues().forEach((row, index) => {
+    const appId = String(row[0] || '').trim();
+    if (!appId) return;
+    const explicitDecision = normalizeDecisionStatus_(row[19]);
+    out.set(appId, {
+      row,
+      rowNumber: index + 2,
+      appId,
+      name: String(row[1] || ''),
+      status: explicitDecision || normalizeDecisionStatus_(row[2]),
+      lastCheckedDate: row[3],
+      lastGain: row[4],
+      lastType: String(row[5] || ''),
+      nextRecheckDate: row[6],
+      note: row[7] || '',
+      lastCheckedStatus: normalizeDecisionStatus_(row[8]),
+      firstSeen: row[9] || '', source: row[10] || '', firstType: row[11] || '', currentStage: row[12] || '',
+      researchStatus: row[13] || '', trendsResult: row[14] || '', socialResult: row[15] || '', serpCompetition: row[16] || '',
+      keywordOpportunity: row[17] || '', manualNote: row[18] || '', decisionDate: row[20] || '', nextAction: row[21] || ''
+    });
+  });
+  return out;
+}
+
+function candidateDecisionRow_(decision) {
+  return [
+    decision.appId, decision.name, decision.status, decision.lastCheckedDate, decision.lastGain,
+    decision.lastType, decision.nextRecheckDate, decision.note, decision.lastCheckedStatus,
+    decision.firstSeen, decision.source, decision.firstType, decision.currentStage, decision.researchStatus,
+    decision.trendsResult, decision.socialResult, decision.serpCompetition, decision.keywordOpportunity, decision.manualNote,
+    decision.status, decision.decisionDate, decision.nextAction
+  ];
+}
+
+function syncCandidateDecisions_(ss, records, runTime, rules) {
+  const sheet = ss.getSheetByName(HOTWORD_V2.sheets.decisions);
+  const decisions = readCandidateDecisions_(ss);
+  records.forEach(rec => {
+    const appId = String(rec.appId);
+    let decision = decisions.get(appId);
+    if (!decision) {
+      decision = {appId, name: rec.name, status: '', lastCheckedDate: '', lastGain: '', lastType: '', nextRecheckDate: '', note: '', lastCheckedStatus: '',
+        firstSeen: '', source: '', firstType: '', currentStage: '', researchStatus: '待研究', trendsResult: '', socialResult: '', serpCompetition: '未检查', keywordOpportunity: '未检查', manualNote: '', decisionDate: '', nextAction: ''};
+      decisions.set(appId, decision);
+    }
+    decision.name = rec.name;
+    const masterRow = findMasterRecord_(ss, appId);
+    if (masterRow) {
+      decision.firstSeen = decision.firstSeen || masterRow[28] || runTime;
+      decision.source = decision.source || masterRow[4] || '';
+      decision.firstType = decision.firstType || masterRow[20] || rec.firstRoundType;
+      decision.currentStage = masterRow[25] || rec.currentStage;
+    }
+    decision.firstType = decision.firstType || rec.firstRoundType;
+    decision.currentStage = decision.currentStage || rec.currentStage;
+    const isHumanStage = decision.currentStage === '1B完成→人工第二轮';
+    decision.researchStatus = isHumanStage ? deriveResearchStatus_(decision) : '';
+    if (decision.status === 'BUILD') decision.nextAction = 'Site Build';
+    else if (decision.status === 'WATCH') decision.nextAction = 'Recheck';
+    else if (decision.status === 'REJECT' || !isHumanStage) decision.nextAction = 'None';
+    else if (!decision.nextAction || (decision.nextAction === 'Keyword Research' && decision.researchStatus === '待研究')) decision.nextAction = 'Google Trends';
+    if (decision.status && decision.status !== decision.lastCheckedStatus) {
+      decision.lastCheckedDate = runTime;
+      decision.lastGain = rec.gain7d;
+      decision.lastType = rec.firstRoundType;
+      decision.nextRecheckDate = decision.status === 'WATCH'
+        ? addDays_(runTime, isStrongWatchType_(rec.firstRoundType)
+          ? rules.WATCH_RECHECK_DAYS_STRONG : rules.WATCH_RECHECK_DAYS_NORMAL)
+        : '';
+      decision.lastCheckedStatus = decision.status;
+      decision.decisionDate = decision.status === 'REJECT' || decision.status === 'BUILD' ? runTime : decision.decisionDate;
+    }
+  });
+
+  const rows = [];
+  decisions.forEach(decision => rows.push(candidateDecisionRow_(decision)));
+  if (sheet.getLastRow() > 1) sheet.getRange(2, 1, sheet.getLastRow() - 1, HOTWORD_V2.decisionHeaders.length).clearContent();
+  if (rows.length) sheet.getRange(2, 1, rows.length, HOTWORD_V2.decisionHeaders.length).setValues(rows);
+  return decisions;
+}
+
+function nextActionForResearch_(decision) {
+  if (isUnfinishedResearchValue_(decision.trendsResult)) return 'Google Trends';
+  if (isUnfinishedResearchValue_(decision.socialResult)) return 'Social验证';
+  if (isUnfinishedResearchValue_(decision.serpCompetition)) return 'SERP检查';
+  if (isUnfinishedResearchValue_(decision.keywordOpportunity)) return 'Keyword Research';
+  return 'Keyword Research';
+}
+
+function syncCandidateDecisionFromActionEdit_(e) {
+  if (!e || !e.range) return;
+  const sheet = e.range.getSheet();
+  if (sheet.getName() !== HOTWORD_V2.sheets.action || e.range.getRow() < 4) return;
+  const headers = sheet.getRange(3, 1, 1, HOTWORD_V2.actionHeaders.length).getDisplayValues()[0];
+  const editable = ['Trends结果', 'Social结果', 'SERP竞争', '关键词机会', 'Decision', '人工备注'];
+  const editedHeaders = editable.filter(name => {
+    const col = headers.indexOf(name) + 1;
+    return col >= e.range.getColumn() && col <= e.range.getLastColumn();
+  });
+  if (!editedHeaders.length) return;
+
+  const rowNumber = e.range.getRow();
+  const values = sheet.getRange(rowNumber, 1, 1, HOTWORD_V2.actionHeaders.length).getValues()[0];
+  const at = name => values[headers.indexOf(name)];
+  const appId = String(at('Steam App ID') || '').trim();
+  if (!appId) return;
+  const decisions = readCandidateDecisions_(e.source);
+  let decision = decisions.get(appId);
+  if (!decision) {
+    decision = {appId, name: at('游戏名称') || '', status: '', lastCheckedDate: '', lastGain: '', lastType: '', nextRecheckDate: '', note: '', lastCheckedStatus: '',
+      firstSeen: '', source: '', firstType: '', currentStage: at('当前阶段') || '', researchStatus: '', trendsResult: '', socialResult: '', serpCompetition: '', keywordOpportunity: '', manualNote: '', decisionDate: '', nextAction: ''};
+  }
+  decision.name = at('游戏名称') || decision.name;
+  decision.firstType = decision.firstType || at('第一轮类型') || '';
+  decision.currentStage = at('当前阶段') || decision.currentStage;
+  decision.trendsResult = at('Trends结果') || '';
+  decision.socialResult = at('Social结果') || '';
+  decision.serpCompetition = at('SERP竞争') || '';
+  decision.keywordOpportunity = at('关键词机会') || '';
+  decision.manualNote = at('人工备注') || '';
+  decision.status = normalizeDecisionStatus_(at('Decision'));
+  const masterRow = findMasterRecord_(e.source, appId);
+  if (masterRow) {
+    decision.firstSeen = decision.firstSeen || masterRow[28] || '';
+    decision.source = decision.source || masterRow[4] || '';
+    decision.firstType = decision.firstType || masterRow[20] || '';
+  }
+  decision.researchStatus = deriveResearchStatus_(decision);
+  if (decision.status && decision.status !== decision.lastCheckedStatus) {
+    const checkedAt = new Date();
+    decision.lastCheckedDate = checkedAt;
+    decision.lastGain = masterRow ? masterRow[12] : '';
+    decision.lastType = masterRow ? masterRow[20] : decision.firstType;
+    decision.nextRecheckDate = decision.status === 'WATCH' ? addDays_(checkedAt, isStrongWatchType_(decision.lastType) ? loadRules_(e.source).WATCH_RECHECK_DAYS_STRONG : loadRules_(e.source).WATCH_RECHECK_DAYS_NORMAL) : '';
+    decision.decisionDate = decision.status === 'BUILD' || decision.status === 'REJECT' ? checkedAt : decision.decisionDate;
+    decision.lastCheckedStatus = decision.status;
+  } else if (!decision.status) {
+    decision.lastCheckedStatus = '';
+    decision.nextRecheckDate = '';
+    decision.decisionDate = '';
+  }
+  if (decision.status === 'BUILD') decision.nextAction = 'Site Build';
+  else if (decision.status === 'WATCH') decision.nextAction = 'Recheck';
+  else if (decision.status === 'REJECT' || decision.currentStage !== '1B完成→人工第二轮') decision.nextAction = 'None';
+  else decision.nextAction = nextActionForResearch_(decision);
+
+  const decisionSheet = e.source.getSheetByName(HOTWORD_V2.sheets.decisions);
+  const existing = decisions.get(appId);
+  if (existing && existing.row) {
+    const rowNumberInDecision = existing.row[0] ? existing.rowNumber : null;
+    if (rowNumberInDecision) decisionSheet.getRange(rowNumberInDecision, 1, 1, HOTWORD_V2.decisionHeaders.length).setValues([candidateDecisionRow_(decision)]);
+  } else {
+    decisionSheet.getRange(decisionSheet.getLastRow() + 1, 1, 1, HOTWORD_V2.decisionHeaders.length).setValues([candidateDecisionRow_(decision)]);
+  }
+  if (decision.status === 'BUILD') upsertSitePoolRecord_(e.source, decision.name, appId, decision.decisionDate || new Date());
+
+  const output = {
+    '研究状态': decision.researchStatus,
+    '人工动作': decision.status ? '' : deriveHumanAction_({firstRoundType: decision.firstType}, decision, false),
+    '研究完成度': deriveResearchCompletion_(decision),
+    'Decision': decision.status
+  };
+  Object.keys(output).forEach(name => {
+    const col = headers.indexOf(name) + 1;
+    if (col > 0) sheet.getRange(rowNumber, col).setValue(output[name]);
+  });
+}
+
+function captureCandidateDecisionEdit_(e) {
+  if (!e || !e.range) return;
+  const sheet = e.range.getSheet();
+  if (sheet.getName() !== HOTWORD_V2.sheets.decisions || e.range.getRow() < 2) return;
+  const headers = sheet.getRange(1, 1, 1, Math.max(sheet.getLastColumn(), HOTWORD_V2.decisionHeaders.length)).getDisplayValues()[0];
+  const decisionColumn = headers.indexOf('Decision') + 1;
+  const legacyColumn = headers.indexOf('决策状态') + 1;
+  if (e.range.getColumn() !== decisionColumn && e.range.getColumn() !== legacyColumn) return;
+  const status = normalizeDecisionStatus_(sheet.getRange(e.range.getRow(), e.range.getColumn()).getValue());
+  if (!status) return;
+  if (decisionColumn > 0) sheet.getRange(e.range.getRow(), decisionColumn).setValue(status);
+  if (legacyColumn > 0) sheet.getRange(e.range.getRow(), legacyColumn).setValue(status);
+  const appId = String(sheet.getRange(e.range.getRow(), 1).getDisplayValue() || '').trim();
+  const master = e.source.getSheetByName(HOTWORD_V2.sheets.master);
+  if (!appId || !master || master.getLastRow() < 2) return;
+  const ids = master.getRange(2, 2, master.getLastRow() - 1, 1).getDisplayValues();
+  const index = ids.findIndex(row => String(row[0]).trim() === appId);
+  if (index < 0) return;
+  const masterRow = index + 2;
+  const checkedAt = new Date();
+  const type = master.getRange(masterRow, 21).getDisplayValue();
+  const gain = master.getRange(masterRow, 13).getValue();
+  const rules = loadRules_(e.source);
+  sheet.getRange(e.range.getRow(), 4, 1, 6).setValues([[
+    checkedAt, gain, type,
+    status === 'WATCH' ? addDays_(checkedAt, isStrongWatchType_(type)
+      ? rules.WATCH_RECHECK_DAYS_STRONG : rules.WATCH_RECHECK_DAYS_NORMAL) : '',
+    sheet.getRange(e.range.getRow(), 8).getValue(), status
+  ]]);
+  const nextActionColumn = headers.indexOf('Next Action') + 1;
+  const decisionDateColumn = headers.indexOf('Decision日期') + 1;
+  const researchStatusColumn = headers.indexOf('研究状态') + 1;
+  if (researchStatusColumn > 0) sheet.getRange(e.range.getRow(), researchStatusColumn).setValue('已完成');
+  if (decisionDateColumn > 0 && (status === 'BUILD' || status === 'REJECT')) sheet.getRange(e.range.getRow(), decisionDateColumn).setValue(checkedAt);
+  if (nextActionColumn > 0) sheet.getRange(e.range.getRow(), nextActionColumn).setValue(status === 'BUILD' ? 'Site Build' : status === 'WATCH' ? 'Recheck' : 'None');
+  if (status === 'BUILD') upsertSitePoolRecord_(e.source, sheet.getRange(e.range.getRow(), 2).getValue(), appId, checkedAt);
+}
+
+function onEdit(e) {
+  syncCandidateDecisionFromActionEdit_(e);
+  captureCandidateDecisionEdit_(e);
+}
+
 /**
  * @param {Object} rec
  * @return {Array<*>}
@@ -3137,25 +4036,34 @@ function actionRow_(rec) {
     : '';
 
   return [
-    rec.firstRoundType,
+    rec.todayAction.type,
     rec.priority,
     rec.name,
-    trends.query,
-    trends.status,
-    trendsLink,
     rec.appId,
-    rec.releaseStage,
-    rec.releaseDate || '',
-    rec.daysToRelease,
+    rec.firstRoundType,
     rec.followers,
     rec.gain7d,
     rec.growthRate,
+    rec.releaseStage,
+    rec.releaseDate || '',
+    rec.daysToRelease,
     rec.reviews,
     rec.rating,
-    rec.source,
+    trendsLink,
+    rec.todayAction.decision && rec.todayAction.decision.trendsResult || '',
+    rec.todayAction.decision && rec.todayAction.decision.socialResult || '',
+    rec.todayAction.decision && rec.todayAction.decision.serpCompetition || '',
+    rec.todayAction.decision && rec.todayAction.decision.keywordOpportunity || '',
+    rec.todayAction.decision && rec.todayAction.decision.status || '',
+    rec.todayAction.decision && rec.todayAction.decision.manualNote || '',
+    rec.currentStage,
+    rec.todayAction.decision && rec.todayAction.decision.researchStatus || '',
+    rec.todayAction.decision && rec.todayAction.decision.researchStatus === '已完成' ? '已完成' : rec.todayAction.decision && rec.todayAction.decision.researchStatus === '研究中' ? '进行中' : '未开始',
+    rec.todayAction.humanAction || (rec.todayAction.type === 'RESEARCHING' ? '继续完成研究' : ''),
+    rec.todayAction.reason,
+    rec.todayAction.lastCheckedDate || (rec.todayAction.decision && rec.todayAction.decision.lastCheckedDate) || '',
+    rec.url,
     rec.firstRoundReason,
-    rec.nextAction,
-    rec.url
   ];
 }
 
@@ -3407,6 +4315,9 @@ function applyBasicFormatting_(ss) {
     HOTWORD_V2.sheets.anomalies,
     HOTWORD_V2.sheets.log,
     HOTWORD_V2.sheets.history,
+    HOTWORD_V2.sheets.decisions,
+    HOTWORD_V2.sheets.sitePool,
+    HOTWORD_V2.sheets.gscBinding,
     '1B规则回测'
   ].forEach(name => {
     const sheet = ss.getSheetByName(name);
@@ -3445,44 +4356,76 @@ function applyBasicFormatting_(ss) {
     rules.setFrozenRows(1);
     rules.autoResizeColumns(1, 5);
   }
+
+  const decisions = ss.getSheetByName(HOTWORD_V2.sheets.decisions);
+  if (decisions) {
+    decisions.getRange('D:D').setNumberFormat('yyyy-mm-dd');
+    decisions.getRange('G:G').setNumberFormat('yyyy-mm-dd');
+    decisions.getRange('J:J').setNumberFormat('yyyy-mm-dd');
+    decisions.getRange('U:U').setNumberFormat('yyyy-mm-dd hh:mm:ss');
+  }
+
+  const sitePool = ss.getSheetByName(HOTWORD_V2.sheets.sitePool);
+  if (sitePool) {
+    const poolHeaders = sitePool.getRange(1, 1, 1, HOTWORD_V2.sitePoolHeaders.length).getDisplayValues()[0];
+    const poolFormat = (name, format) => {
+      const col = poolHeaders.indexOf(name) + 1;
+      if (col > 0) sitePool.getRange(1, col, sitePool.getMaxRows(), 1).setNumberFormat(format);
+    };
+    poolFormat('BUILD日期', 'yyyy-mm-dd hh:mm:ss');
+    poolFormat('上线日期', 'yyyy-mm-dd hh:mm:ss');
+    poolFormat('首次曝光日期', 'yyyy-mm-dd');
+    poolFormat('CTR', '0.0%');
+    poolFormat('Average Position', '0.0');
+  }
 }
 
 function applyActionFormatting_(sheet, dataRows) {
   sheet.setFrozenRows(3);
 
-  // V2.1：A1:P1 是合并标题行，Google Sheets 不允许冻结列边界切过合并单元格。
-  // 今日行动只冻结前三行，不冻结列，避免主流程在最后格式化阶段被误记为 FAILED。
-  sheet.setFrozenColumns(0);
+  // 核心判断区固定在左侧；标题行不合并，避免冻结边界切过合并单元格。
+  sheet.setFrozenColumns(5);
 
-  sheet.getRange('A1:S1')
+  sheet.getRange(1, 1, 1, HOTWORD_V2.actionHeaders.length)
     .setBackground('#0F766E')
     .setFontColor('#FFFFFF')
     .setFontWeight('bold')
     .setHorizontalAlignment('left');
 
-  sheet.getRange('A3:S3')
+  sheet.getRange(3, 1, 1, HOTWORD_V2.actionHeaders.length)
     .setBackground('#1F4E78')
     .setFontColor('#FFFFFF')
     .setFontWeight('bold')
     .setHorizontalAlignment('center');
 
+  const headers = sheet.getRange(3, 1, 1, HOTWORD_V2.actionHeaders.length).getDisplayValues()[0];
+  const setFormat = (name, format) => {
+    const col = headers.indexOf(name) + 1;
+    if (col > 0) sheet.getRange(4, col, Math.max(dataRows, 1), 1).setNumberFormat(format);
+  };
   sheet.getRange('D2:D2').setNumberFormat('yyyy-mm-dd hh:mm:ss');
   if (dataRows > 0) {
-    sheet.getRange(4, 9, dataRows, 1).setNumberFormat('yyyy-mm-dd');
-    sheet.getRange(4, 13, dataRows, 1).setNumberFormat('0.0%');
-    sheet.getRange(4, 15, dataRows, 1).setNumberFormat('0.0%');
+    setFormat('上次人工检查日', 'yyyy-mm-dd');
+    setFormat('Steam发布日期', 'yyyy-mm-dd');
+    setFormat('距发售天数', '0');
+    setFormat('Steam Followers', '0');
+    setFormat('Steam 7d Gain', '0');
+    setFormat('近似增长率', '0.0%');
+    setFormat('评论数', '0');
+    setFormat('Steam评分', '0.0');
 
-    const typeRange = sheet.getRange(4, 1, dataRows, 1);
+    const typeColumn = headers.indexOf('第一轮类型') + 1;
+    const typeRange = sheet.getRange(4, typeColumn, dataRows, 1);
     const types = typeRange.getDisplayValues();
     types.forEach((r, idx) => {
-      const cell = sheet.getRange(idx + 4, 1);
+      const cell = sheet.getRange(idx + 4, typeColumn);
       if (r[0] === '🔥 趋势候选') cell.setBackground('#FCE8E6');
       else if (r[0] === '🌱 Early候选') cell.setBackground('#E6F4EA');
       else if (r[0] === '🏢 大盘对照') cell.setBackground('#E8F0FE');
     });
   }
 
-  const widths = [18, 12, 34, 52, 16, 14, 14, 14, 15, 12, 16, 15, 14, 12, 12, 28, 55, 34, 48];
+  const widths = [18, 12, 34, 14, 18, 16, 16, 14, 14, 15, 12, 12, 12, 24, 18, 18, 18, 18, 18, 36, 22, 16, 16, 22, 34, 16, 48, 55];
   widths.forEach((w, i) => sheet.setColumnWidth(i + 1, Math.min(420, w * 8)));
 }
 

@@ -28,17 +28,20 @@ function buildSheetUiOrder_(existingNames, preferredNames) {
 }
 
 var SHEET_UI_ORDER = [
+  '今日行动',
+  '站点项目池',
+  '项目GSC关联',
+  '候选决策',
+  '候选主表',
+  'Steam_每日快照',
+  '历史游戏库',
   '使用说明',
   '指标说明',
-  '今日行动',
-  '候选主表',
   '建站关键词规划',
   '规则配置',
   '1B规则回测',
-  'Steam_每日快照',
   '数据异常',
   '运行日志_V2',
-  '历史游戏库',
   '概览',
   'Steam_候选池',
   'Steam_抓取日志',
@@ -59,7 +62,10 @@ assertEqual(
       '运行日志_V2',
       '配置',
       '今日行动',
+      '站点项目池',
+      '项目GSC关联',
       '指标说明',
+      '候选决策',
       'Steam_候选池',
       '候选主表',
       '使用说明',
@@ -76,17 +82,20 @@ assertEqual(
     SHEET_UI_ORDER
   ),
   [
+    '今日行动',
+    '站点项目池',
+    '项目GSC关联',
+    '候选决策',
+    '候选主表',
+    'Steam_每日快照',
+    '历史游戏库',
     '使用说明',
     '指标说明',
-    '今日行动',
-    '候选主表',
     '建站关键词规划',
     '规则配置',
     '1B规则回测',
-    'Steam_每日快照',
     '数据异常',
     '运行日志_V2',
-    '历史游戏库',
     '概览',
     'Steam_候选池',
     'Steam_抓取日志',
@@ -98,7 +107,7 @@ assertEqual(
 
 assertEqual(
   buildSheetUiOrder_(['使用说明', '今日行动'], SHEET_UI_ORDER),
-  ['使用说明', '今日行动'],
+  ['今日行动', '使用说明'],
   'does not invent 指标说明 when missing from existingNames input — creator runs separately'
 );
 
@@ -131,6 +140,12 @@ if (/sheetUiHidden:[\s\S]*指标说明/.test(src.split('sheetUiHidden')[1].slice
 }
 if (!/sheetUiOrder:[\s\S]*?'指标说明'/.test(src)) {
   throw new Error('sheetUiOrder missing 指标说明');
+}
+if (!/sheetUiOrder:[\s\S]*?'候选决策'/.test(src)) {
+  throw new Error('sheetUiOrder missing 候选决策');
+}
+if (!/RECHECK_GAIN_GROWTH_MIN/.test(src) || !/WATCH_RECHECK_DAYS_STRONG/.test(src) || !/WATCH_RECHECK_DAYS_NORMAL/.test(src)) {
+  throw new Error('candidate recheck rules missing');
 }
 
 // Count metric rows roughly from getMetricGuideRows_

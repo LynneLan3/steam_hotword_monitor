@@ -12,7 +12,7 @@ var src = fs.readFileSync(srcPath, 'utf8');
 
 var sandbox = {
   HOTWORD_V2: {
-    trendsExplore: {date: 'today 3-m', geo: ''}
+    trendsExplore: {date: 'today 1-m', geo: 'US'}
   },
   console: console
 };
@@ -57,11 +57,25 @@ assertTrends('Soul\'s Remnant', 'Souls Remnant', '✅ 自动');
 
 var url = sandbox.buildGoogleTrendsExploreUrl_('Agent 64 Spies Never Die + Agent 64');
 assertIncludes(url, 'q=Agent%2064%20Spies%20Never%20Die%20%2B%20Agent%2064', 'Trends URL keeps OR plus');
-assertIncludes(url, 'date=today%203-m', 'Trends URL date param');
+assertIncludes(url, 'date=today%201-m', 'Trends URL date param');
+assertIncludes(url, 'geo=US', 'Trends URL geo param');
 
-var headerBlock = src.match(/actionHeaders:\s*\[([\s\S]*?)\]\s*,\s*\n\s*\/\*\* 人工 Google Trends/);
+[
+  'Normal Game',
+  'The Sinking City 2',
+  'Soul\'s Remnant: Beyond™ 🚀'
+].forEach(function (name) {
+  var query = sandbox.buildTrendsQuery_(name).query;
+  var encoded = sandbox.buildGoogleTrendsExploreUrl_(query);
+  assertIncludes(encoded, 'geo=US', name + ' geo');
+  assertIncludes(encoded, 'date=today%201-m', name + ' date');
+  assertIncludes(encoded, 'q=', name + ' query parameter');
+  if (encoded.indexOf(' ') >= 0) throw new Error(name + ' URL has raw spaces');
+});
+
+var headerBlock = src.match(/actionHeaders:\s*\[([\s\S]*?)\]\s*,/);
 if (!headerBlock) throw new Error('actionHeaders block missing');
-['游戏名称', 'Trends 查询词', 'Trends 名称状态', 'Google Trends', 'Steam App ID'].forEach(function (h) {
+['游戏名称', 'Google Trends链接', 'Steam App ID'].forEach(function (h) {
   if (headerBlock[0].indexOf("'" + h + "'") < 0) throw new Error('actionHeaders missing ' + h);
 });
 
