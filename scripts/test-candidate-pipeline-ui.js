@@ -54,7 +54,7 @@ assert((actionBlock.match(/'触发原因'/g) || []).length === 1, 'one trigger r
 assert(actionBlock.indexOf("'今日动作'") < 0, 'no duplicate 今日动作');
 assert(actionBlock.indexOf("'Decision状态'") < 0, 'no duplicate Decision状态');
 assert(src.indexOf("row[0] || '').trim() === siteId") >= 0, 'Site ID dedupe');
-assert(src.indexOf("row[2] || '').trim() === String(appId).trim()") >= 0, 'App ID dedupe');
+assert(src.indexOf("row[2] || '').trim() === normalizedAppId") >= 0, 'App ID dedupe');
 assert(src.indexOf('sheet.getRange(4, 1, Math.max(sheet.getMaxRows() - 3, 1), sheet.getMaxColumns()).clearDataValidations()') >= 0, 'old action validations cleared');
 assert(src.indexOf("const decisionCol = col('Decision')") >= 0, 'Decision validation follows header');
 // Simulate the reported V3.3 migration: a stale W4 rule is cleared before the current Decision rule is applied.

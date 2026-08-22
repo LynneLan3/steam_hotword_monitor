@@ -183,6 +183,7 @@ const HOTWORD_V2 = {
     'Decision', 'Decision日期', 'Next Action'
   ],
 
+  /** Site ID is a cross-system reference; Steam runtime preserves existing values and never rewrites them. */
   sitePoolHeaders: ['Site ID', '游戏名称', 'Steam App ID', '当前状态', 'BUILD日期', 'Build状态', 'Repo URL', 'Vercel URL', '上线日期', '模板版本', 'GSC状态', 'GSC Site', 'GSC URL Prefix', 'GSC Last Sync', 'SEO阶段', 'Index状态', '首次曝光日期', 'Clicks', 'Impressions', 'CTR', 'Average Position'],
   gscBindingHeaders: ['Site ID', '游戏名称', 'Steam App ID', '网站URL', 'GSC Property', 'GSC状态', '首次同步日期', '最近同步日期'],
   /** Phase 4.4：独立 GSC 监控 Spreadsheet，只读。 */
@@ -3343,20 +3344,74 @@ function findMasterRecord_(ss, appId) {
   return rows.find(row => String(row[1] || '').trim() === String(appId).trim()) || null;
 }
 
+function isSiteIdContractValue_(value) {
+  const siteId = String(value || '').trim();
+  return !!siteId && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(siteId);
+}
+
 function siteIdFromGameName_(name) {
   return String(name || '').toLowerCase().normalize('NFKD')
     .replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '').replace(/-+/g, '-') || 'steam-candidate';
+    .replace(/^-+|-+$/g, '').replace(/-+/g, '-') || '';
+}
+
+function inspectSitePoolSiteIds_(sheet) {
+  const result = {rows: 0, missing: 0, duplicate: 0, invalid: 0};
+  if (!sheet || sheet.getLastRow() < 2) return result;
+  const lastColumn = Math.max(sheet.getLastColumn(), HOTWORD_V2.sitePoolHeaders.length);
+  const headers = sheet.getRange(1, 1, 1, lastColumn).getDisplayValues()[0];
+  const siteIdColumn = headers.indexOf('Site ID');
+  if (siteIdColumn < 0) return result;
+  const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, lastColumn).getValues();
+  const seen = new Set();
+  result.rows = rows.length;
+  rows.forEach(row => {
+    const siteId = String(row[siteIdColumn] || '').trim();
+    if (!siteId) {
+      result.missing++;
+      return;
+    }
+    if (!isSiteIdContractValue_(siteId)) result.invalid++;
+    if (seen.has(siteId)) result.duplicate++;
+    seen.add(siteId);
+  });
+  return result;
+}
+
+function logSitePoolIdentityIssue_(message) {
+  if (typeof Logger !== 'undefined' && Logger.log) Logger.log(message);
 }
 
 function upsertSitePoolRecord_(ss, gameName, appId, buildDate) {
   const sheet = ensureSitePoolSchema_(ss);
   const siteId = siteIdFromGameName_(gameName);
+  const normalizedAppId = String(appId || '').trim();
+  if (!isSiteIdContractValue_(siteId) || !normalizedAppId) {
+    logSitePoolIdentityIssue_('Site Pool upsert skipped: Site ID and Steam App ID are required.');
+    return null;
+  }
   const values = sheet.getLastRow() < 2 ? [] : sheet.getRange(2, 1, sheet.getLastRow() - 1, HOTWORD_V2.sitePoolHeaders.length).getValues();
-  const index = values.findIndex(row => String(row[0] || '').trim() === siteId || String(row[2] || '').trim() === String(appId).trim());
+  const appIdIndex = values.findIndex(row => String(row[2] || '').trim() === normalizedAppId);
+  const siteIdIndex = values.findIndex(row => String(row[0] || '').trim() === siteId);
+  let index = appIdIndex;
+  if (index < 0 && siteIdIndex >= 0) {
+    const existingAppId = String(values[siteIdIndex][2] || '').trim();
+    if (existingAppId && existingAppId !== normalizedAppId) {
+      logSitePoolIdentityIssue_('Site ID collision skipped: ' + siteId + ' is already linked to Steam App ID ' + existingAppId + '.');
+      return null;
+    }
+    index = siteIdIndex;
+  }
+  if (appIdIndex >= 0 && !String(values[appIdIndex][0] || '').trim() && siteIdIndex >= 0 && siteIdIndex !== appIdIndex) {
+    const existingAppId = String(values[siteIdIndex][2] || '').trim();
+    if (existingAppId && existingAppId !== normalizedAppId) {
+      logSitePoolIdentityIssue_('Site ID collision skipped: ' + siteId + ' is already linked to Steam App ID ' + existingAppId + '.');
+      return null;
+    }
+  }
   if (index >= 0) {
     const existing = values[index];
-    const row = [existing[0] || siteId, existing[1] || gameName, existing[2] || String(appId), existing[3] || 'BUILD_PENDING', existing[4] || buildDate,
+    const row = [existing[0] || siteId, existing[1] || gameName, existing[2] || normalizedAppId, existing[3] || 'BUILD_PENDING', existing[4] || buildDate,
       existing[5] || 'BUILD_PENDING', existing[6] || '', existing[7] || '', existing[8] || '', existing[9] || '', existing[10] || 'NOT_CONNECTED',
       existing[11] || '', existing[12] || '', existing[13] || '', existing[14] || 'WAITING_INDEX', existing[15] || 'UNKNOWN', existing[16] || '',
       existing[17] || '', existing[18] || '', existing[19] || '', existing[20] || ''];
@@ -3364,7 +3419,7 @@ function upsertSitePoolRecord_(ss, gameName, appId, buildDate) {
     upsertGscBindingRecord_(ss, row[0], row[1], row[2], row[7]);
     return row;
   }
-  const row = [siteId, gameName, String(appId), 'BUILD_PENDING', buildDate, 'BUILD_PENDING', '', '', '', '', 'NOT_CONNECTED', '', '', '', 'WAITING_INDEX', 'UNKNOWN', '', '', '', '', ''];
+  const row = [siteId, gameName, normalizedAppId, 'BUILD_PENDING', buildDate, 'BUILD_PENDING', '', '', '', '', 'NOT_CONNECTED', '', '', '', 'WAITING_INDEX', 'UNKNOWN', '', '', '', '', ''];
   sheet.getRange(sheet.getLastRow() + 1, 1, 1, row.length).setValues([row]);
   upsertGscBindingRecord_(ss, row[0], row[1], row[2], row[7]);
   return row;
