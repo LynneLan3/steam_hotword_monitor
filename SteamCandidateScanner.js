@@ -180,7 +180,9 @@ const HOTWORD_V2 = {
     '上次检查类型', '下次复查日', '决策备注', '上次检查时决策状态',
     '首次发现日期', '首次来源', '第一轮类型', '当前Steam阶段', '研究状态',
     'Google Trends结果', 'Social结果', 'SERP竞争', '关键词机会', '人工备注',
-    'Decision', 'Decision日期', 'Next Action'
+    'Decision', 'Decision日期', 'Next Action',
+    // Phase 7C-2：append-only Steam Opportunity identity；旧列位置不移动。
+    'OpportunityID'
   ],
 
   /** Site ID is a cross-system reference; Steam runtime preserves existing values and never rewrites them. */
@@ -3355,6 +3357,19 @@ function siteIdFromGameName_(name) {
     .replace(/^-+|-+$/g, '').replace(/-+/g, '-') || '';
 }
 
+/**
+ * Steam Candidate Opportunity identity.
+ * The game_id deliberately reuses the existing Site ID/canonical slug logic;
+ * Steam App ID is the runtime key that decides whether this value is created
+ * or reused. The fixed 001 sequence is not a run counter.
+ */
+function opportunityIdFromSteamCandidate_(gameName, appId) {
+  const normalizedAppId = String(appId || '').trim();
+  const gameId = siteIdFromGameName_(gameName);
+  if (!normalizedAppId || !gameId) return '';
+  return 'opp-' + gameId + '-steam-candidate-001';
+}
+
 function inspectSitePoolSiteIds_(sheet) {
   const result = {rows: 0, missing: 0, duplicate: 0, invalid: 0};
   if (!sheet || sheet.getLastRow() < 2) return result;
@@ -3868,6 +3883,7 @@ function readCandidateDecisions_(ss) {
   const sheet = ss.getSheetByName(HOTWORD_V2.sheets.decisions);
   const out = new Map();
   if (!sheet || sheet.getLastRow() < 2) return out;
+  const opportunityIdColumn = HOTWORD_V2.decisionHeaders.indexOf('OpportunityID');
   sheet.getRange(2, 1, sheet.getLastRow() - 1, HOTWORD_V2.decisionHeaders.length).getValues().forEach((row, index) => {
     const appId = String(row[0] || '').trim();
     if (!appId) return;
@@ -3886,7 +3902,8 @@ function readCandidateDecisions_(ss) {
       lastCheckedStatus: normalizeDecisionStatus_(row[8]),
       firstSeen: row[9] || '', source: row[10] || '', firstType: row[11] || '', currentStage: row[12] || '',
       researchStatus: row[13] || '', trendsResult: row[14] || '', socialResult: row[15] || '', serpCompetition: row[16] || '',
-      keywordOpportunity: row[17] || '', manualNote: row[18] || '', decisionDate: row[20] || '', nextAction: row[21] || ''
+      keywordOpportunity: row[17] || '', manualNote: row[18] || '', decisionDate: row[20] || '', nextAction: row[21] || '',
+      opportunityId: opportunityIdColumn >= 0 ? String(row[opportunityIdColumn] || '').trim() : ''
     });
   });
   return out;
@@ -3898,7 +3915,7 @@ function candidateDecisionRow_(decision) {
     decision.lastType, decision.nextRecheckDate, decision.note, decision.lastCheckedStatus,
     decision.firstSeen, decision.source, decision.firstType, decision.currentStage, decision.researchStatus,
     decision.trendsResult, decision.socialResult, decision.serpCompetition, decision.keywordOpportunity, decision.manualNote,
-    decision.status, decision.decisionDate, decision.nextAction
+    decision.status, decision.decisionDate, decision.nextAction, decision.opportunityId || ''
   ];
 }
 
@@ -3914,6 +3931,9 @@ function syncCandidateDecisions_(ss, records, runTime, rules) {
       decisions.set(appId, decision);
     }
     decision.name = rec.name;
+    // Opportunity precedes Decision: create only when this candidate enters the
+    // normal decision runtime, and preserve it across later refreshes/statuses.
+    decision.opportunityId = decision.opportunityId || opportunityIdFromSteamCandidate_(decision.name, appId);
     const masterRow = findMasterRecord_(ss, appId);
     if (masterRow) {
       decision.firstSeen = decision.firstSeen || masterRow[28] || runTime;
@@ -3978,9 +3998,10 @@ function syncCandidateDecisionFromActionEdit_(e) {
   let decision = decisions.get(appId);
   if (!decision) {
     decision = {appId, name: at('游戏名称') || '', status: '', lastCheckedDate: '', lastGain: '', lastType: '', nextRecheckDate: '', note: '', lastCheckedStatus: '',
-      firstSeen: '', source: '', firstType: '', currentStage: at('当前阶段') || '', researchStatus: '', trendsResult: '', socialResult: '', serpCompetition: '', keywordOpportunity: '', manualNote: '', decisionDate: '', nextAction: ''};
+      firstSeen: '', source: '', firstType: '', currentStage: at('当前阶段') || '', researchStatus: '', trendsResult: '', socialResult: '', serpCompetition: '', keywordOpportunity: '', manualNote: '', decisionDate: '', nextAction: '', opportunityId: ''};
   }
   decision.name = at('游戏名称') || decision.name;
+  decision.opportunityId = decision.opportunityId || opportunityIdFromSteamCandidate_(decision.name, appId);
   decision.firstType = decision.firstType || at('第一轮类型') || '';
   decision.currentStage = at('当前阶段') || decision.currentStage;
   decision.trendsResult = at('Trends结果') || '';
@@ -4049,6 +4070,11 @@ function captureCandidateDecisionEdit_(e) {
   if (decisionColumn > 0) sheet.getRange(e.range.getRow(), decisionColumn).setValue(status);
   if (legacyColumn > 0) sheet.getRange(e.range.getRow(), legacyColumn).setValue(status);
   const appId = String(sheet.getRange(e.range.getRow(), 1).getDisplayValue() || '').trim();
+  const opportunityIdColumn = headers.indexOf('OpportunityID') + 1;
+  if (opportunityIdColumn > 0 && !sheet.getRange(e.range.getRow(), opportunityIdColumn).getDisplayValue()) {
+    const name = sheet.getRange(e.range.getRow(), 2).getDisplayValue();
+    sheet.getRange(e.range.getRow(), opportunityIdColumn).setValue(opportunityIdFromSteamCandidate_(name, appId));
+  }
   const master = e.source.getSheetByName(HOTWORD_V2.sheets.master);
   if (!appId || !master || master.getLastRow() < 2) return;
   const ids = master.getRange(2, 2, master.getLastRow() - 1, 1).getDisplayValues();
