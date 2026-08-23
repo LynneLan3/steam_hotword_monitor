@@ -185,7 +185,10 @@ const HOTWORD_V2 = {
     'OpportunityID',
     // M7A：append-only automatic Candidate Research queue/result fields。
     'ResearchJobID', '自动研究状态', '自动研究时间', '自动Social摘要',
-    '自动SERP摘要', '自动研究结果路径'
+    '自动SERP摘要', '自动研究结果路径',
+    // M7C：append-only callback recommendation fields；不覆盖人工字段。
+    '自动Recommendation', '自动Recommendation置信度', '自动Recommendation理由',
+    '自动缺失证据', '自动Recommendation结果路径', '自动研究错误'
   ],
 
   /** Site ID is a cross-system reference; Steam runtime preserves existing values and never rewrites them. */
@@ -205,6 +208,15 @@ const HOTWORD_V2 = {
 const STEAM_CANDIDATE_RESEARCH_JOB_TYPE = 'STEAM_CANDIDATE_RESEARCH';
 const STEAM_CANDIDATE_RESEARCH_PENDING = 'PENDING';
 const STEAM_CANDIDATE_RESEARCH_CHECKS = ['GAME_WIDE_SOCIAL', 'GOOGLE_ORGANIC_SERP'];
+const STEAM_CANDIDATE_RESEARCH_WRITE_TOKEN_PROP = 'STEAM_CANDIDATE_RESEARCH_WRITE_TOKEN';
+const STEAM_CANDIDATE_RESEARCH_EXEC_COMPLETED = 'COMPLETED';
+const STEAM_CANDIDATE_RESEARCH_EXEC_FAILED = 'FAILED';
+const STEAM_CANDIDATE_RECOMMENDATIONS = {
+  RECOMMEND_BUILD: true,
+  RECOMMEND_WATCH: true,
+  RECOMMEND_REJECT: true
+};
+const STEAM_CANDIDATE_RESEARCH_CONFIDENCES = { HIGH: true, MEDIUM: true, LOW: true };
 
 
 // ============================================================================
@@ -238,6 +250,232 @@ function doGet(e) {
   return ContentService
     .createTextOutput(JSON.stringify({ error: 'unknown_action', jobs: [] }))
     .setMimeType(ContentService.MimeType.JSON);
+}
+
+/** Web App POST: accepts only the Steam Candidate Research callback contract. */
+function doPost(e) {
+  try {
+    const body = steamCandidateResearchParsePostJson_(e);
+    if (!body) return steamCandidateResearchJsonOutput_({ok: false, error: 'invalid_json'});
+    if (!checkSteamCandidateResearchWriteToken_(e, body)) {
+      return steamCandidateResearchJsonOutput_({ok: false, error: 'unauthorized'});
+    }
+    if (String(body.job_type || '').trim().toUpperCase() !== STEAM_CANDIDATE_RESEARCH_JOB_TYPE) {
+      return steamCandidateResearchJsonOutput_({ok: false, error: 'unsupported_job_type'});
+    }
+    return steamCandidateResearchJsonOutput_(handleSteamCandidateResearchCallback_(body));
+  } catch (err) {
+    return steamCandidateResearchJsonOutput_({
+      ok: false,
+      error: String((err && err.message) || err || 'unknown_error')
+    });
+  }
+}
+
+function steamCandidateResearchJsonOutput_(obj) {
+  return ContentService
+    .createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+function steamCandidateResearchParsePostJson_(e) {
+  if (!e || !e.postData || e.postData.contents == null) return null;
+  try {
+    return JSON.parse(e.postData.contents);
+  } catch (err) {
+    return null;
+  }
+}
+
+function checkSteamCandidateResearchWriteToken_(e, body) {
+  const expected = PropertiesService.getScriptProperties().getProperty(
+    STEAM_CANDIDATE_RESEARCH_WRITE_TOKEN_PROP
+  );
+  if (!expected) return false;
+  let provided = body && body.token != null ? String(body.token).trim() : '';
+  if (!provided && e && e.parameter && e.parameter.token != null) {
+    provided = String(e.parameter.token).trim();
+  }
+  return provided !== '' && provided === expected;
+}
+
+/** Set once through Apps Script execution; token is never written to a Sheet or repository. */
+function initSteamCandidateResearchWriteToken_() {
+  const props = PropertiesService.getScriptProperties();
+  const existing = props.getProperty(STEAM_CANDIDATE_RESEARCH_WRITE_TOKEN_PROP);
+  if (existing) return {ok: false, error: 'already_configured'};
+  const token = Utilities.getUuid().replace(/-/g, '');
+  props.setProperty(STEAM_CANDIDATE_RESEARCH_WRITE_TOKEN_PROP, token);
+  return {ok: true, token: token};
+}
+
+function rotateSteamCandidateResearchWriteToken(token) {
+  token = String(token || '').trim();
+  if (!token) return {ok: false, error: 'empty_token'};
+  PropertiesService.getScriptProperties().setProperty(
+    STEAM_CANDIDATE_RESEARCH_WRITE_TOKEN_PROP,
+    token
+  );
+  return {ok: true, key: STEAM_CANDIDATE_RESEARCH_WRITE_TOKEN_PROP};
+}
+
+function steamCandidateResearchCallbackString_(value) {
+  return String(value == null ? '' : value).trim();
+}
+
+function steamCandidateResearchCallbackArray_(value) {
+  if (Object.prototype.toString.call(value) !== '[object Array]') return [];
+  return value.map(function (item) { return steamCandidateResearchCallbackString_(item); })
+    .filter(function (item) { return item !== ''; });
+}
+
+function steamCandidateResearchCallbackNonNegativeNumber_(value, field) {
+  if (typeof value !== 'number' || !isFinite(value) || value < 0) {
+    return {ok: false, error: 'invalid_' + field};
+  }
+  return {ok: true, value: value};
+}
+
+function validateSteamCandidateResearchCallback_(body) {
+  if (!body || Object.prototype.toString.call(body) !== '[object Object]') {
+    return {ok: false, error: 'invalid_callback_body'};
+  }
+  const required = ['job_id', 'job_type', 'steam_app_id', 'game_name', 'research_cycle_date', 'execution_status'];
+  for (let i = 0; i < required.length; i++) {
+    if (!steamCandidateResearchCallbackString_(body[required[i]])) {
+      return {ok: false, error: 'missing_' + required[i]};
+    }
+  }
+  if (steamCandidateResearchCallbackString_(body.job_type).toUpperCase() !== STEAM_CANDIDATE_RESEARCH_JOB_TYPE) {
+    return {ok: false, error: 'unsupported_job_type'};
+  }
+  const executionStatus = steamCandidateResearchCallbackString_(body.execution_status).toUpperCase();
+  if (Object.prototype.hasOwnProperty.call(body, 'evidence') ||
+      Object.prototype.hasOwnProperty.call(body, 'results') ||
+      Object.prototype.hasOwnProperty.call(body, 'organic_results')) {
+    return {ok: false, error: 'raw_evidence_not_allowed'};
+  }
+  if (executionStatus === STEAM_CANDIDATE_RESEARCH_EXEC_FAILED) {
+    if (!steamCandidateResearchCallbackString_(body.error)) return {ok: false, error: 'missing_error'};
+    if (Object.prototype.hasOwnProperty.call(body, 'recommendation')) {
+      return {ok: false, error: 'failed_callback_must_not_include_recommendation'};
+    }
+    return {ok: true, executionStatus: executionStatus};
+  }
+  if (executionStatus !== STEAM_CANDIDATE_RESEARCH_EXEC_COMPLETED) {
+    return {ok: false, error: 'invalid_execution_status'};
+  }
+  const recommendation = steamCandidateResearchCallbackString_(body.recommendation);
+  const confidence = steamCandidateResearchCallbackString_(body.confidence);
+  if (!STEAM_CANDIDATE_RECOMMENDATIONS[recommendation]) return {ok: false, error: 'invalid_recommendation'};
+  if (!STEAM_CANDIDATE_RESEARCH_CONFIDENCES[confidence]) return {ok: false, error: 'invalid_confidence'};
+  if (!steamCandidateResearchCallbackString_(body.completed_at)) return {ok: false, error: 'missing_completed_at'};
+  if (!steamCandidateResearchCallbackString_(body.research_result_path) ||
+      !steamCandidateResearchCallbackString_(body.recommendation_result_path)) {
+    return {ok: false, error: 'missing_result_path'};
+  }
+  if (Object.prototype.toString.call(body.reasons) !== '[object Array]' ||
+      Object.prototype.toString.call(body.blocking_reasons) !== '[object Array]' ||
+      Object.prototype.toString.call(body.missing_evidence) !== '[object Array]') {
+    return {ok: false, error: 'invalid_recommendation_arrays'};
+  }
+  const social = body.social_summary;
+  const serp = body.serp_summary;
+  if (!social || Object.prototype.toString.call(social) !== '[object Object]') {
+    return {ok: false, error: 'missing_social_summary'};
+  }
+  if (!serp || Object.prototype.toString.call(serp) !== '[object Object]') {
+    return {ok: false, error: 'missing_serp_summary'};
+  }
+  const socialStatus = steamCandidateResearchCallbackString_(social.status).toUpperCase();
+  const serpStatus = steamCandidateResearchCallbackString_(serp.status).toUpperCase();
+  if (['AVAILABLE', 'UNAVAILABLE'].indexOf(socialStatus) < 0) return {ok: false, error: 'invalid_social_status'};
+  if (['AVAILABLE', 'UNAVAILABLE'].indexOf(serpStatus) < 0) return {ok: false, error: 'invalid_serp_status'};
+  const socialFields = ['evidence_count', 'cluster_count', 'actionable_cluster_count', 'watch_cluster_count'];
+  for (let j = 0; j < socialFields.length; j++) {
+    const checked = steamCandidateResearchCallbackNonNegativeNumber_(social[socialFields[j]], socialFields[j]);
+    if (!checked.ok) return checked;
+  }
+  const organic = steamCandidateResearchCallbackNonNegativeNumber_(serp.organic_count, 'organic_count');
+  if (!organic.ok) return organic;
+  const topics = social.top_topics;
+  if (Object.prototype.toString.call(topics) !== '[object Array]' || topics.length > 10) {
+    return {ok: false, error: 'invalid_top_topics'};
+  }
+  if (topics.some(function (topic) {
+    const text = steamCandidateResearchCallbackString_(topic);
+    return !text || /^https?:\/\//i.test(text);
+  })) return {ok: false, error: 'invalid_top_topics'};
+  return {ok: true, executionStatus: executionStatus};
+}
+
+function steamCandidateResearchNameKey_(value) {
+  return steamCandidateResearchCallbackString_(value).toLowerCase().replace(/\s+/g, ' ');
+}
+
+function steamCandidateResearchSetAutomaticField_(sheet, rowNumber, field, value) {
+  const column = HOTWORD_V2.decisionHeaders.indexOf(field);
+  if (column >= 0) sheet.getRange(rowNumber, column + 1).setValue(value);
+}
+
+function steamCandidateResearchJoin_(value) {
+  return steamCandidateResearchCallbackArray_(value).join(' | ');
+}
+
+function steamCandidateResearchSocialSummary_(summary) {
+  const topics = steamCandidateResearchCallbackArray_(summary.top_topics);
+  let text = steamCandidateResearchCallbackString_(summary.status).toUpperCase() +
+    ' | evidence=' + summary.evidence_count +
+    ' | clusters=' + summary.cluster_count +
+    ' | actionable=' + summary.actionable_cluster_count;
+  if (topics.length) text += ' | ' + topics.join(' / ');
+  return text;
+}
+
+function steamCandidateResearchSerpSummary_(summary) {
+  return steamCandidateResearchCallbackString_(summary.status).toUpperCase() +
+    ' | organic=' + summary.organic_count +
+    ' | guide=' + steamCandidateResearchCallbackString_(summary.guide_density).toUpperCase() +
+    ' | video_ugc=' + (summary.high_video_ugc ? 'yes' : 'no') +
+    ' | contamination=' + (summary.contamination ? 'yes' : 'no');
+}
+
+function handleSteamCandidateResearchCallback_(body) {
+  const validation = validateSteamCandidateResearchCallback_(body);
+  if (!validation.ok) return validation;
+  const appId = steamCandidateResearchCallbackString_(body.steam_app_id);
+  const decisions = readCandidateDecisions_(SpreadsheetApp.getActiveSpreadsheet());
+  const decision = decisions.get(appId);
+  if (!decision) return {ok: false, error: 'candidate_not_found'};
+  if (steamCandidateResearchCallbackString_(decision.researchJobId) !== steamCandidateResearchCallbackString_(body.job_id)) {
+    return {ok: false, error: 'job_id_mismatch'};
+  }
+  if (steamCandidateResearchNameKey_(decision.name) !== steamCandidateResearchNameKey_(body.game_name)) {
+    return {ok: false, error: 'game_name_mismatch'};
+  }
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(HOTWORD_V2.sheets.decisions);
+  if (!sheet) return {ok: false, error: 'candidate_sheet_missing'};
+  const status = validation.executionStatus;
+  if (status === STEAM_CANDIDATE_RESEARCH_EXEC_FAILED) {
+    steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动研究状态', status);
+    steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动研究错误', steamCandidateResearchCallbackString_(body.error));
+    ['自动Social摘要', '自动SERP摘要', '自动Recommendation', '自动Recommendation置信度',
+      '自动Recommendation理由', '自动缺失证据', '自动Recommendation结果路径'].forEach(function (field) {
+        steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, field, '');
+      });
+    return {ok: true, job_id: body.job_id, execution_status: status};
+  }
+  steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动研究状态', status);
+  steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动研究时间', body.completed_at);
+  steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动Social摘要', steamCandidateResearchSocialSummary_(body.social_summary));
+  steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动SERP摘要', steamCandidateResearchSerpSummary_(body.serp_summary));
+  steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动Recommendation', body.recommendation);
+  steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动Recommendation置信度', body.confidence);
+  steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动Recommendation理由', steamCandidateResearchJoin_(body.reasons));
+  steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动缺失证据', steamCandidateResearchJoin_(body.missing_evidence));
+  steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动Recommendation结果路径', body.recommendation_result_path);
+  steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动研究错误', '');
+  return {ok: true, job_id: body.job_id, execution_status: status};
 }
 
 // 兼容 V1 的旧函数名：如果你已经安装过旧 trigger，不会突然失效。
@@ -3912,32 +4150,41 @@ function readCandidateDecisions_(ss) {
   const out = new Map();
   if (!sheet || sheet.getLastRow() < 2) return out;
   const opportunityIdColumn = HOTWORD_V2.decisionHeaders.indexOf('OpportunityID');
+  const col = {};
+  HOTWORD_V2.decisionHeaders.forEach((name, index) => { col[name] = index; });
   sheet.getRange(2, 1, sheet.getLastRow() - 1, HOTWORD_V2.decisionHeaders.length).getValues().forEach((row, index) => {
-    const appId = String(row[0] || '').trim();
+    const at = name => col[name] === undefined ? '' : row[col[name]];
+    const appId = String(at('Steam App ID') || '').trim();
     if (!appId) return;
-    const explicitDecision = normalizeDecisionStatus_(row[19]);
+    const explicitDecision = normalizeDecisionStatus_(at('Decision'));
     out.set(appId, {
       row,
       rowNumber: index + 2,
       appId,
-      name: String(row[1] || ''),
-      status: explicitDecision || normalizeDecisionStatus_(row[2]),
-      lastCheckedDate: row[3],
-      lastGain: row[4],
-      lastType: String(row[5] || ''),
-      nextRecheckDate: row[6],
-      note: row[7] || '',
-      lastCheckedStatus: normalizeDecisionStatus_(row[8]),
-      firstSeen: row[9] || '', source: row[10] || '', firstType: row[11] || '', currentStage: row[12] || '',
-      researchStatus: row[13] || '', trendsResult: row[14] || '', socialResult: row[15] || '', serpCompetition: row[16] || '',
-      keywordOpportunity: row[17] || '', manualNote: row[18] || '', decisionDate: row[20] || '', nextAction: row[21] || '',
-      opportunityId: opportunityIdColumn >= 0 ? String(row[opportunityIdColumn] || '').trim() : '',
-      researchJobId: String(row[23] || '').trim(),
-      autoResearchStatus: String(row[24] || '').trim(),
-      autoResearchTime: row[25] || '',
-      autoSocialSummary: row[26] || '',
-      autoSerpSummary: row[27] || '',
-      autoResearchResultPath: String(row[28] || '').trim()
+      name: String(at('游戏名称') || ''),
+      status: explicitDecision || normalizeDecisionStatus_(at('决策状态')),
+      lastCheckedDate: at('上次人工检查日'),
+      lastGain: at('上次检查7d Gain'),
+      lastType: String(at('上次检查类型') || ''),
+      nextRecheckDate: at('下次复查日'),
+      note: at('决策备注') || '',
+      lastCheckedStatus: normalizeDecisionStatus_(at('上次检查时决策状态')),
+      firstSeen: at('首次发现日期') || '', source: at('首次来源') || '', firstType: at('第一轮类型') || '', currentStage: at('当前Steam阶段') || '',
+      researchStatus: at('研究状态') || '', trendsResult: at('Google Trends结果') || '', socialResult: at('Social结果') || '', serpCompetition: at('SERP竞争') || '',
+      keywordOpportunity: at('关键词机会') || '', manualNote: at('人工备注') || '', decisionDate: at('Decision日期') || '', nextAction: at('Next Action') || '',
+      opportunityId: opportunityIdColumn >= 0 ? String(at('OpportunityID') || '').trim() : '',
+      researchJobId: String(at('ResearchJobID') || '').trim(),
+      autoResearchStatus: String(at('自动研究状态') || '').trim(),
+      autoResearchTime: at('自动研究时间') || '',
+      autoSocialSummary: at('自动Social摘要') || '',
+      autoSerpSummary: at('自动SERP摘要') || '',
+      autoResearchResultPath: String(at('自动研究结果路径') || '').trim(),
+      autoRecommendation: String(at('自动Recommendation') || '').trim(),
+      autoRecommendationConfidence: String(at('自动Recommendation置信度') || '').trim(),
+      autoRecommendationReasons: String(at('自动Recommendation理由') || '').trim(),
+      autoMissingEvidence: String(at('自动缺失证据') || '').trim(),
+      autoRecommendationResultPath: String(at('自动Recommendation结果路径') || '').trim(),
+      autoResearchError: String(at('自动研究错误') || '').trim()
     });
   });
   return out;
@@ -4074,6 +4321,12 @@ function enqueueSteamCandidateResearchJobs_(ss, createdAt) {
     decisionSheet.getRange(rowNumber, decisionCol['自动Social摘要'] + 1).setValue('');
     decisionSheet.getRange(rowNumber, decisionCol['自动SERP摘要'] + 1).setValue('');
     decisionSheet.getRange(rowNumber, decisionCol['自动研究结果路径'] + 1).setValue('');
+    decisionSheet.getRange(rowNumber, decisionCol['自动Recommendation'] + 1).setValue('');
+    decisionSheet.getRange(rowNumber, decisionCol['自动Recommendation置信度'] + 1).setValue('');
+    decisionSheet.getRange(rowNumber, decisionCol['自动Recommendation理由'] + 1).setValue('');
+    decisionSheet.getRange(rowNumber, decisionCol['自动缺失证据'] + 1).setValue('');
+    decisionSheet.getRange(rowNumber, decisionCol['自动Recommendation结果路径'] + 1).setValue('');
+    decisionSheet.getRange(rowNumber, decisionCol['自动研究错误'] + 1).setValue('');
     createdJobIds.add(job.job_id);
     created.push(job);
   });
@@ -4119,7 +4372,10 @@ function candidateDecisionRow_(decision) {
     decision.trendsResult, decision.socialResult, decision.serpCompetition, decision.keywordOpportunity, decision.manualNote,
     decision.status, decision.decisionDate, decision.nextAction, decision.opportunityId || '',
     decision.researchJobId || '', decision.autoResearchStatus || '', decision.autoResearchTime || '',
-    decision.autoSocialSummary || '', decision.autoSerpSummary || '', decision.autoResearchResultPath || ''
+    decision.autoSocialSummary || '', decision.autoSerpSummary || '', decision.autoResearchResultPath || '',
+    decision.autoRecommendation || '', decision.autoRecommendationConfidence || '',
+    decision.autoRecommendationReasons || '', decision.autoMissingEvidence || '',
+    decision.autoRecommendationResultPath || '', decision.autoResearchError || ''
   ];
 }
 
@@ -4132,7 +4388,8 @@ function syncCandidateDecisions_(ss, records, runTime, rules) {
     if (!decision) {
       decision = {appId, name: rec.name, status: '', lastCheckedDate: '', lastGain: '', lastType: '', nextRecheckDate: '', note: '', lastCheckedStatus: '',
         firstSeen: '', source: '', firstType: '', currentStage: '', researchStatus: '待研究', trendsResult: '', socialResult: '', serpCompetition: '未检查', keywordOpportunity: '未检查', manualNote: '', decisionDate: '', nextAction: '',
-        researchJobId: '', autoResearchStatus: '', autoResearchTime: '', autoSocialSummary: '', autoSerpSummary: '', autoResearchResultPath: ''};
+        researchJobId: '', autoResearchStatus: '', autoResearchTime: '', autoSocialSummary: '', autoSerpSummary: '', autoResearchResultPath: '',
+        autoRecommendation: '', autoRecommendationConfidence: '', autoRecommendationReasons: '', autoMissingEvidence: '', autoRecommendationResultPath: '', autoResearchError: ''};
       decisions.set(appId, decision);
     }
     decision.name = rec.name;
@@ -4204,7 +4461,8 @@ function syncCandidateDecisionFromActionEdit_(e) {
   if (!decision) {
     decision = {appId, name: at('游戏名称') || '', status: '', lastCheckedDate: '', lastGain: '', lastType: '', nextRecheckDate: '', note: '', lastCheckedStatus: '',
       firstSeen: '', source: '', firstType: '', currentStage: at('当前阶段') || '', researchStatus: '', trendsResult: '', socialResult: '', serpCompetition: '', keywordOpportunity: '', manualNote: '', decisionDate: '', nextAction: '', opportunityId: '',
-      researchJobId: '', autoResearchStatus: '', autoResearchTime: '', autoSocialSummary: '', autoSerpSummary: '', autoResearchResultPath: ''};
+      researchJobId: '', autoResearchStatus: '', autoResearchTime: '', autoSocialSummary: '', autoSerpSummary: '', autoResearchResultPath: '',
+      autoRecommendation: '', autoRecommendationConfidence: '', autoRecommendationReasons: '', autoMissingEvidence: '', autoRecommendationResultPath: '', autoResearchError: ''};
   }
   decision.name = at('游戏名称') || decision.name;
   decision.opportunityId = decision.opportunityId || opportunityIdFromSteamCandidate_(decision.name, appId);
