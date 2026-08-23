@@ -4297,6 +4297,17 @@ function enqueueSteamCandidateResearchJobs_(ss, createdAt) {
 
     const decision = decisions.get(appId);
     if (!decision || !decision.rowNumber) return;
+    // M7E V1 is one-shot per Steam App ID. An existing ResearchJobID means
+    // this candidate has already entered the paid research lifecycle.
+    if (String(decision.researchJobId || '').trim()) {
+      skipped += 1;
+      return;
+    }
+    // Final human decisions are never eligible for automatic research.
+    if (String(decision.status || '').trim()) {
+      skipped += 1;
+      return;
+    }
     const jobId = 'steam-research-' + appId + '-' + cycleDate.replace(/-/g, '');
     if (createdJobIds.has(jobId)) {
       skipped += 1;
@@ -4359,6 +4370,8 @@ function loadPendingSteamCandidateResearchJobs_() {
     const jobId = String(decision.researchJobId || '').trim();
     const masterRow = masterByAppId.get(String(decision.appId || '').trim());
     if (!jobId || !masterRow) return;
+    if (String(masterRow[masterCol['进入下一步']] || '').trim() !== '是') return;
+    if (String(decision.status || '').trim()) return;
     jobs.push(buildSteamCandidateResearchJob_(masterRow, masterCol, decision, ss, decision.autoResearchTime));
   });
   return jobs;
