@@ -182,7 +182,10 @@ const HOTWORD_V2 = {
     'Google Trends结果', 'Social结果', 'SERP竞争', '关键词机会', '人工备注',
     'Decision', 'Decision日期', 'Next Action',
     // Phase 7C-2：append-only Steam Opportunity identity；旧列位置不移动。
-    'OpportunityID'
+    'OpportunityID',
+    // M7A：append-only automatic Candidate Research queue/result fields。
+    'ResearchJobID', '自动研究状态', '自动研究时间', '自动Social摘要',
+    '自动SERP摘要', '自动研究结果路径'
   ],
 
   /** Site ID is a cross-system reference; Steam runtime preserves existing values and never rewrites them. */
@@ -198,6 +201,10 @@ const HOTWORD_V2 = {
     geo: 'US'
   }
 };
+
+const STEAM_CANDIDATE_RESEARCH_JOB_TYPE = 'STEAM_CANDIDATE_RESEARCH';
+const STEAM_CANDIDATE_RESEARCH_PENDING = 'PENDING';
+const STEAM_CANDIDATE_RESEARCH_CHECKS = ['GAME_WIDE_SOCIAL', 'GOOGLE_ORGANIC_SERP'];
 
 
 // ============================================================================
@@ -218,6 +225,19 @@ function onOpen() {
     .addItem('安装每日自动触发器', 'installDailyHotwordTrigger')
     .addItem('删除每日自动触发器', 'removeDailyHotwordTriggers')
     .addToUi();
+}
+
+/** Read-only Steam Candidate Research queue endpoint. */
+function doGet(e) {
+  const action = e && e.parameter ? String(e.parameter.action || '').trim() : '';
+  if (action === 'pendingSteamCandidateResearchJobs') {
+    return ContentService
+      .createTextOutput(JSON.stringify({ jobs: loadPendingSteamCandidateResearchJobs_() }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+  return ContentService
+    .createTextOutput(JSON.stringify({ error: 'unknown_action', jobs: [] }))
+    .setMimeType(ContentService.MimeType.JSON);
 }
 
 // 兼容 V1 的旧函数名：如果你已经安装过旧 trigger，不会突然失效。
@@ -1307,6 +1327,14 @@ function runSteamHotword01B() {
     appendSnapshots_(ss, active, startedAt, runId);
 
     const decisions = syncCandidateDecisions_(ss, active, startedAt, rules);
+    try {
+      const queueResult = enqueueSteamCandidateResearchJobs_(ss, startedAt);
+      if (queueResult && Number(queueResult.created)) {
+        discoveryNotes.push('M7A Candidate Research enqueue ' + queueResult.created);
+      }
+    } catch (queueErr) {
+      warnings.push('M7A Candidate Research enqueue failed: ' + String(queueErr && queueErr.message || queueErr));
+    }
     const actions = active
       .map(rec => {
         const decision = decisions.get(String(rec.appId));
@@ -3903,10 +3931,184 @@ function readCandidateDecisions_(ss) {
       firstSeen: row[9] || '', source: row[10] || '', firstType: row[11] || '', currentStage: row[12] || '',
       researchStatus: row[13] || '', trendsResult: row[14] || '', socialResult: row[15] || '', serpCompetition: row[16] || '',
       keywordOpportunity: row[17] || '', manualNote: row[18] || '', decisionDate: row[20] || '', nextAction: row[21] || '',
-      opportunityId: opportunityIdColumn >= 0 ? String(row[opportunityIdColumn] || '').trim() : ''
+      opportunityId: opportunityIdColumn >= 0 ? String(row[opportunityIdColumn] || '').trim() : '',
+      researchJobId: String(row[23] || '').trim(),
+      autoResearchStatus: String(row[24] || '').trim(),
+      autoResearchTime: row[25] || '',
+      autoSocialSummary: row[26] || '',
+      autoSerpSummary: row[27] || '',
+      autoResearchResultPath: String(row[28] || '').trim()
     });
   });
   return out;
+}
+
+// ============================================================================
+// M7A — Steam Candidate Research bridge
+// ============================================================================
+
+function steamCandidateResearchNumberOrNull_(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function steamCandidateResearchDateString_(value, ss) {
+  if (value === null || value === undefined || value === '') return '';
+  if (Object.prototype.toString.call(value) === '[object Date]' && !isNaN(value.getTime())) {
+    const tz = ss && ss.getSpreadsheetTimeZone ? ss.getSpreadsheetTimeZone() : 'Asia/Shanghai';
+    return Utilities.formatDate(value, tz, 'yyyy-MM-dd');
+  }
+  return String(value).trim();
+}
+
+function steamCandidateResearchCreatedAt_(value) {
+  if (Object.prototype.toString.call(value) === '[object Date]' && !isNaN(value.getTime())) {
+    return value.toISOString();
+  }
+  const text = String(value || '').trim();
+  return text || new Date().toISOString();
+}
+
+function steamCandidateResearchCycleFromJobId_(jobId) {
+  const match = /-(\d{8})$/.exec(String(jobId || '').trim());
+  if (!match) return '';
+  const compact = match[1];
+  return compact.slice(0, 4) + '-' + compact.slice(4, 6) + '-' + compact.slice(6, 8);
+}
+
+function steamCandidateResearchSignalsFromMasterRow_(masterRow, masterCol, ss) {
+  const value = name => masterCol[name] === undefined ? '' : masterRow[masterCol[name]];
+  return {
+    first_round_type: String(value('第一轮类型') || '').trim(),
+    first_round_priority: String(value('第一轮优先级') || '').trim(),
+    followers: steamCandidateResearchNumberOrNull_(value('Steam Followers')),
+    followers_gain_7d: steamCandidateResearchNumberOrNull_(value('Steam 7d Gain')),
+    growth_rate: steamCandidateResearchNumberOrNull_(value('近似增长率')),
+    release_stage: String(value('发布阶段') || '').trim(),
+    release_date: steamCandidateResearchDateString_(value('Steam 发布日期'), ss),
+    days_to_release: steamCandidateResearchNumberOrNull_(value('距发售天数')),
+    review_count: steamCandidateResearchNumberOrNull_(value('评论数')),
+    steam_score: steamCandidateResearchNumberOrNull_(value('Steam评分'))
+  };
+}
+
+function buildSteamCandidateResearchJob_(masterRow, masterCol, decision, ss, createdAt) {
+  const value = name => masterCol[name] === undefined ? '' : masterRow[masterCol[name]];
+  const appId = String(value('Steam App ID') || decision.appId || '').trim();
+  const gameName = String(value('游戏名称') || decision.name || '').trim();
+  const cycleDate = steamCandidateResearchCycleFromJobId_(decision.researchJobId) ||
+    steamCandidateResearchDateString_(createdAt, ss);
+  const ymd = cycleDate.replace(/-/g, '');
+  const jobId = String(decision.researchJobId || '').trim() ||
+    ('steam-research-' + appId + '-' + ymd);
+  return {
+    job_id: jobId,
+    job_type: STEAM_CANDIDATE_RESEARCH_JOB_TYPE,
+    steam_app_id: appId,
+    game_name: gameName,
+    steam_url: String(value('Steam URL') || '').trim(),
+    research_cycle_date: cycleDate,
+    steam_signals: steamCandidateResearchSignalsFromMasterRow_(masterRow, masterCol, ss),
+    manual_signals: {
+      trends_result: decision.trendsResult || '',
+      keyword_opportunity: decision.keywordOpportunity || ''
+    },
+    serp_queries: gameName ? [gameName] : [],
+    requested_checks: STEAM_CANDIDATE_RESEARCH_CHECKS.slice(),
+    created_at: steamCandidateResearchCreatedAt_(decision.autoResearchTime || createdAt)
+  };
+}
+
+function enqueueSteamCandidateResearchJobs_(ss, createdAt) {
+  ss = ss || SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) return { created: 0, skipped: 0 };
+  const decisionSheet = ss.getSheetByName(HOTWORD_V2.sheets.decisions);
+  const masterSheet = ss.getSheetByName(HOTWORD_V2.sheets.master);
+  if (!decisionSheet || !masterSheet || masterSheet.getLastRow() < 2) {
+    return { created: 0, skipped: 0, error: 'candidate_sheet_missing' };
+  }
+
+  const decisionCol = {};
+  HOTWORD_V2.decisionHeaders.forEach((name, index) => { decisionCol[name] = index; });
+  const masterCol = {};
+  HOTWORD_V2.masterHeaders.forEach((name, index) => { masterCol[name] = index; });
+  const masterRows = masterSheet.getRange(
+    2, 1, masterSheet.getLastRow() - 1, HOTWORD_V2.masterHeaders.length
+  ).getValues();
+  const decisions = readCandidateDecisions_(ss);
+  const now = createdAt || new Date();
+  const cycleDate = steamCandidateResearchDateString_(now, ss);
+  const created = [];
+  const createdJobIds = new Set();
+  let skipped = 0;
+
+  masterRows.forEach(masterRow => {
+    const appId = String(masterRow[masterCol['Steam App ID']] || '').trim();
+    const continueNext = String(masterRow[masterCol['进入下一步']] || '').trim();
+    if (!isReliableSteamAppId_(appId) || continueNext !== '是') return;
+
+    const decision = decisions.get(appId);
+    if (!decision || !decision.rowNumber) return;
+    const jobId = 'steam-research-' + appId + '-' + cycleDate.replace(/-/g, '');
+    if (createdJobIds.has(jobId)) {
+      skipped += 1;
+      return;
+    }
+    if (String(decision.researchJobId || '').trim() === jobId) {
+      skipped += 1;
+      return;
+    }
+
+    const job = buildSteamCandidateResearchJob_(
+      masterRow,
+      masterCol,
+      Object.assign({}, decision, { researchJobId: jobId, autoResearchTime: now }),
+      ss,
+      now
+    );
+    const rowNumber = decision.rowNumber;
+    decisionSheet.getRange(rowNumber, decisionCol['ResearchJobID'] + 1).setValue(job.job_id);
+    decisionSheet.getRange(rowNumber, decisionCol['自动研究状态'] + 1).setValue(STEAM_CANDIDATE_RESEARCH_PENDING);
+    decisionSheet.getRange(rowNumber, decisionCol['自动研究时间'] + 1).setValue(now);
+    decisionSheet.getRange(rowNumber, decisionCol['自动Social摘要'] + 1).setValue('');
+    decisionSheet.getRange(rowNumber, decisionCol['自动SERP摘要'] + 1).setValue('');
+    decisionSheet.getRange(rowNumber, decisionCol['自动研究结果路径'] + 1).setValue('');
+    createdJobIds.add(job.job_id);
+    created.push(job);
+  });
+
+  return { created: created.length, skipped: skipped, jobs: created };
+}
+
+function loadPendingSteamCandidateResearchJobs_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) return [];
+  const decisionSheet = ss.getSheetByName(HOTWORD_V2.sheets.decisions);
+  const masterSheet = ss.getSheetByName(HOTWORD_V2.sheets.master);
+  if (!decisionSheet || !masterSheet || decisionSheet.getLastRow() < 2 || masterSheet.getLastRow() < 2) return [];
+
+  const masterCol = {};
+  HOTWORD_V2.masterHeaders.forEach((name, index) => { masterCol[name] = index; });
+  const masterRows = masterSheet.getRange(
+    2, 1, masterSheet.getLastRow() - 1, HOTWORD_V2.masterHeaders.length
+  ).getValues();
+  const masterByAppId = new Map();
+  masterRows.forEach(row => {
+    const appId = String(row[masterCol['Steam App ID']] || '').trim();
+    if (appId) masterByAppId.set(appId, row);
+  });
+
+  const decisions = readCandidateDecisions_(ss);
+  const jobs = [];
+  decisions.forEach(decision => {
+    if (String(decision.autoResearchStatus || '').trim() !== STEAM_CANDIDATE_RESEARCH_PENDING) return;
+    const jobId = String(decision.researchJobId || '').trim();
+    const masterRow = masterByAppId.get(String(decision.appId || '').trim());
+    if (!jobId || !masterRow) return;
+    jobs.push(buildSteamCandidateResearchJob_(masterRow, masterCol, decision, ss, decision.autoResearchTime));
+  });
+  return jobs;
 }
 
 function candidateDecisionRow_(decision) {
@@ -3915,7 +4117,9 @@ function candidateDecisionRow_(decision) {
     decision.lastType, decision.nextRecheckDate, decision.note, decision.lastCheckedStatus,
     decision.firstSeen, decision.source, decision.firstType, decision.currentStage, decision.researchStatus,
     decision.trendsResult, decision.socialResult, decision.serpCompetition, decision.keywordOpportunity, decision.manualNote,
-    decision.status, decision.decisionDate, decision.nextAction, decision.opportunityId || ''
+    decision.status, decision.decisionDate, decision.nextAction, decision.opportunityId || '',
+    decision.researchJobId || '', decision.autoResearchStatus || '', decision.autoResearchTime || '',
+    decision.autoSocialSummary || '', decision.autoSerpSummary || '', decision.autoResearchResultPath || ''
   ];
 }
 
@@ -3927,7 +4131,8 @@ function syncCandidateDecisions_(ss, records, runTime, rules) {
     let decision = decisions.get(appId);
     if (!decision) {
       decision = {appId, name: rec.name, status: '', lastCheckedDate: '', lastGain: '', lastType: '', nextRecheckDate: '', note: '', lastCheckedStatus: '',
-        firstSeen: '', source: '', firstType: '', currentStage: '', researchStatus: '待研究', trendsResult: '', socialResult: '', serpCompetition: '未检查', keywordOpportunity: '未检查', manualNote: '', decisionDate: '', nextAction: ''};
+        firstSeen: '', source: '', firstType: '', currentStage: '', researchStatus: '待研究', trendsResult: '', socialResult: '', serpCompetition: '未检查', keywordOpportunity: '未检查', manualNote: '', decisionDate: '', nextAction: '',
+        researchJobId: '', autoResearchStatus: '', autoResearchTime: '', autoSocialSummary: '', autoSerpSummary: '', autoResearchResultPath: ''};
       decisions.set(appId, decision);
     }
     decision.name = rec.name;
@@ -3998,7 +4203,8 @@ function syncCandidateDecisionFromActionEdit_(e) {
   let decision = decisions.get(appId);
   if (!decision) {
     decision = {appId, name: at('游戏名称') || '', status: '', lastCheckedDate: '', lastGain: '', lastType: '', nextRecheckDate: '', note: '', lastCheckedStatus: '',
-      firstSeen: '', source: '', firstType: '', currentStage: at('当前阶段') || '', researchStatus: '', trendsResult: '', socialResult: '', serpCompetition: '', keywordOpportunity: '', manualNote: '', decisionDate: '', nextAction: '', opportunityId: ''};
+      firstSeen: '', source: '', firstType: '', currentStage: at('当前阶段') || '', researchStatus: '', trendsResult: '', socialResult: '', serpCompetition: '', keywordOpportunity: '', manualNote: '', decisionDate: '', nextAction: '', opportunityId: '',
+      researchJobId: '', autoResearchStatus: '', autoResearchTime: '', autoSocialSummary: '', autoSerpSummary: '', autoResearchResultPath: ''};
   }
   decision.name = at('游戏名称') || decision.name;
   decision.opportunityId = decision.opportunityId || opportunityIdFromSteamCandidate_(decision.name, appId);
