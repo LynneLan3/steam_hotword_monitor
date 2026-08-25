@@ -9,6 +9,15 @@ var vm = require('vm');
 var src = fs.readFileSync(path.join(__dirname, '..', 'SteamCandidateScanner.js'), 'utf8');
 var match = src.match(/function decideTodayAction_\([\s\S]*?\n\}/);
 if (!match) throw new Error('decideTodayAction_ not found');
+function extract(name) {
+  var m = src.match(new RegExp('function\\s+' + name + '\\s*\\([\\s\\S]*?\\n\\}'));
+  if (!m) throw new Error('missing ' + name);
+  return m[0];
+}
+var helperSource = ['hasCompletedManualResearchValue_', 'candidateExternalSignalIsNew_',
+  'candidateGainGrowthReached_', 'candidateWatchRecheckGate_',
+  'candidateManualEvidenceNextAction_', 'candidateManualEvidenceNeedsNoProvider_']
+  .map(extract).join('\n');
 
 var context = {
   isFiniteNumber_: function (value) {
@@ -30,7 +39,7 @@ var context = {
 vm.runInNewContext(
   'var isFiniteNumber_ = this.isFiniteNumber_;\n' +
   'var normalizeDecisionStatus_ = this.normalizeDecisionStatus_;\n' +
-  'var dateAtStart_ = this.dateAtStart_;\n' + match[0],
+  'var dateAtStart_ = this.dateAtStart_;\n' + helperSource + '\n' + match[0],
   context
 );
 var decideTodayAction_ = context.decideTodayAction_;
@@ -49,8 +58,9 @@ function assertType(rec, decision, expected, label) {
 
 assertType(base, null, 'NEW', 'NEW without manual record');
 assertType(base, {status: 'WATCH', lastGain: 1000, nextRecheckDate: '2026-08-25'}, null, 'WATCH not due');
-assertType(base, {status: 'WATCH', lastGain: 1000, nextRecheckDate: '2026-08-21'}, 'RECHECK_DUE', 'WATCH due');
+assertType(base, {status: 'WATCH', lastGain: 1000, nextRecheckDate: '2026-08-21'}, null, 'WATCH due without new signal');
 assertType({continueNext: '是', gain7d: 1300}, {status: 'WATCH', lastGain: 1000, nextRecheckDate: '2026-08-25'}, 'GAIN_GROWTH', 'Gain growth at 30 percent');
+assertType(base, {status: 'WATCH', nextRecheckDate: '2026-08-25', externalSignal: 'GOOGLE_TRENDS', trendLastChecked: '2026-08-21', lastCheckedDate: '2026-08-20'}, 'EXTERNAL_SIGNAL', 'new ExternalSignal');
 assertType(base, {status: 'BUILD', lastGain: 1000}, null, 'BUILD suppressed');
 assertType(base, {status: 'REJECT', lastGain: 1000}, null, 'REJECT suppressed');
 

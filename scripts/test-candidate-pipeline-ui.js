@@ -16,6 +16,10 @@ var context = {
   Number: Number, String: String, Date: Date, Math: Math
 };
 vm.createContext(context);
+['hasCompletedManualResearchValue_', 'candidateExternalSignalIsNew_',
+  'candidateGainGrowthReached_', 'candidateWatchRecheckGate_',
+  'candidateManualEvidenceNextAction_', 'candidateManualEvidenceNeedsNoProvider_']
+  .forEach(function (name) { vm.runInContext(extract(name), context); });
 vm.runInContext(extract('decideTodayAction_'), context);
 vm.runInContext(extract('isUnfinishedResearchValue_'), context);
 vm.runInContext(extract('deriveResearchStatus_'), context);
@@ -28,7 +32,7 @@ var base = { continueNext: '是', gain7d: 1000 };
 assert(action(base, null).humanAction === '检查 Google Trends', 'NEW action');
 assert(action(base, { status: 'BUILD' }).include === false, 'BUILD hidden');
 assert(action(base, { status: 'REJECT' }).include === false, 'REJECT hidden');
-assert(action(base, { status: 'WATCH', lastGain: 1000, nextRecheckDate: '2026-08-21' }).humanAction === '重新验证趋势变化', 'WATCH action');
+assert(action(base, { status: 'WATCH', lastGain: 1000, nextRecheckDate: '2026-08-21' }).include === false, 'WATCH without new signal hidden');
 assert(deriveResearchStatus({status: '', trendsResult: '', socialResult: '未检查', serpCompetition: '', keywordOpportunity: '未检查'}) === '待研究', 'all empty research status');
 assert(deriveResearchStatus({status: '', trendsResult: '强', socialResult: '未检查', serpCompetition: '', keywordOpportunity: '未检查'}) === '研究中', 'partial research status');
 assert(deriveResearchStatus({status: 'BUILD'}) === '已完成', 'decision research status');
@@ -42,7 +46,7 @@ assert(src.indexOf("['待研究', '研究中', '已完成']") >= 0, 'research va
 assert(src.indexOf("['BUILD', 'WATCH', 'REJECT']") >= 0, 'decision validation options');
 assert(src.indexOf("decision.researchStatus = isHumanStage ? deriveResearchStatus_(decision) : ''") >= 0, 'excluded candidates not marked待研究');
 assert(src.indexOf("decision.nextAction = 'None'") >= 0, 'excluded candidates next action None');
-assert(src.indexOf("decision.nextAction = 'Google Trends'") >= 0, 'new human candidate next action Google Trends');
+assert(src.indexOf("candidateManualEvidenceNextAction_") >= 0, 'manual evidence determines next action');
 assert(src.indexOf("decision.nextAction = 'Recheck'") >= 0, 'WATCH next action Recheck');
 assert(src.indexOf("decision.nextAction = 'Site Build'") >= 0, 'BUILD next action Site Build');
 assert(src.indexOf("decision.nextAction = 'None'") >= 0, 'REJECT next action None');

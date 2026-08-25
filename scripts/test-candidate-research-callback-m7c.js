@@ -113,10 +113,13 @@ master[index(masterHeaders, '进入下一步')] = '是';
 
 var decisionRows = [decision];
 var masterRows = [master];
+var rulesHeaders = ['规则Key', '当前值'];
+var rulesRows = [['RECHECK_GAIN_GROWTH_MIN', 0.30], ['WATCH_RECHECK_DAYS_STRONG', 3], ['WATCH_RECHECK_DAYS_NORMAL', 7]];
 spreadsheet = {
   getSheetByName: function (name) {
     if (name === '候选决策') return makeSheet(decisionRows, decisionHeaders);
     if (name === '候选主表') return makeSheet(masterRows, masterHeaders);
+    if (name === '规则配置') return makeSheet(rulesRows, rulesHeaders);
     return null;
   },
   getSpreadsheetTimeZone: function () { return 'UTC'; }

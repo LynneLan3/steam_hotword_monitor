@@ -51,6 +51,8 @@ var masterHeaders = [
   '1A排除原因', '第一轮类型', '第一轮优先级', '进入下一步', '下一步动作', '第一轮判定依据',
   '当前筛选阶段', '数据状态', '数据备注', '首次发现日期', '最后发现日期', '最近Run ID', '人工备注'
 ];
+var rulesHeaders = ['规则Key', '当前值'];
+var rulesRows = [['RECHECK_GAIN_GROWTH_MIN', 0.30], ['WATCH_RECHECK_DAYS_STRONG', 3], ['WATCH_RECHECK_DAYS_NORMAL', 7]];
 
 function row(length) { return new Array(length).fill(''); }
 function index(headers, name) { return headers.indexOf(name); }
@@ -164,6 +166,7 @@ spreadsheet = {
   getSheetByName: function (name) {
     if (name === '候选决策') return makeSheet(decisionRows, decisionHeaders);
     if (name === '候选主表') return makeSheet(masterRows, masterHeaders);
+    if (name === '规则配置') return makeSheet(rulesRows, rulesHeaders);
     return null;
   },
   getSpreadsheetTimeZone: function () { return 'UTC'; }
@@ -208,15 +211,36 @@ assert(buildDecision[index(decisionHeaders, 'ResearchJobID')] === '', 'manual BU
 assert(watchDecision[index(decisionHeaders, 'ResearchJobID')] === '', 'manual WATCH is not enqueued');
 assert(rejectDecision[index(decisionHeaders, 'ResearchJobID')] === '', 'manual REJECT is not enqueued');
 
+var weakManualMaster = candidateMaster('4026260', 'Weak Manual Evidence', '是');
+weakManualMaster[index(masterHeaders, 'Steam 7d Gain')] = 1100;
+var weakManualDecision = candidateDecision('4026260', 'Weak Manual Evidence', {
+  ResearchJobID: 'steam-research-4026260-20260823', '自动研究状态': 'PENDING', 'Google Trends结果': '弱'
+});
+var watchNoGrowthMaster = candidateMaster('4026261', 'WATCH No Growth', '是');
+watchNoGrowthMaster[index(masterHeaders, 'Steam 7d Gain')] = 1100;
+var watchNoGrowthDecision = candidateDecision('4026261', 'WATCH No Growth', {
+  ResearchJobID: 'steam-research-4026261-20260823', '自动研究状态': 'PENDING', Decision: 'WATCH',
+  '上次检查7d Gain': 1000, '下次复查日': '2026-08-24'
+});
+var watchGrowthMaster = candidateMaster('4026262', 'WATCH Growth', '是');
+watchGrowthMaster[index(masterHeaders, 'Steam 7d Gain')] = 1300;
+var watchGrowthDecision = candidateDecision('4026262', 'WATCH Growth', {
+  ResearchJobID: 'steam-research-4026262-20260823', '自动研究状态': 'PENDING', Decision: 'WATCH',
+  '上次检查7d Gain': 1000, '下次复查日': '2026-08-24'
+});
+masterRows.push(weakManualMaster, watchNoGrowthMaster, watchGrowthMaster);
+decisionRows.push(weakManualDecision, watchNoGrowthDecision, watchGrowthDecision);
+
 var beforeGetWrites = writes;
 var pending = sandbox.loadPendingSteamCandidateResearchJobs_();
-assert(pending.length === 1, 'GET loader returns pending candidate only');
+assert(pending.length === 2, 'GET loader suppresses manual evidence and WATCH without new signal');
 assert(pending[0].steam_app_id === '4026250', 'GET contract AppID');
+assert(pending[1].steam_app_id === '4026262', 'GET allows WATCH with 30 percent growth');
 assert(pending[0].steam_url.indexOf('/4026250/') >= 0, 'GET contract Steam URL');
 assert(pending[0].steam_signals.steam_score === null, 'missing facts remain null');
 assert(pending[0].manual_signals.keyword_opportunity === '人工关键词', 'GET preserves manual input');
 var getResponse = sandbox.doGet({parameter: {action: 'pendingSteamCandidateResearchJobs'}});
-assert(JSON.parse(getResponse.text).jobs.length === 1, 'GET endpoint returns the pending contract');
+assert(JSON.parse(getResponse.text).jobs.length === 2, 'GET endpoint returns the gated pending contract');
 assert(JSON.parse(getResponse.text).jobs[0].steam_app_id === '4026250', 'GET excludes manually decided and no-longer-eligible jobs');
 assert(writes === beforeGetWrites, 'GET loader is read-only');
 

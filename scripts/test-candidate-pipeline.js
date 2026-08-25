@@ -17,6 +17,10 @@ var context = {
   Number: Number, String: String, Date: Date, Math: Math
 };
 vm.createContext(context);
+['hasCompletedManualResearchValue_', 'candidateExternalSignalIsNew_',
+  'candidateGainGrowthReached_', 'candidateWatchRecheckGate_',
+  'candidateManualEvidenceNextAction_', 'candidateManualEvidenceNeedsNoProvider_']
+  .forEach(function (name) { vm.runInContext(extract(name), context); });
 vm.runInContext(extract('decideTodayAction_'), context);
 vm.runInContext(extract('siteIdFromGameName_'), context);
 var decide = context.decideTodayAction_;
@@ -31,7 +35,7 @@ assert(action(base, null).type === 'NEW', 'NEW enters action');
 assert(!action(base, { status: 'BUILD' }).include, 'BUILD suppressed');
 assert(!action(base, { status: 'REJECT' }).include, 'REJECT suppressed');
 assert(!action(base, { status: 'WATCH', lastGain: 1000, nextRecheckDate: '2026-08-25' }).include, 'WATCH not due');
-assert(action(base, { status: 'WATCH', lastGain: 1000, nextRecheckDate: '2026-08-21' }).type === 'RECHECK_DUE', 'WATCH due enters');
+assert(!action(base, { status: 'WATCH', lastGain: 1000, nextRecheckDate: '2026-08-21' }).include, 'WATCH due without trigger remains hidden');
 assert(action(base, { status: '', researchStatus: '已完成' }).type === 'RESEARCHING', 'researching enters');
 assert(siteId('Twisted Tower™') === 'twisted-tower', 'stable Site ID');
 assert(siteId('Mortal Shell II') === 'mortal-shell-ii', 'stable Site ID 2');
