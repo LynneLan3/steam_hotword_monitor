@@ -411,16 +411,16 @@ function hotwordExternalResolveCandidate_(ss, appId, game, opportunityId) {
 function hotwordExternalApplyDecisionSummary_(ss, resolution, data, interpretation) {
   const sheet = ss.getSheetByName(HOTWORD_V2.sheets.decisions);
   if (!sheet || sheet.getLastRow() < 2) return;
-  const headers = sheet.getRange(1, 1, 1, Math.max(sheet.getLastColumn(), HOTWORD_V2.decisionHeaders.length)).getDisplayValues()[0];
-  const appColumn = headers.indexOf('Steam App ID');
-  if (appColumn < 0) return;
-  const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, headers.length).getDisplayValues();
-  const rowIndex = rows.findIndex(row => String(row[appColumn] || '').trim() === resolution.appId);
+  const columnMap = candidateDecisionColumnMap_(sheet);
+  const appColumn = columnMap.byName['Steam App ID'];
+  if (!appColumn) return;
+  const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, columnMap.width).getDisplayValues();
+  const rowIndex = rows.findIndex(row => String(row[appColumn - 1] || '').trim() === resolution.appId);
   if (rowIndex < 0) return;
   const rowNumber = rowIndex + 2;
   const put = (name, value) => {
-    const col = headers.indexOf(name);
-    if (col >= 0) sheet.getRange(rowNumber, col + 1).setValue(value);
+    const col = columnMap.byName[name];
+    if (col) candidateDecisionSetField_(sheet, rowNumber, name, value, columnMap);
   };
   const legacy = {
     SEARCH_CONFIRMED: '强', SEARCH_WEAK: '弱', TREND_OVERRIDE: '强',
@@ -430,10 +430,13 @@ function hotwordExternalApplyDecisionSummary_(ss, resolution, data, interpretati
   put('TrendRelativeStrength', interpretation.relativeStrength === null ? '' : interpretation.relativeStrength);
   put('TrendVerdict', interpretation.verdict);
   put('TrendLastChecked', data.observedAt || new Date());
-  put('ExternalSignal', hotwordExternalMergeSignals_(String(rows[rowIndex][headers.indexOf('ExternalSignal')] || ''), 'GOOGLE_TRENDS'));
+  put('ExternalSignal', hotwordExternalMergeSignals_(String(rows[rowIndex][columnMap.byName['ExternalSignal'] - 1] || ''), 'GOOGLE_TRENDS'));
   put('FinalResearchStage', interpretation.route);
 
-  const decision = String(rows[rowIndex][headers.indexOf('Decision')] || rows[rowIndex][headers.indexOf('决策状态')] || '').trim().toUpperCase();
+  const decision = String(
+    rows[rowIndex][columnMap.byName['Decision'] - 1] ||
+    rows[rowIndex][columnMap.byName['决策状态'] - 1] || ''
+  ).trim().toUpperCase();
   if (!decision) {
     const nextAction = {
       SERP_PROBE: 'SERP检查', KEYWORD_RESEARCH: 'Keyword Research', SOCIAL_EARLY: 'Social验证',

@@ -227,13 +227,8 @@ assert(digest(spreadsheet.getSheetByName('今日行动').rows) !== beforeActionH
 var actionSheet = spreadsheet.getSheetByName('今日行动');
 var actionRows = actionSheet.rows.slice(2).filter(function (candidate) { return String(candidate[actionHeaders.indexOf('Steam App ID')] || '').trim(); });
 function find(appId) { return actionRows.find(function (candidate) { return candidate[actionHeaders.indexOf('Steam App ID')] === appId; }); }
-assert(find('1001')[actionHeaders.indexOf('行动类型')] === 'COMPLETED', 'BUILD is a completed row');
-assert(find('1001')[actionHeaders.indexOf('Decision')] === 'BUILD', 'BUILD Decision is authoritative');
-assert(find('1001')[actionHeaders.indexOf('研究状态')] === '已完成', 'BUILD is completed');
-assert(find('1001')[actionHeaders.indexOf('人工动作')] === '无需人工', 'BUILD has no human action');
-assert(find('1002')[actionHeaders.indexOf('行动类型')] === 'COMPLETED', 'REJECT is a completed row');
-assert(find('1002')[actionHeaders.indexOf('Decision')] === 'REJECT', 'REJECT Decision is authoritative');
-assert(find('1002')[actionHeaders.indexOf('人工动作')] === '无需人工', 'REJECT has no human action');
+assert(!find('1001'), 'BUILD is absent from 今日行动');
+assert(!find('1002'), 'REJECT is absent from 今日行动');
 ['1003', '1004', '1005'].forEach(function (appId) {
   var waiting = find(appId);
   assert(waiting && waiting[actionHeaders.indexOf('行动类型')] === 'WATCH_WAITING', appId + ' is waiting');
@@ -265,5 +260,6 @@ var syncCall = source.indexOf('syncCandidateDecisions_(ss, active', scanStart);
 var syncStart = source.indexOf('function syncCandidateDecisions_(');
 var syncEnd = source.indexOf('function nextActionForResearch_', syncStart);
 assert(syncCall > scanStart, 'full scan owns candidate decision synchronization');
-assert(source.slice(syncStart, syncEnd).indexOf('clearContent()') >= 0, 'candidate sync has destructive rebuild operation');
+assert(source.slice(syncStart, syncEnd).indexOf('clearContent()') < 0, 'candidate sync preserves unknown columns');
+assert(source.slice(syncStart, syncEnd).indexOf('candidateDecisionRow_(decision, columnMap') >= 0, 'candidate sync writes through the header map');
 console.log('PASS scripts/test-today-action-refresh.js');

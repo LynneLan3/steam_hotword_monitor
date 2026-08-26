@@ -52,7 +52,8 @@ assert(src.indexOf("decision.nextAction = 'Site Build'") >= 0, 'BUILD next actio
 assert(src.indexOf("decision.nextAction = 'None'") >= 0, 'REJECT next action None');
 assert(src.indexOf('function deriveResearchStatus_') >= 0, 'automatic research status');
 assert(src.indexOf('function deriveResearchCompletion_') >= 0, 'automatic research completion');
-assert(src.indexOf('decisionSheet.getRange(rowNumberInDecision') >= 0, 'action edit upsert');
+assert(src.indexOf('candidateDecisionRow_(decision, decisionColumnMap') >= 0, 'action edit upsert uses header map');
+assert(src.indexOf('sheet.getRange(2, 1, Math.max(sheet.getMaxRows() - 1, 1), sheet.getMaxColumns()).clearDataValidations()') >= 0, 'candidate decision validations cleared');
 var actionBlock = src.match(/actionHeaders:\s*\[([\s\S]*?)\],\n\n\s*decisionHeaders/)[1];
 assert((actionBlock.match(/'触发原因'/g) || []).length === 1, 'one trigger reason');
 assert(actionBlock.indexOf("'今日动作'") < 0, 'no duplicate 今日动作');
