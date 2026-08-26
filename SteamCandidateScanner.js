@@ -223,6 +223,14 @@ const STEAM_PREFLIGHT_ENABLED = true;
 const PREFLIGHT_MAX_SERP_QUERIES_PER_CANDIDATE = 3;
 const PREFLIGHT_DEDICATED_DOMAIN_REJECT_MIN = 2;
 const STEAM_PREFLIGHT_VERDICTS = {AUTO_REJECT: true, WATCH: true, MANUAL_REVIEW: true, PREFLIGHT_ERROR: true};
+// Candidate Main's canonical 1A pass labels are explicit state values. Keep
+// the historical bare label for existing rows, but do not broaden this into
+// a substring/contains match that could admit exclusions or anomalies.
+const STEAM_CANDIDATE_1A_PASS_RESULTS = {
+  '✅ 通过（主池）': true,
+  '✅ 通过（对照预留）': true,
+  '通过': true
+};
 const STEAM_CANDIDATE_RECOMMENDATIONS = {
   RECOMMEND_BUILD: true,
   RECOMMEND_WATCH: true,
@@ -4731,7 +4739,7 @@ function enqueueSteamCandidateResearchJobs_(ss, createdAt) {
     const continueNext = String(masterRow[masterCol['进入下一步']] || '').trim();
     if (!isReliableSteamAppId_(appId) || continueNext !== '是') return;
     const oneAResult = String(masterRow[masterCol['1A结果']] || '').trim().toUpperCase();
-    if (oneAResult && oneAResult !== '通过') return;
+    if (oneAResult && !STEAM_CANDIDATE_1A_PASS_RESULTS[oneAResult]) return;
 
     const decision = decisions.get(appId);
     if (!decision || !decision.rowNumber) return;

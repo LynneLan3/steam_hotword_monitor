@@ -246,4 +246,40 @@ assert(writes === beforeGetWrites, 'GET loader is read-only');
 
 assert(/function enqueueSteamCandidateResearchJobs_/.test(source), 'enqueue helper exists');
 assert(!/RESEARCH_RECOMMENDATION/.test(source), 'does not reuse GSC recommendation enum');
+
+// Regression: use the current production 1A values, not only historical
+// fixture text "通过".  Only the explicit accepted values are enqueueable.
+var gateCandidates = [
+  ['3859630', 'METAL GEAR SOLID: MASTER COLLECTION Vol.2', '✅ 通过（主池）'],
+  ['3859631', 'Canonical Reserved Candidate', '✅ 通过（对照预留）'],
+  ['3859632', 'Excluded Candidate', '❌ 排除'],
+  ['3859633', 'Anomalous Candidate', '⚠ 数据异常'],
+  ['3859634', 'Legacy Accepted Candidate', '通过']
+];
+var gateMasterRows = gateCandidates.map(function (item) {
+  var candidate = candidateMaster(item[0], item[1], '是');
+  candidate[index(masterHeaders, '1A结果')] = item[2];
+  return candidate;
+});
+var gateDecisionRows = gateCandidates.map(function (item) {
+  return candidateDecision(item[0], item[1], {});
+});
+var gateSpreadsheet = {
+  getSheetByName: function (name) {
+    if (name === '候选决策') return makeSheet(gateDecisionRows, decisionHeaders);
+    if (name === '候选主表') return makeSheet(gateMasterRows, masterHeaders);
+    if (name === '规则配置') return makeSheet(rulesRows, rulesHeaders);
+    return null;
+  },
+  getSpreadsheetTimeZone: function () { return 'UTC'; }
+};
+var gateResult = sandbox.enqueueSteamCandidateResearchJobs_(gateSpreadsheet, new Date('2026-08-26T01:00:00Z'));
+assert(gateResult.created === 3, 'canonical main-pool, reserved, and legacy pass values enqueue');
+assert(gateResult.jobs.map(function (job) { return job.steam_app_id; }).join('|') === '3859630|3859631|3859634', 'only explicit 1A pass values enqueue');
+assert(gateDecisionRows[0][index(decisionHeaders, 'ResearchJobID')] === 'steam-research-3859630-20260826', 'real candidate ResearchJobID written');
+assert(gateDecisionRows[0][index(decisionHeaders, '自动研究状态')] === 'PENDING', 'real candidate status is PENDING');
+assert(gateDecisionRows[1][index(decisionHeaders, 'ResearchJobID')] !== '', '对照预留 pass is accepted');
+assert(gateDecisionRows[2][index(decisionHeaders, 'ResearchJobID')] === '', '排除 is not enqueued');
+assert(gateDecisionRows[3][index(decisionHeaders, 'ResearchJobID')] === '', '数据异常 is not enqueued');
+assert(gateDecisionRows[4][index(decisionHeaders, 'ResearchJobID')] !== '', 'historical 通过 remains accepted');
 console.log('PASS scripts/test-candidate-research-m7a.js');
