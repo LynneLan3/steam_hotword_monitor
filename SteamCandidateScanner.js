@@ -200,7 +200,7 @@ const HOTWORD_V2 = {
   ],
 
   /** Site ID is a cross-system reference; Steam runtime preserves existing values and never rewrites them. */
-  sitePoolHeaders: ['Site ID', '游戏名称', 'Steam App ID', '当前状态', 'BUILD日期', 'Build状态', 'Repo URL', 'Vercel URL', '上线日期', '模板版本', 'GSC状态', 'GSC Site', 'GSC URL Prefix', 'GSC Last Sync', 'SEO阶段', 'Index状态', '首次曝光日期', 'Clicks', 'Impressions', 'CTR', 'Average Position'],
+  sitePoolHeaders: ['Site ID', '游戏名称', 'Steam App ID', '当前状态', 'BUILD日期', 'Build状态', 'Repo URL', 'Vercel URL', '上线日期', '模板版本', 'GSC状态', 'GSC Site', 'GSC URL Prefix', 'GSC Last Sync', 'SEO阶段', 'Index状态', '首次曝光日期', 'Clicks', 'Impressions', 'CTR', 'Average Position', 'OpportunityID', 'ExperimentType', 'ActualLiveAt', 'LaunchPageCount'],
   gscBindingHeaders: ['Site ID', '游戏名称', 'Steam App ID', '网站URL', 'GSC Property', 'GSC状态', '首次同步日期', '最近同步日期'],
   /** Phase 4.4：独立 GSC 监控 Spreadsheet，只读。 */
   GSC_SOURCE_SPREADSHEET_ID: '15GJGvPnJlXTSbO4aM_Yxvf0GxCgXrmZr0M5b9uZGIJU',
@@ -4105,10 +4105,16 @@ function logSitePoolIdentityIssue_(message) {
   if (typeof Logger !== 'undefined' && Logger.log) Logger.log(message);
 }
 
-function upsertSitePoolRecord_(ss, gameName, appId, buildDate) {
+function upsertSitePoolRecord_(ss, gameName, appId, buildDate, siteFacts) {
   const sheet = ensureSitePoolSchema_(ss);
   const siteId = siteIdFromGameName_(gameName);
   const normalizedAppId = String(appId || '').trim();
+  const facts = siteFacts || {};
+  const opportunityId = typeof facts === 'string' ? facts.trim() : String(facts.opportunityId || '').trim();
+  const experimentType = typeof facts === 'string' ? '' : ['PROBE', 'FORMAL'].indexOf(String(facts.experimentType || '').trim().toUpperCase()) >= 0
+    ? String(facts.experimentType).trim().toUpperCase() : '';
+  const actualLiveAt = typeof facts === 'string' ? '' : facts.actualLiveAt || '';
+  const launchPageCount = typeof facts === 'string' ? '' : facts.launchPageCount === undefined ? '' : facts.launchPageCount;
   if (!isSiteIdContractValue_(siteId) || !normalizedAppId) {
     logSitePoolIdentityIssue_('Site Pool upsert skipped: Site ID and Steam App ID are required.');
     return null;
@@ -4137,12 +4143,13 @@ function upsertSitePoolRecord_(ss, gameName, appId, buildDate) {
     const row = [existing[0] || siteId, existing[1] || gameName, existing[2] || normalizedAppId, existing[3] || 'BUILD_PENDING', existing[4] || buildDate,
       existing[5] || 'BUILD_PENDING', existing[6] || '', existing[7] || '', existing[8] || '', existing[9] || '', existing[10] || 'NOT_CONNECTED',
       existing[11] || '', existing[12] || '', existing[13] || '', existing[14] || 'WAITING_INDEX', existing[15] || 'UNKNOWN', existing[16] || '',
-      existing[17] || '', existing[18] || '', existing[19] || '', existing[20] || ''];
+      existing[17] || '', existing[18] || '', existing[19] || '', existing[20] || '', existing[21] || opportunityId,
+      existing[22] || experimentType, existing[23] || actualLiveAt, existing[24] === '' || existing[24] === null || existing[24] === undefined ? launchPageCount : existing[24]];
     sheet.getRange(index + 2, 1, 1, row.length).setValues([row]);
     upsertGscBindingRecord_(ss, row[0], row[1], row[2], row[7]);
     return row;
   }
-  const row = [siteId, gameName, normalizedAppId, 'BUILD_PENDING', buildDate, 'BUILD_PENDING', '', '', '', '', 'NOT_CONNECTED', '', '', '', 'WAITING_INDEX', 'UNKNOWN', '', '', '', '', ''];
+  const row = [siteId, gameName, normalizedAppId, 'BUILD_PENDING', buildDate, 'BUILD_PENDING', '', '', '', '', 'NOT_CONNECTED', '', '', '', 'WAITING_INDEX', 'UNKNOWN', '', '', '', '', '', opportunityId, experimentType, actualLiveAt, launchPageCount];
   sheet.getRange(sheet.getLastRow() + 1, 1, 1, row.length).setValues([row]);
   upsertGscBindingRecord_(ss, row[0], row[1], row[2], row[7]);
   return row;
@@ -4284,6 +4291,7 @@ function setupSitePoolUi_(ss) {
       .setDataValidation(SpreadsheetApp.newDataValidation().requireValueInList(values, true).setAllowInvalid(false).build());
   };
   validate('Build状态', ['BUILD_PENDING', 'BUILDING', 'LIVE', 'FAILED']);
+  validate('ExperimentType', ['PROBE', 'FORMAL']);
   validate('GSC状态', ['NOT_CONNECTED', 'CONNECTED']);
   validate('SEO阶段', ['WAITING_INDEX', 'INDEXING', 'EARLY_DATA', 'GROWING', 'FAILED']);
   validate('Index状态', ['UNKNOWN', 'INDEXING', 'INDEXED', 'ISSUE']);
@@ -5056,7 +5064,7 @@ function syncCandidateDecisionFromActionEdit_(e) {
     decisionSheet.getRange(decisionSheet.getLastRow() + 1, 1, 1, decisionColumnMap.width)
       .setValues([candidateDecisionRow_(decision, decisionColumnMap)]);
   }
-  if (decision.status === 'BUILD') upsertSitePoolRecord_(e.source, decision.name, appId, decision.decisionDate || new Date());
+  if (decision.status === 'BUILD') upsertSitePoolRecord_(e.source, decision.name, appId, decision.decisionDate || new Date(), {opportunityId: decision.opportunityId});
 
   const output = {
     '研究状态': decision.researchStatus,
@@ -5117,7 +5125,9 @@ function captureCandidateDecisionEdit_(e) {
   if (researchStatusColumn > 0) candidateDecisionSetField_(sheet, e.range.getRow(), '研究状态', '已完成', columnMap);
   if (decisionDateColumn > 0 && (status === 'BUILD' || status === 'REJECT')) candidateDecisionSetField_(sheet, e.range.getRow(), 'Decision日期', checkedAt, columnMap);
   if (nextActionColumn > 0) candidateDecisionSetField_(sheet, e.range.getRow(), 'Next Action', status === 'BUILD' ? 'Site Build' : status === 'WATCH' ? 'Recheck' : 'None', columnMap);
-  if (status === 'BUILD') upsertSitePoolRecord_(e.source, sheet.getRange(e.range.getRow(), 2).getValue(), appId, checkedAt);
+  if (status === 'BUILD') upsertSitePoolRecord_(e.source, sheet.getRange(e.range.getRow(), 2).getValue(), appId, checkedAt, {
+    opportunityId: opportunityIdColumn > 0 ? sheet.getRange(e.range.getRow(), opportunityIdColumn).getValue() : ''
+  });
 }
 
 function candidateDecisionEditAffectsTodayAction_(e) {
@@ -5693,6 +5703,7 @@ function applyBasicFormatting_(ss) {
     };
     poolFormat('BUILD日期', 'yyyy-mm-dd hh:mm:ss');
     poolFormat('上线日期', 'yyyy-mm-dd hh:mm:ss');
+    poolFormat('ActualLiveAt', 'yyyy-mm-dd hh:mm:ss');
     poolFormat('首次曝光日期', 'yyyy-mm-dd');
     poolFormat('CTR', '0.0%');
     poolFormat('Average Position', '0.0');
