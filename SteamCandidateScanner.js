@@ -1914,6 +1914,12 @@ function runSteamHotword01B() {
       }
     }
 
+    // Enrich the already-persisted rows for this run. Deep observations stay
+    // RAW_ONLY; the row identity prevents appending a second snapshot row.
+    active.forEach(rec => { rec.rawStatus = 'ENRICHED'; });
+    const snapshotUpdate = updateSnapshots_(ss, active, startedAt, runId, rawPersistence.rowByAppId);
+    discoveryNotes.push('G010 snapshot enriched=' + snapshotUpdate.updated + ' same-run rows');
+
     // ------------------------------------------------------------------------
     // 输出
     // ------------------------------------------------------------------------
@@ -5309,16 +5315,40 @@ function masterRow_(rec, runTime, firstSeen, runId, manualNote) {
 
 function appendSnapshots_(ss, records, runTime, runId) {
   const sheet = ss.getSheetByName(HOTWORD_V2.sheets.snapshot);
-  if (!records.length) return {persisted: 0, uniqueAppIds: 0, bySourcePage: ''};
+  const uniqueRecords = [];
+  const seenAppIds = new Set();
+  (records || []).forEach(rec => {
+    const appId = String(rec.appId || '').trim();
+    if (!appId || seenAppIds.has(appId)) return;
+    seenAppIds.add(appId);
+    uniqueRecords.push(rec);
+  });
+  if (!uniqueRecords.length) return {persisted: 0, uniqueAppIds: 0, bySourcePage: '', rowByAppId: {}};
 
   const bySourcePage = {};
-  records.forEach(rec => {
+  uniqueRecords.forEach(rec => {
     String(rec.sourcePage || '').split(' + ').filter(Boolean).forEach(value => {
       bySourcePage[value] = (bySourcePage[value] || 0) + 1;
     });
   });
 
-  const rows = records.map(rec => [
+  const rows = uniqueRecords.map(rec => snapshotRow_(rec, runTime, runId));
+  const firstRow = sheet.getLastRow() + 1;
+  sheet.getRange(firstRow, 1, rows.length, HOTWORD_V2.snapshotHeaders.length).setValues(rows);
+  const rowByAppId = {};
+  uniqueRecords.forEach((rec, index) => {
+    rowByAppId[String(rec.appId)] = firstRow + index;
+  });
+  return {
+    persisted: rows.length,
+    uniqueAppIds: uniqueRecords.length,
+    bySourcePage: Object.keys(bySourcePage).sort().map(key => key + '=' + bySourcePage[key]).join(','),
+    rowByAppId: rowByAppId
+  };
+}
+
+function snapshotRow_(rec, runTime, runId) {
+  return [
     runTime,
     runId,
     rec.appId,
@@ -5347,14 +5377,33 @@ function appendSnapshots_(ss, records, runTime, runId) {
     rec.dataNotes.concat(rec.observationDataNotes || []).join(' | '),
     rec.sourcePage || '',
     rec.rawStatus || 'RAW_ONLY'
-  ]);
+  ];
+}
 
-  sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, HOTWORD_V2.snapshotHeaders.length).setValues(rows);
-  return {
-    persisted: rows.length,
-    uniqueAppIds: new Set(records.map(rec => String(rec.appId))).size,
-    bySourcePage: Object.keys(bySourcePage).sort().map(key => key + '=' + bySourcePage[key]).join(',')
-  };
+function updateSnapshots_(ss, records, runTime, runId, rowByAppId) {
+  const sheet = ss.getSheetByName(HOTWORD_V2.sheets.snapshot);
+  const updated = [];
+  const skipped = [];
+  const refs = rowByAppId || {};
+
+  records.forEach(rec => {
+    const rowNumber = Number(refs[String(rec.appId)] || 0);
+    if (!rowNumber) {
+      skipped.push(String(rec.appId));
+      return;
+    }
+    const identity = sheet.getRange(rowNumber, 2, 1, 2).getDisplayValues()[0];
+    if (String(identity[0] || '').trim() !== String(runId) ||
+        String(identity[1] || '').trim() !== String(rec.appId)) {
+      skipped.push(String(rec.appId));
+      return;
+    }
+    sheet.getRange(rowNumber, 1, 1, HOTWORD_V2.snapshotHeaders.length)
+      .setValues([snapshotRow_(rec, runTime, runId)]);
+    updated.push(String(rec.appId));
+  });
+
+  return {updated: updated.length, skipped: skipped};
 }
 
 function readCandidateMasterRecordsForTodayAction_(ss) {
