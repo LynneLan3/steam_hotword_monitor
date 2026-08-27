@@ -157,7 +157,9 @@ const HOTWORD_V2 = {
     'Steam Followers', '7d基准Followers', 'Steam 7d Gain', '近似增长率', '增速覆盖天数',
     '评论数', '好评数', 'Steam评分',
     '1A结果', '1A排除原因', '第一轮类型', '第一轮优先级', '进入下一步', '下一步动作',
-    '数据状态', '数据备注'
+    '数据状态', '数据备注',
+    // G010：追加字段，不移动历史列；raw observation provenance/status。
+    '来源页码', '原始观察状态'
   ],
 
   anomalyHeaders: [
@@ -167,7 +169,9 @@ const HOTWORD_V2 = {
   logHeaders: [
     '运行时间', 'Run ID', '运行状态', '发现唯一游戏', '历史排除', '数据补全成功',
     '1A通过', '1A排除', '🔥趋势', '🌱Early', '🏢对照', '⚪低优先级', '数据异常',
-    '今日行动数', '耗时秒', '错误/警告'
+    '今日行动数', '耗时秒', '错误/警告',
+    // G010 audit fields: raw coverage is separate from candidate input.
+    'Raw唯一AppID', 'Raw行已持久化', 'Candidate输入数', 'Candidate范围'
   ],
 
   actionHeaders: [
@@ -237,6 +241,7 @@ const STEAM_CANDIDATE_RECOMMENDATIONS = {
   RECOMMEND_REJECT: true
 };
 const STEAM_CANDIDATE_RESEARCH_CONFIDENCES = { HIGH: true, MEDIUM: true, LOW: true };
+const G010_RAW_DISCOVERY_PAGES = 5;
 
 
 // ============================================================================
@@ -862,7 +867,7 @@ function setupRulesSheet_(ss) {
     ['RECHECK_GAIN_GROWTH_MIN', 0.30, '比例', 'WATCH候选重新进入今日行动所需的7d Gain增长', '候选人工复查 V1'],
     ['WATCH_RECHECK_DAYS_STRONG', 3, '天', '强信号 WATCH 的默认复查间隔', '候选人工复查 V1'],
     ['WATCH_RECHECK_DAYS_NORMAL', 7, '天', '普通 WATCH 的默认复查间隔', '候选人工复查 V1'],
-    ['DISCOVERY_PAGES', 1, '页/来源', '每个Steam来源抓取页数', '当前每页约50条，V2默认1页'],
+    ['DISCOVERY_PAGES', 5, '页/来源', '每个Steam来源抓取页数（raw observation）', 'G010：已验证 pages 1–5；candidate scope 仍为 page 1'],
     ['DAILY_HOUR', 8, '小时', '自动触发器运行小时', '表格/脚本时区下08:00–09:00窗口']
   ];
 
@@ -1610,7 +1615,8 @@ function runSteamHotword01B() {
         runId,
         'SKIPPED',
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        'LockService：已有完整抓取 run 在执行，本轮被阻止（防止手动与定时重叠）'
+        'LockService：已有完整抓取 run 在执行，本轮被阻止（防止手动与定时重叠）',
+        0, 0, 0, 'page1-only (bounded; skipped)'
       ]);
     } catch (logErr) {
       // 锁冲突日志失败也不再抛出，避免叠加重试压力。
@@ -1627,6 +1633,9 @@ function runSteamHotword01B() {
 
   let status = 'SUCCESS';
   let discoveredCount = 0;
+  let rawUniqueAppIdCount = 0;
+  let rawPersistedCount = 0;
+  let candidateInputCount = 0;
   let historyExcludedCount = 0;
   let enrichedSuccessCount = 0;
   let pass1ACount = 0;
@@ -1655,12 +1664,11 @@ function runSteamHotword01B() {
     }
     const historyIndex = buildHistoryIndex_(ss);
 
-    const gpKey = getGamesPopularityApiKey_();
-
     // ------------------------------------------------------------------------
     // 0A. 发现候选
     // ------------------------------------------------------------------------
-    const discovery = discoverSteamCandidates_(rules.DISCOVERY_PAGES, warnings, discoveryNotes);
+    const rawDiscoveryPages = Math.max(G010_RAW_DISCOVERY_PAGES, Math.floor(Number(rules.DISCOVERY_PAGES || 1)));
+    const discovery = discoverSteamCandidates_(rawDiscoveryPages, warnings, discoveryNotes);
     const discovered = discovery.items;
     discoveredCount = discovered.length;
 
@@ -1677,12 +1685,25 @@ function runSteamHotword01B() {
     // Steam_每日快照是 raw discovery observation ledger，不能因历史排除丢失观察。
     // ------------------------------------------------------------------------
     const observations = discovered.map(createCandidateRecord_);
+    const rawPersistence = appendSnapshots_(ss, observations, startedAt, runId);
+    rawUniqueAppIdCount = rawPersistence.uniqueAppIds;
+    rawPersistedCount = rawPersistence.persisted;
+    discoveryNotes.push(
+      'G010 raw persisted=' + rawPersistence.persisted +
+      ' unique=' + rawPersistence.uniqueAppIds +
+      ' bySourcePage=' + rawPersistence.bySourcePage
+    );
+
+    // The existing production candidate boundary is page 1. Deep pages are
+    // retained above, but do not enter follower/review/1A/1B or research.
+    const candidateScope = observations.filter(isLegacyCandidateScope_);
+    candidateInputCount = candidateScope.length;
+    const gpKey = getGamesPopularityApiKey_();
     const active = [];
 
-    for (let i = 0; i < discovered.length; i += 1) {
-      const item = discovered[i];
-      const rec = observations[i];
-      if (isInHistoryIndex_(item, historyIndex)) {
+    for (let i = 0; i < candidateScope.length; i += 1) {
+      const rec = candidateScope[i];
+      if (isInHistoryIndex_(rec, historyIndex)) {
         historyExcludedCount += 1;
         continue;
       }
@@ -1693,9 +1714,9 @@ function runSteamHotword01B() {
     // ------------------------------------------------------------------------
     // 0C. Followers 当前值（Games Popularity latest）
     // ------------------------------------------------------------------------
-    const latestMap = fetchGamesPopularityLatestBatch_(observations, gpKey, warnings);
+    const latestMap = fetchGamesPopularityLatestBatch_(active, gpKey, warnings);
 
-    for (const rec of observations) {
+    for (const rec of active) {
       const latest = latestMap.get(rec.appId);
       if (!latest) {
         rec.dataStatus = '⚠ 数据缺失';
@@ -1714,7 +1735,7 @@ function runSteamHotword01B() {
     // ------------------------------------------------------------------------
     // 0D. 解析发售日 / 发布阶段
     // ------------------------------------------------------------------------
-    for (const rec of observations) {
+    for (const rec of active) {
       fillReleaseStage_(rec, startedAt, tz);
     }
 
@@ -1778,32 +1799,17 @@ function runSteamHotword01B() {
     }
 
     // ------------------------------------------------------------------------
-    // 1B 前置：全量 raw discovery observations 拉 Followers 历史；
+    // 1B 前置：仅对既有 page-1 candidate scope 拉 Followers 历史；
     // 只有 active 中的 1A 通过对象才继续进入 1B 分类。
     // ------------------------------------------------------------------------
-    const followerHistoryMap = fetchGamesPopularityFollowersBatch_(observations, gpKey, warnings);
+    const followerHistoryMap = fetchGamesPopularityFollowersBatch_(active, gpKey, warnings);
 
     const eligibleFor1B = [];
     const pass1ASet = new Set(pass1A);
 
-    for (const rec of observations) {
+    for (const rec of active) {
       const payload = followerHistoryMap.get(rec.appId);
       const growth = computeFollowerGrowth_(payload, rec.followers, startedAt, rules.FOLLOWER_HISTORY_MIN_DAYS);
-
-      // Historical observations are retained in the snapshot ledger but must
-      // not acquire candidate/1B decisions or affect candidate counters.
-      if (!active.includes(rec)) {
-        if (growth.ok) {
-          rec.baselineFollowers = growth.baselineFollowers;
-          rec.gain7d = growth.gain;
-          rec.growthRate = growth.growthRate;
-          rec.coverageDays = growth.coverageDays;
-        } else {
-          rec.observationDataStatus = '⚠ 增速数据不足';
-          rec.observationDataNotes.push(growth.reason);
-        }
-        continue;
-      }
 
       // Non-1A candidates retain observation-level history semantics without
       // entering the existing 1B anomaly/counter path.
@@ -1912,8 +1918,6 @@ function runSteamHotword01B() {
     // 输出
     // ------------------------------------------------------------------------
     upsertMaster_(ss, active, startedAt, runId);
-    appendSnapshots_(ss, observations, startedAt, runId);
-
     const decisions = syncCandidateDecisions_(ss, active, startedAt, rules);
     try {
       const queueResult = enqueueSteamCandidateResearchJobs_(ss, startedAt);
@@ -1955,7 +1959,11 @@ function runSteamHotword01B() {
       anomalyCount,
       actionCount,
       Math.round((new Date().getTime() - startedAt.getTime()) / 1000),
-      logMessage
+      logMessage,
+      rawUniqueAppIdCount,
+      rawPersistedCount,
+      candidateInputCount,
+      'page1-only (bounded)'
     ]);
 
     SpreadsheetApp.flush();
@@ -1992,7 +2000,11 @@ function runSteamHotword01B() {
         anomalyCount,
         actionCount,
         Math.round((new Date().getTime() - startedAt.getTime()) / 1000),
-        failMsg
+        failMsg,
+        rawUniqueAppIdCount,
+        rawPersistedCount,
+        candidateInputCount,
+        'page1-only (bounded; run failed)'
       ]);
     } catch (logErr) {
       // 不让日志错误覆盖真实错误。
@@ -2036,12 +2048,14 @@ function discoverSteamCandidates_(pagesPerSource, warnings, fetchLogs) {
           reviewCount: isFiniteNumber_(item.reviewCount) ? Number(item.reviewCount) : null,
           reviewRating: isFiniteNumber_(item.reviewRating) ? Number(item.reviewRating) : null,
           sources: [source.name],
-          ranks: [source.name + '#' + sourceRank]
+          ranks: [source.name + '#' + sourceRank],
+          sourcePages: [source.name + '#' + (item._sourcePage || Math.ceil(sourceRank / 50))]
         });
       } else {
         const existing = merged.get(key);
         if (!existing.sources.includes(source.name)) existing.sources.push(source.name);
         existing.ranks.push(source.name + '#' + sourceRank);
+        existing.sourcePages.push(source.name + '#' + (item._sourcePage || Math.ceil(sourceRank / 50)));
         if (!existing.releaseRaw && (item.releaseDate || item.releaseRaw)) {
           existing.releaseRaw = item.releaseDate || item.releaseRaw;
         }
@@ -2154,6 +2168,7 @@ function fetchSteamSourcePagesLive_(source, pages, fetchLogs) {
 
     items.forEach((item, idx) => {
       item._sourceRank = (page - 1) * 50 + idx + 1;
+      item._sourcePage = page;
       allItems.push(item);
     });
   }
@@ -2457,7 +2472,8 @@ function compactSteamCacheItems_(items) {
     r: item.releaseDate || item.releaseRaw || '',
     c: isFiniteNumber_(item.reviewCount) ? Number(item.reviewCount) : null,
     p: isFiniteNumber_(item.reviewRating) ? Number(item.reviewRating) : null,
-    k: item._sourceRank || null
+    k: item._sourceRank || null,
+    q: item._sourcePage || null
   }));
 }
 
@@ -2471,7 +2487,8 @@ function expandSteamCacheRows_(rows) {
       releaseDate: row.r || row.releaseDate || '',
       reviewCount: row.c != null ? row.c : row.reviewCount,
       reviewRating: row.p != null ? row.p : row.reviewRating,
-      _sourceRank: row.k || row._sourceRank || null
+      _sourceRank: row.k || row._sourceRank || null,
+      _sourcePage: row.q || row._sourcePage || null
     };
   }).filter(item => item.appId && item.name);
 }
@@ -2662,6 +2679,7 @@ function createCandidateRecord_(item) {
     url: item.url,
     source: item.sources.join(' + '),
     sourceRank: item.ranks.join(' + '),
+    sourcePage: item.sourcePages.join(' + '),
     releaseRaw: item.releaseRaw || '',
     releaseDate: null,
     releaseStage: '',
@@ -2694,6 +2712,14 @@ function createCandidateRecord_(item) {
     observationDataNotes: [],
     controlOnly: false
   };
+}
+
+/** Preserve the pre-G010 production candidate universe: page 1 only. */
+function isLegacyCandidateScope_(rec) {
+  return String(rec.sourcePage || '').split(' + ').some(value => {
+    const match = value.match(/#(\d+)$/);
+    return match && Number(match[1]) === 1;
+  });
 }
 
 
@@ -5283,7 +5309,14 @@ function masterRow_(rec, runTime, firstSeen, runId, manualNote) {
 
 function appendSnapshots_(ss, records, runTime, runId) {
   const sheet = ss.getSheetByName(HOTWORD_V2.sheets.snapshot);
-  if (!records.length) return;
+  if (!records.length) return {persisted: 0, uniqueAppIds: 0, bySourcePage: ''};
+
+  const bySourcePage = {};
+  records.forEach(rec => {
+    String(rec.sourcePage || '').split(' + ').filter(Boolean).forEach(value => {
+      bySourcePage[value] = (bySourcePage[value] || 0) + 1;
+    });
+  });
 
   const rows = records.map(rec => [
     runTime,
@@ -5311,10 +5344,17 @@ function appendSnapshots_(ss, records, runTime, runId) {
     rec.continueNext,
     rec.nextAction,
     rec.observationDataStatus || rec.dataStatus,
-    rec.dataNotes.concat(rec.observationDataNotes || []).join(' | ')
+    rec.dataNotes.concat(rec.observationDataNotes || []).join(' | '),
+    rec.sourcePage || '',
+    rec.rawStatus || 'RAW_ONLY'
   ]);
 
   sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, HOTWORD_V2.snapshotHeaders.length).setValues(rows);
+  return {
+    persisted: rows.length,
+    uniqueAppIds: new Set(records.map(rec => String(rec.appId))).size,
+    bySourcePage: Object.keys(bySourcePage).sort().map(key => key + '=' + bySourcePage[key]).join(',')
+  };
 }
 
 function readCandidateMasterRecordsForTodayAction_(ss) {
