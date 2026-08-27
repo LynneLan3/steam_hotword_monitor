@@ -961,7 +961,7 @@ function setupCandidateDecisionUi_(ss) {
   validation('SERP竞争', ['低', '中', '高', '未检查']);
   validation('关键词机会', ['有', '无', '未检查']);
   validation('Decision', ['BUILD', 'WATCH', 'REJECT']);
-  validation('Next Action', ['Google Trends', 'Social验证', 'SERP检查', 'Keyword Research', 'Site Build', 'Recheck', 'None']);
+  validation('Next Action', ['Google Trends', 'Social验证', 'SERP检查', 'Keyword Research', 'Site Build', 'Recheck', 'None', 'Automatic Preflight']);
 
   const decisionCol = column('Decision');
   if (decisionCol > 0) {
@@ -1673,25 +1673,29 @@ function runSteamHotword01B() {
     }
 
     // ------------------------------------------------------------------------
-    // 0B. 历史去重（使用同步之后的历史库）
+    // 0B. 先建立全量 observation 集合；历史去重只派生候选 active 集合。
+    // Steam_每日快照是 raw discovery observation ledger，不能因历史排除丢失观察。
     // ------------------------------------------------------------------------
+    const observations = discovered.map(createCandidateRecord_);
     const active = [];
 
-    for (const item of discovered) {
+    for (let i = 0; i < discovered.length; i += 1) {
+      const item = discovered[i];
+      const rec = observations[i];
       if (isInHistoryIndex_(item, historyIndex)) {
         historyExcludedCount += 1;
         continue;
       }
 
-      active.push(createCandidateRecord_(item));
+      active.push(rec);
     }
 
     // ------------------------------------------------------------------------
     // 0C. Followers 当前值（Games Popularity latest）
     // ------------------------------------------------------------------------
-    const latestMap = fetchGamesPopularityLatestBatch_(active, gpKey, warnings);
+    const latestMap = fetchGamesPopularityLatestBatch_(observations, gpKey, warnings);
 
-    for (const rec of active) {
+    for (const rec of observations) {
       const latest = latestMap.get(rec.appId);
       if (!latest) {
         rec.dataStatus = '⚠ 数据缺失';
@@ -1710,7 +1714,7 @@ function runSteamHotword01B() {
     // ------------------------------------------------------------------------
     // 0D. 解析发售日 / 发布阶段
     // ------------------------------------------------------------------------
-    for (const rec of active) {
+    for (const rec of observations) {
       fillReleaseStage_(rec, startedAt, tz);
     }
 
@@ -1774,15 +1778,47 @@ function runSteamHotword01B() {
     }
 
     // ------------------------------------------------------------------------
-    // 1B 前置：仅对 1A 通过的对象拉 Followers 历史
+    // 1B 前置：全量 raw discovery observations 拉 Followers 历史；
+    // 只有 active 中的 1A 通过对象才继续进入 1B 分类。
     // ------------------------------------------------------------------------
-    const followerHistoryMap = fetchGamesPopularityFollowersBatch_(pass1A, gpKey, warnings);
+    const followerHistoryMap = fetchGamesPopularityFollowersBatch_(observations, gpKey, warnings);
 
     const eligibleFor1B = [];
+    const pass1ASet = new Set(pass1A);
 
-    for (const rec of pass1A) {
+    for (const rec of observations) {
       const payload = followerHistoryMap.get(rec.appId);
       const growth = computeFollowerGrowth_(payload, rec.followers, startedAt, rules.FOLLOWER_HISTORY_MIN_DAYS);
+
+      // Historical observations are retained in the snapshot ledger but must
+      // not acquire candidate/1B decisions or affect candidate counters.
+      if (!active.includes(rec)) {
+        if (growth.ok) {
+          rec.baselineFollowers = growth.baselineFollowers;
+          rec.gain7d = growth.gain;
+          rec.growthRate = growth.growthRate;
+          rec.coverageDays = growth.coverageDays;
+        } else {
+          rec.observationDataStatus = '⚠ 增速数据不足';
+          rec.observationDataNotes.push(growth.reason);
+        }
+        continue;
+      }
+
+      // Non-1A candidates retain observation-level history semantics without
+      // entering the existing 1B anomaly/counter path.
+      if (!pass1ASet.has(rec)) {
+        if (growth.ok) {
+          rec.baselineFollowers = growth.baselineFollowers;
+          rec.gain7d = growth.gain;
+          rec.growthRate = growth.growthRate;
+          rec.coverageDays = growth.coverageDays;
+        } else {
+          rec.observationDataStatus = '⚠ 增速数据不足';
+          rec.observationDataNotes.push(growth.reason);
+        }
+        continue;
+      }
 
       if (!growth.ok) {
         rec.dataStatus = '⚠ 增速数据不足';
@@ -1876,7 +1912,7 @@ function runSteamHotword01B() {
     // 输出
     // ------------------------------------------------------------------------
     upsertMaster_(ss, active, startedAt, runId);
-    appendSnapshots_(ss, active, startedAt, runId);
+    appendSnapshots_(ss, observations, startedAt, runId);
 
     const decisions = syncCandidateDecisions_(ss, active, startedAt, rules);
     try {
@@ -2654,6 +2690,8 @@ function createCandidateRecord_(item) {
     currentStage: '',
     dataStatus: 'OK',
     dataNotes: [],
+    observationDataStatus: '',
+    observationDataNotes: [],
     controlOnly: false
   };
 }
@@ -5262,8 +5300,8 @@ function appendSnapshots_(ss, records, runTime, runId) {
     rec.priority,
     rec.continueNext,
     rec.nextAction,
-    rec.dataStatus,
-    rec.dataNotes.join(' | ')
+    rec.observationDataStatus || rec.dataStatus,
+    rec.dataNotes.concat(rec.observationDataNotes || []).join(' | ')
   ]);
 
   sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, HOTWORD_V2.snapshotHeaders.length).setValues(rows);
