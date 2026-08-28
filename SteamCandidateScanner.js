@@ -40,7 +40,8 @@ const HOTWORD_V2 = {
     sitePool: '站点项目池',
     gscBinding: '项目GSC关联',
     externalEvidence: '外部证据记录',
-    trendsResearch: 'Trends研究记录'
+    trendsResearch: 'Trends研究记录',
+    externalDataAttempts: '外部数据获取尝试'
   },
 
   /**
@@ -140,6 +141,7 @@ const HOTWORD_V2 = {
 
   gpBase: 'https://games-popularity.com/swagger/api',
   gpKeyProperty: 'GAMES_POPULARITY_API_KEY',
+  gpForceRefreshProperty: 'GP_FORCE_REFRESH_ONCE_V1',
 
   masterHeaders: [
     '最后扫描时间', 'Steam App ID', '游戏名称', 'Steam URL', '候选来源', '来源排名',
@@ -171,7 +173,16 @@ const HOTWORD_V2 = {
     '1A通过', '1A排除', '🔥趋势', '🌱Early', '🏢对照', '⚪低优先级', '数据异常',
     '今日行动数', '耗时秒', '错误/警告',
     // G010 audit fields: raw coverage is separate from candidate input.
-    'Raw唯一AppID', 'Raw行已持久化', 'Candidate输入数', 'Candidate范围'
+    'Raw唯一AppID', 'Raw行已持久化', 'Candidate输入数', 'Candidate范围',
+    '🟡 Trend Watch', '🟢 Early Watch', '⏳1B历史不足',
+    'GP缓存命中', 'GP实时请求', 'GP实时成功', 'GP429', 'GP失败保留旧值'
+  ],
+
+  // V1 contract: attempts are append-only and are not the successful
+  // observation ledger. Credentials and request URLs are never persisted.
+  externalDataAttemptHeaders: [
+    '尝试时间', 'Run ID', 'Provider', 'Endpoint', 'Steam App ID', '游戏名称',
+    '刷新原因', 'HTTP状态', '尝试结果', '错误摘要'
   ],
 
   actionHeaders: [
@@ -255,6 +266,7 @@ function onOpen() {
     .addItem('整理工作表视图', 'organizeSheetUi')
     .addItem('② 设置 Games Popularity API Key', 'setGamesPopularityApiKey')
     .addItem('③ 检查 API Key', 'checkGamesPopularityApiKey')
+    .addItem('强制刷新 Games Popularity（一次）', 'forceRefreshGamesPopularity')
     .addSeparator()
     .addItem('▶ 立即运行 0→1B', 'runSteamHotword01B')
     .addItem('刷新今日行动', 'refreshTodayActionsFromCandidateDecisions')
@@ -802,6 +814,7 @@ function setupSteamHotwordV2() {
   ensureSheetWithHeaders_(ss, HOTWORD_V2.sheets.snapshot, HOTWORD_V2.snapshotHeaders);
   ensureSheetWithHeaders_(ss, HOTWORD_V2.sheets.anomalies, HOTWORD_V2.anomalyHeaders);
   ensureSheetWithHeaders_(ss, HOTWORD_V2.sheets.log, HOTWORD_V2.logHeaders);
+  ensureSheetWithHeaders_(ss, HOTWORD_V2.sheets.externalDataAttempts, HOTWORD_V2.externalDataAttemptHeaders);
   ensureSheetWithHeaders_(ss, HOTWORD_V2.sheets.history, ['Steam App ID', '游戏名称', 'Steam URL', '当前阶段', '备注']);
   ensureCandidateDecisionSchema_(ss);
   ensureSitePoolSchema_(ss);
@@ -863,6 +876,20 @@ function setupRulesSheet_(ss) {
     ['CONTROL_GROWTH_MAX', 0.10, '比例', '🏢对照：增长率上限（低于趋势线）', '历史逻辑：绝对量大但增速偏低'],
     ['CONTROL_MAX_PER_RUN', 3, '个', '每轮最多保留多少大盘对照', '历史逻辑：只保留少量样本'],
 
+    ['TREND_WATCH_GAIN_MIN', 600, '人/7d', '🟡 Trend Watch：第一条7d Gain下限', 'P2边界实验：14天人工研究样本'],
+    ['TREND_WATCH_GROWTH_MIN', 0.07, '比例', '🟡 Trend Watch：第一条增长率下限', 'P2边界实验：14天人工研究样本'],
+    ['TREND_WATCH_HIGH_GAIN_MIN', 1000, '人/7d', '🟡 Trend Watch：第二条7d Gain下限', 'P2边界实验：高Gain放宽增长率'],
+    ['TREND_WATCH_HIGH_GAIN_GROWTH_MIN', 0.05, '比例', '🟡 Trend Watch：第二条增长率下限', 'P2边界实验：14天人工研究样本'],
+    ['EARLY_WATCH_FOLLOWERS_MAX', 8000, '人', '🟢 Early Watch：Followers上限', 'P2边界实验：14天人工研究样本'],
+    ['EARLY_WATCH_GAIN_MIN', 300, '人/7d', '🟢 Early Watch：7d Gain下限', 'P2边界实验：14天人工研究样本'],
+    ['EARLY_WATCH_GROWTH_MIN', 0.10, '比例', '🟢 Early Watch：增长率下限', 'P2边界实验：14天人工研究样本'],
+    ['P1_MAX_PER_DAY', 6, '个', '今日行动：P1每日采样上限', 'P2边界实验：人工研究负载上限'],
+    ['P1_TREND_MAX_PER_DAY', 4, '个', '今日行动：P1 Trend优先配额', 'P2边界实验：人工研究负载上限'],
+    ['P1_EARLY_MAX_PER_DAY', 2, '个', '今日行动：P1 Early优先配额', 'P2边界实验：人工研究负载上限'],
+    ['P2_MAX_PER_DAY', 6, '个', '今日行动：P2每日采样上限', 'P2边界实验：14天人工研究样本'],
+    ['P2_TREND_MAX_PER_DAY', 3, '个', '今日行动：P2 Trend Watch优先配额', 'P2边界实验：14天人工研究样本'],
+    ['P2_EARLY_MAX_PER_DAY', 3, '个', '今日行动：P2 Early Watch优先配额', 'P2边界实验：14天人工研究样本'],
+
     ['FOLLOWER_HISTORY_MIN_DAYS', 5, '天', '至少需要多少天Followers历史才做1B', '防止把1–2天增长误当7d Gain'],
     ['RECHECK_GAIN_GROWTH_MIN', 0.30, '比例', 'WATCH候选重新进入今日行动所需的7d Gain增长', '候选人工复查 V1'],
     ['WATCH_RECHECK_DAYS_STRONG', 3, '天', '强信号 WATCH 的默认复查间隔', '候选人工复查 V1'],
@@ -891,9 +918,7 @@ function setupActionSheet_(ss) {
   if (!sheet) sheet = ss.insertSheet(HOTWORD_V2.sheets.action, 0);
 
   sheet.getRange(1, 1, 1, sheet.getMaxColumns()).breakApart();
-  if (!sheet.getRange('A1').getDisplayValue()) {
-    sheet.getRange('A1').setValue('今日行动：只看首次或需要复查的 1B 候选；从这里开始手动做 Google Trends / Social');
-  }
+  sheet.getRange('A1').setValue('今日行动：P1 主样本 + P2 边界实验样本；从这里开始手动做 Google Trends / Social');
   sheet.getRange(3, 1, 1, HOTWORD_V2.actionHeaders.length).setValues([HOTWORD_V2.actionHeaders]);
   const oldLastColumn = sheet.getLastColumn();
   if (oldLastColumn > HOTWORD_V2.actionHeaders.length) {
@@ -1070,10 +1095,10 @@ function getUsageGuideLines_() {
     'Google Trends / Social / SERP / KD / 最终建站决定，目前仍属于 Human Gate。',
     '',
     '—— 各 Sheet 职责 ——',
-    '今日行动：每天主要入口。这里只有值得进入第二轮验证的候选。进入今日行动 ≠ 一定建站。',
+    '今日行动：每天主要入口。这里包含 P1 主样本与 P2 边界实验样本；进入今日行动 ≠ 一定建站。',
     '候选决策：后台自动同步数据库，以 Steam App ID 唯一标识；日常无需打开或人工编辑。',
     '每天操作：1.只打开今日行动；2.点击 Google Trends 链接；3.在同一行选择 Trends、Social、SERP、Keyword 结果；4.最后选择 BUILD / WATCH / REJECT；5.必要时写一句人工备注。其余字段自动记录。',
-    '今日行动复查规则：无人工记录的1B候选标记 NEW；WATCH 仅在到期或当前7d Gain较上次检查增长至少30%时出现；BUILD / REJECT 不再出现。',
+    '今日行动复查规则：无人工记录的1B候选标记 NEW；WATCH 仅在到期或当前7d Gain较上次检查增长至少30%时出现；BUILD / REJECT 不再出现。每天最多采样 P1 6 个、P2 6 个；未采样候选仍保留在候选主表。',
     '指标说明：数据字典。查字段来源、公式、是否实验规则；不是每日操作入口。',
     '候选主表：系统当前所有候选及自动计算结果。用来回答“为什么推荐 / 为什么过滤”，不是每天逐行浏览的工作表。',
     '建站关键词规划：只有人工二次验证确认值得 BUILD 或重点 WATCH 后才进入。把游戏机会 → 搜索意图 → 页面结构 → URL / Page Type。不是候选发现入口。',
@@ -1237,7 +1262,7 @@ function getMetricGuideRows_() {
       '默认须 ≥ 5 天（FOLLOWER_HISTORY_MIN_DAYS）',
       '确定性计算 + 当前实验参数',
       '待验证',
-      '覆盖天数 < 最低天数时本轮不做 1B 分类，记入数据异常。'
+      '覆盖天数 < 最低天数时本轮不做 1B 分类，标记为“⏳ 等待历史 / 待数据 / 1B等待历史”，不计入 P3。'
     ],
     [
       '近似增长率',
@@ -1247,7 +1272,7 @@ function getMetricGuideRows_() {
       '(当前 Followers − 历史基准 Followers) ÷ 当前 Followers；即 Gain ÷ 当前 Followers',
       '1B 相对增速分类（与绝对 Gain 一起用）',
       '是（1B）',
-      '🔥 ≥10%；🌱 ≥17.5%；🏢 增长率须 <10%（默认）',
+      'P1：🔥 ≥10%；🌱 ≥17.5%；🏢 增长率须 <10%。P2：Trend 为（Gain≥600且增长≥7%）或（Gain≥1000且增长≥5%）；Early 为 Followers≤8000、Gain≥300且增长≥10%。',
       '确定性计算 + 历史规则 / 历史人工样本校准',
       '待验证',
       '这是热词站项目当前使用的“近似增长率”，不是通常意义上的“相较 7 天前增长率”。常见同比写法会用 Gain÷基准 Followers；当前系统不是该定义。改公式会使现有 1B 阈值整体失效，需重新校准——本轮禁止改公式。'
@@ -1596,6 +1621,12 @@ function getGamesPopularityApiKey_() {
   return key;
 }
 
+/** Explicit operator action; the flag is consumed by exactly one normal run. */
+function forceRefreshGamesPopularity() {
+  PropertiesService.getScriptProperties().setProperty(HOTWORD_V2.gpForceRefreshProperty, '1');
+  return runSteamHotword01B();
+}
+
 
 // ============================================================================
 // 主流程 0 → 1B
@@ -1616,7 +1647,7 @@ function runSteamHotword01B() {
         'SKIPPED',
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         'LockService：已有完整抓取 run 在执行，本轮被阻止（防止手动与定时重叠）',
-        0, 0, 0, 'page1-only (bounded; skipped)'
+        0, 0, 0, 'page1-only (bounded; skipped)', 0, 0, 0, 0, 0, 0, 0, 0
       ]);
     } catch (logErr) {
       // 锁冲突日志失败也不再抛出，避免叠加重试压力。
@@ -1630,6 +1661,9 @@ function runSteamHotword01B() {
   const tz = ss.getSpreadsheetTimeZone();
   const runId = Utilities.formatDate(startedAt, tz, 'yyyyMMdd-HHmmss');
   const warnings = [];
+  const forceGpRefresh = PropertiesService.getScriptProperties()
+    .getProperty(HOTWORD_V2.gpForceRefreshProperty) === '1';
+  if (forceGpRefresh) PropertiesService.getScriptProperties().deleteProperty(HOTWORD_V2.gpForceRefreshProperty);
 
   let status = 'SUCCESS';
   let discoveredCount = 0;
@@ -1644,6 +1678,10 @@ function runSteamHotword01B() {
   let earlyCount = 0;
   let controlCount = 0;
   let lowCount = 0;
+  let p2TrendCount = 0;
+  let p2EarlyCount = 0;
+  let historyInsufficientCount = 0;
+  const gpStats = {cacheHits: 0, realtimeRequests: 0, realtimeSuccess: 0, rateLimited: 0, failuresKept: 0};
   let anomalyCount = 0;
   let actionCount = 0;
   const discoveryNotes = [];
@@ -1713,22 +1751,42 @@ function runSteamHotword01B() {
 
     // ------------------------------------------------------------------------
     // 0C. Followers 当前值（Games Popularity latest）
+    // 同一业务日内复用 Steam_每日快照的成功 enrichment，只请求 cache miss。
     // ------------------------------------------------------------------------
-    const latestMap = fetchGamesPopularityLatestBatch_(active, gpKey, warnings);
+    const dailyGpCache = forceGpRefresh ? new Map() : readDailyGamesPopularityCache_(ss, startedAt);
+    const cachePartition = partitionDailyGamesPopularityCache_(active, dailyGpCache);
+    const cacheHits = cachePartition.hits;
+    const cacheMisses = cachePartition.misses;
+    cacheHits.forEach(rec => { rec._gpDailyCache = dailyGpCache.get(String(rec.appId)); });
+    gpStats.cacheHits = cacheHits.length;
+    const gpAttemptContext = {ss: ss, runId: runId, runTime: startedAt, refreshReason: forceGpRefresh ? 'EXPLICIT_FORCE' : 'POLICY_MISS'};
+    const latestMap = fetchGamesPopularityLatestBatch_(cacheMisses, gpKey, warnings, gpStats, gpAttemptContext);
 
     for (const rec of active) {
+      if (rec._gpDailyCache) {
+        rec.followers = rec._gpDailyCache.followers;
+        rec.baselineFollowers = rec._gpDailyCache.baselineFollowers;
+        rec.gain7d = rec._gpDailyCache.gain7d;
+        rec.growthRate = rec._gpDailyCache.growthRate;
+        rec.coverageDays = rec._gpDailyCache.coverageDays;
+        rec._gpEnrichmentFresh = true;
+        continue;
+      }
       const latest = latestMap.get(rec.appId);
       if (!latest) {
         rec.dataStatus = '⚠ 数据缺失';
         addDataNote_(rec, 'Games Popularity latest 无数据');
+        rec._gpEnrichmentFailed = true;
         continue;
       }
 
       if (latest.followers && isFiniteNumber_(latest.followers.followers)) {
         rec.followers = Number(latest.followers.followers);
+        rec._gpLatestFresh = true;
       } else {
         rec.dataStatus = '⚠ 数据缺失';
         addDataNote_(rec, '缺少 Followers 当前值');
+        rec._gpEnrichmentFailed = true;
       }
     }
 
@@ -1802,12 +1860,17 @@ function runSteamHotword01B() {
     // 1B 前置：仅对既有 page-1 candidate scope 拉 Followers 历史；
     // 只有 active 中的 1A 通过对象才继续进入 1B 分类。
     // ------------------------------------------------------------------------
-    const followerHistoryMap = fetchGamesPopularityFollowersBatch_(active, gpKey, warnings);
+    const followerHistoryMap = fetchGamesPopularityFollowersBatch_(cacheMisses, gpKey, warnings, gpStats, gpAttemptContext);
 
     const eligibleFor1B = [];
     const pass1ASet = new Set(pass1A);
 
     for (const rec of active) {
+      if (rec._gpDailyCache && isFiniteNumber_(rec.gain7d) && isFiniteNumber_(rec.growthRate)) {
+        eligibleFor1B.push(rec);
+        enrichedSuccessCount += 1;
+        continue;
+      }
       const payload = followerHistoryMap.get(rec.appId);
       const growth = computeFollowerGrowth_(payload, rec.followers, startedAt, rules.FOLLOWER_HISTORY_MIN_DAYS);
 
@@ -1827,15 +1890,16 @@ function runSteamHotword01B() {
       }
 
       if (!growth.ok) {
-        rec.dataStatus = '⚠ 增速数据不足';
+        if (!rec._gpDailyCache) rec._gpEnrichmentFailed = true;
+        rec.dataStatus = '待数据';
         addDataNote_(rec, growth.reason);
-        rec.firstRoundType = '⚠ 增速数据不足';
-        rec.priority = '待补数据';
+        rec.firstRoundType = '⏳ 等待历史';
+        rec.priority = '待数据';
         rec.continueNext = '否（本轮）';
         rec.nextAction = '等待 Followers 历史达到最少天数后自动重算';
-        rec.currentStage = '1B待数据';
+        rec.currentStage = '1B等待历史';
 
-        anomalyCount += 1;
+        historyInsufficientCount += 1;
         appendAnomalyRecord_(ss, startedAt, runId, rec, '1B', 'Followers历史不足', growth.reason, rec.nextAction);
         continue;
       }
@@ -1844,13 +1908,14 @@ function runSteamHotword01B() {
       rec.gain7d = growth.gain;
       rec.growthRate = growth.growthRate;
       rec.coverageDays = growth.coverageDays;
+      rec._gpEnrichmentFresh = true;
       rec.dataStatus = rec.dataStatus === '⚠ 数据缺失' ? rec.dataStatus : 'OK';
       eligibleFor1B.push(rec);
       enrichedSuccessCount += 1;
     }
 
     // ------------------------------------------------------------------------
-    // 1B. 先分趋势 / Early / 对照候选 / 低优先级
+    // 1B. 先分 P1 Trend / P1 Early / Control / P2 Watch / P3。
     // 对照候选要“只保留少量”，所以最后统一取 top N。
     // ------------------------------------------------------------------------
     const controlCandidates = [];
@@ -1867,6 +1932,12 @@ function runSteamHotword01B() {
       } else if (raw.type === '🏢 对照候选') {
         rec._controlReason = raw.reason;
         controlCandidates.push(rec);
+      } else if (raw.type === '🟡 Trend Watch') {
+        applyFirstRoundDecision_(rec, raw.type, 'P2 观察', '是', 'Google Trends', raw.reason);
+        p2TrendCount += 1;
+      } else if (raw.type === '🟢 Early Watch') {
+        applyFirstRoundDecision_(rec, raw.type, 'P2 观察', '是', 'Google Trends；若Google弱则手动做Social Early', raw.reason);
+        p2EarlyCount += 1;
       } else {
         applyFirstRoundDecision_(rec, '⚪ 低优先级', 'P3 暂缓', '否（本轮）', '本轮暂缓', raw.reason);
         lowCount += 1;
@@ -1916,14 +1987,14 @@ function runSteamHotword01B() {
 
     // Enrich the already-persisted rows for this run. Deep observations stay
     // RAW_ONLY; the row identity prevents appending a second snapshot row.
-    active.forEach(rec => { rec.rawStatus = 'ENRICHED'; });
-    const snapshotUpdate = updateSnapshots_(ss, active, startedAt, runId, rawPersistence.rowByAppId);
+    active.forEach(rec => { if (rec._gpEnrichmentFresh) rec.rawStatus = 'ENRICHED'; });
+    const snapshotUpdate = updateSnapshots_(ss, active.filter(rec => rec._gpEnrichmentFresh), startedAt, runId, rawPersistence.rowByAppId);
     discoveryNotes.push('G010 snapshot enriched=' + snapshotUpdate.updated + ' same-run rows');
 
     // ------------------------------------------------------------------------
     // 输出
     // ------------------------------------------------------------------------
-    upsertMaster_(ss, active, startedAt, runId);
+    upsertMaster_(ss, active, startedAt, runId, gpStats);
     const decisions = syncCandidateDecisions_(ss, active, startedAt, rules);
     try {
       const queueResult = enqueueSteamCandidateResearchJobs_(ss, startedAt);
@@ -1940,6 +2011,9 @@ function runSteamHotword01B() {
       trendCount,
       earlyCount,
       controlCount,
+      p2TrendCount,
+      p2EarlyCount,
+      historyInsufficientCount,
       anomalyCount
     });
     actionCount = actionRefresh && actionRefresh.afterPendingCount || 0;
@@ -1969,7 +2043,15 @@ function runSteamHotword01B() {
       rawUniqueAppIdCount,
       rawPersistedCount,
       candidateInputCount,
-      'page1-only (bounded)'
+      'page1-only (bounded)',
+      p2TrendCount,
+      p2EarlyCount,
+      historyInsufficientCount,
+      gpStats.cacheHits,
+      gpStats.realtimeRequests,
+      gpStats.realtimeSuccess,
+      gpStats.rateLimited,
+      gpStats.failuresKept
     ]);
 
     SpreadsheetApp.flush();
@@ -2010,7 +2092,15 @@ function runSteamHotword01B() {
         rawUniqueAppIdCount,
         rawPersistedCount,
         candidateInputCount,
-        'page1-only (bounded; run failed)'
+        'page1-only (bounded; run failed)',
+        p2TrendCount,
+        p2EarlyCount,
+        historyInsufficientCount,
+        gpStats.cacheHits,
+        gpStats.realtimeRequests,
+        gpStats.realtimeSuccess,
+        gpStats.rateLimited,
+        gpStats.failuresKept
       ]);
     } catch (logErr) {
       // 不让日志错误覆盖真实错误。
@@ -2733,7 +2823,66 @@ function isLegacyCandidateScope_(rec) {
 // 0：Games Popularity + Steam Reviews 数据补全
 // ============================================================================
 
-function fetchGamesPopularityLatestBatch_(records, apiKey, warnings) {
+function partitionDailyGamesPopularityCache_(records, cache) {
+  const hits = [];
+  const misses = [];
+  (records || []).forEach(rec => {
+    if (cache && cache.has(String(rec.appId))) hits.push(rec);
+    else misses.push(rec);
+  });
+  return {hits: hits, misses: misses};
+}
+
+function readDailyGamesPopularityCache_(ss, runTime) {
+  const out = new Map();
+  const sheet = ss && ss.getSheetByName ? ss.getSheetByName(HOTWORD_V2.sheets.snapshot) : null;
+  if (!sheet || sheet.getLastRow() < 2) return out;
+
+  const width = Math.max(sheet.getLastColumn(), HOTWORD_V2.snapshotHeaders.length);
+  const headers = sheet.getRange(1, 1, 1, width).getDisplayValues()[0];
+  const col = {};
+  HOTWORD_V2.snapshotHeaders.forEach(name => { col[name] = headers.indexOf(name); });
+  const timeCol = col['运行时间'];
+  const appIdCol = col['Steam App ID'];
+  const followersCol = col['Steam Followers'];
+  if (timeCol < 0 || appIdCol < 0 || followersCol < 0) return out;
+
+  const dateKey = todayActionDateText_(runTime, ss);
+  const numericCell = value => {
+    if (value === null || value === undefined || String(value).trim() === '') return null;
+    const number = Number(value);
+    return isFiniteNumber_(number) ? number : null;
+  };
+  sheet.getRange(2, 1, sheet.getLastRow() - 1, width).getValues().forEach(row => {
+    if (todayActionDateText_(row[timeCol], ss) !== dateKey) return;
+    const appId = String(row[appIdCol] || '').trim();
+    const followersText = String(row[followersCol] === null || row[followersCol] === undefined ? '' : row[followersCol]).trim();
+    const followers = Number(followersText);
+    // A cache hit is a complete successful GP observation, not merely a
+    // latest-followers response. Incomplete history must remain a miss.
+    if (!appId || !followersText || !isFiniteNumber_(followers) || followers < 0 ||
+        numericCell(row[col['Steam 7d Gain']]) === null ||
+        numericCell(row[col['近似增长率']]) === null ||
+        numericCell(row[col['增速覆盖天数']]) === null) return;
+
+    const observedAt = row[timeCol];
+    const previous = out.get(appId);
+    const observedTimestamp = new Date(observedAt).getTime();
+    const previousTimestamp = previous ? new Date(previous.observedAt).getTime() : NaN;
+    if (previous && isFinite(previousTimestamp) && isFinite(observedTimestamp) && previousTimestamp >= observedTimestamp) return;
+    out.set(appId, {
+      observedAt: observedAt,
+      followers: followers,
+      baselineFollowers: numericCell(row[col['7d基准Followers']]),
+      gain7d: numericCell(row[col['Steam 7d Gain']]),
+      growthRate: numericCell(row[col['近似增长率']]),
+      coverageDays: numericCell(row[col['增速覆盖天数']])
+    });
+  });
+  return out;
+}
+
+function fetchGamesPopularityLatestBatch_(records, apiKey, warnings, stats, attemptContext) {
   const map = new Map();
   const requests = records.map(rec => ({
     url: HOTWORD_V2.gpBase + '/game/latest/' + encodeURIComponent(rec.appId) + '?apiKey=' + encodeURIComponent(apiKey),
@@ -2741,6 +2890,7 @@ function fetchGamesPopularityLatestBatch_(records, apiKey, warnings) {
     method: 'get'
   }));
 
+  if (stats) stats.realtimeRequests += requests.length;
   const responses = fetchAllInChunks_(requests, 40, 150);
 
   responses.forEach((resp, idx) => {
@@ -2750,20 +2900,26 @@ function fetchGamesPopularityLatestBatch_(records, apiKey, warnings) {
     if (code === 200) {
       try {
         map.set(rec.appId, JSON.parse(resp.getContentText()));
+        if (stats) stats.realtimeSuccess += 1;
+        appendGamesPopularityAttempt_(attemptContext, rec, 'latest', code, 'SUCCESS', '');
       } catch (e) {
         warnings.push('GP latest JSON异常 ' + rec.appId + ' ' + rec.name);
+        appendGamesPopularityAttempt_(attemptContext, rec, 'latest', code, 'FAILED', 'JSON_PARSE');
       }
     } else if (code === 404) {
       warnings.push('GP数据集无此App ' + rec.appId + ' ' + rec.name);
+      appendGamesPopularityAttempt_(attemptContext, rec, 'latest', code, 'FAILED', 'NOT_FOUND');
     } else {
+      if (stats && code === 429) stats.rateLimited += 1;
       warnings.push('GP latest HTTP ' + code + ' ' + rec.appId + ' ' + rec.name);
+      appendGamesPopularityAttempt_(attemptContext, rec, 'latest', code, 'FAILED', 'HTTP_' + code);
     }
   });
 
   return map;
 }
 
-function fetchGamesPopularityFollowersBatch_(records, apiKey, warnings) {
+function fetchGamesPopularityFollowersBatch_(records, apiKey, warnings, stats, attemptContext) {
   const map = new Map();
   const requests = records.map(rec => ({
     url: HOTWORD_V2.gpBase + '/game/followers/' + encodeURIComponent(rec.appId) + '?apiKey=' + encodeURIComponent(apiKey),
@@ -2771,6 +2927,7 @@ function fetchGamesPopularityFollowersBatch_(records, apiKey, warnings) {
     method: 'get'
   }));
 
+  if (stats) stats.realtimeRequests += requests.length;
   const responses = fetchAllInChunks_(requests, 40, 150);
 
   responses.forEach((resp, idx) => {
@@ -2780,17 +2937,34 @@ function fetchGamesPopularityFollowersBatch_(records, apiKey, warnings) {
     if (code === 200) {
       try {
         map.set(rec.appId, JSON.parse(resp.getContentText()));
+        if (stats) stats.realtimeSuccess += 1;
+        appendGamesPopularityAttempt_(attemptContext, rec, 'followers', code, 'SUCCESS', '');
       } catch (e) {
         warnings.push('GP followers JSON异常 ' + rec.appId + ' ' + rec.name);
+        appendGamesPopularityAttempt_(attemptContext, rec, 'followers', code, 'FAILED', 'JSON_PARSE');
       }
     } else if (code === 404) {
       warnings.push('GP followers无历史 ' + rec.appId + ' ' + rec.name);
+      appendGamesPopularityAttempt_(attemptContext, rec, 'followers', code, 'FAILED', 'NOT_FOUND');
     } else {
+      if (stats && code === 429) stats.rateLimited += 1;
       warnings.push('GP followers HTTP ' + code + ' ' + rec.appId + ' ' + rec.name);
+      appendGamesPopularityAttempt_(attemptContext, rec, 'followers', code, 'FAILED', 'HTTP_' + code);
     }
   });
 
   return map;
+}
+
+function appendGamesPopularityAttempt_(context, rec, endpoint, code, result, errorSummary) {
+  if (!context || !context.ss || !context.runId) return;
+  const sheet = context.ss.getSheetByName(HOTWORD_V2.sheets.externalDataAttempts);
+  if (!sheet) return;
+  sheet.appendRow([
+    context.runTime || new Date(), context.runId, 'Games Popularity', endpoint,
+    String(rec && rec.appId || ''), String(rec && rec.name || ''),
+    context.refreshReason || 'POLICY_MISS', Number(code || 0), result, errorSummary || ''
+  ]);
 }
 
 function fetchSteamReviewSummaryBatch_(records, warnings) {
@@ -3248,9 +3422,34 @@ function classify1BRaw_(rec, rules) {
     };
   }
 
+  if (
+    (gain >= Number(rules.TREND_WATCH_GAIN_MIN) && growth >= Number(rules.TREND_WATCH_GROWTH_MIN)) ||
+    (gain >= Number(rules.TREND_WATCH_HIGH_GAIN_MIN) && growth >= Number(rules.TREND_WATCH_HIGH_GAIN_GROWTH_MIN))
+  ) {
+    return {
+      type: '🟡 Trend Watch',
+      reason: 'P2 Trend Watch：7d Gain=' + gain + '，增长率=' + formatPercentText_(growth) +
+        '；满足（Gain≥' + rules.TREND_WATCH_GAIN_MIN + '且增长≥' + formatPercentText_(rules.TREND_WATCH_GROWTH_MIN) +
+        '）或（Gain≥' + rules.TREND_WATCH_HIGH_GAIN_MIN + '且增长≥' + formatPercentText_(rules.TREND_WATCH_HIGH_GAIN_GROWTH_MIN) + '）'
+    };
+  }
+
+  if (
+    followers <= Number(rules.EARLY_WATCH_FOLLOWERS_MAX) &&
+    gain >= Number(rules.EARLY_WATCH_GAIN_MIN) &&
+    growth >= Number(rules.EARLY_WATCH_GROWTH_MIN)
+  ) {
+    return {
+      type: '🟢 Early Watch',
+      reason: 'P2 Early Watch：Followers=' + followers + '≤' + rules.EARLY_WATCH_FOLLOWERS_MAX +
+        '；7d Gain=' + gain + '≥' + rules.EARLY_WATCH_GAIN_MIN +
+        '；增长率=' + formatPercentText_(growth) + '≥' + formatPercentText_(rules.EARLY_WATCH_GROWTH_MIN)
+    };
+  }
+
   return {
     type: '⚪ 低优先级',
-    reason: '未同时满足趋势、Early或大盘对照规则；7d Gain=' + gain +
+    reason: '未同时满足趋势、Early、大盘对照或P2观察规则；7d Gain=' + gain +
       '，增长率=' + formatPercentText_(growth) + '，Followers=' + followers
   };
 }
@@ -3905,7 +4104,8 @@ function normalizeDecisionStatus_(value) {
 }
 
 function isStrongWatchType_(type) {
-  return type === '🔥 趋势候选' || type === '🌱 Early候选';
+  return type === '🔥 趋势候选' || type === '🌱 Early候选' ||
+    type === '🟡 Trend Watch' || type === '🟢 Early Watch';
 }
 
 function addDays_(date, days) {
@@ -3968,7 +4168,7 @@ function candidateManualEvidenceNextAction_(rec, decision, allowWeakTrendRecheck
   if (!trendsDone) return 'Google Trends';
   const trendWeak = trends === '弱' || trends === '无';
   if (trendWeak && !allowWeakTrendRecheck) return 'Recheck';
-  if ((rec && rec.firstRoundType === '🌱 Early候选') && trendWeak &&
+  if ((rec && (rec.firstRoundType === '🌱 Early候选' || rec.firstRoundType === '🟢 Early Watch')) && trendWeak &&
       !hasCompletedManualResearchValue_(decision.socialResult)) return 'Social验证';
   const stage = String(decision && decision.finalResearchStage || '').trim().toUpperCase();
   if (stage === 'SERP_PROBE' && !hasCompletedManualResearchValue_(decision.serpCompetition)) return 'SERP检查';
@@ -3985,8 +4185,33 @@ function candidateManualEvidenceNeedsNoProvider_(rec, decision, allowWeakTrendRe
   return nextAction !== 'Google Trends';
 }
 
+function isTodayActionP2Type_(type) {
+  return type === '🟡 Trend Watch' || type === '🟢 Early Watch';
+}
+
+function hasNoManualResearchHistory_(decision) {
+  if (!decision) return true;
+  return !hasCompletedManualResearchValue_(decision.trendsResult) &&
+    !hasCompletedManualResearchValue_(decision.socialResult) &&
+    !hasCompletedManualResearchValue_(decision.serpCompetition) &&
+    !hasCompletedManualResearchValue_(decision.keywordOpportunity);
+}
+
+function isDirectP2TodayActionSample_(rec, decision) {
+  return !!rec && isTodayActionP2Type_(rec.firstRoundType) &&
+    rec.continueNext === '是' && rec.nextAction === 'Google Trends' &&
+    !normalizeDecisionStatus_(decision && decision.status) &&
+    hasNoManualResearchHistory_(decision);
+}
+
 function decideTodayAction_(rec, decision, today, rules) {
   if (rec.continueNext !== '是') return {include: false};
+  // P2 Watch rows are deliberate first-pass manual samples. They may not yet
+  // have a Candidate Decision row or preflight verdict, so the master-row
+  // Google Trends gate must be evaluated before the preflight gate.
+  if (isDirectP2TodayActionSample_(rec, decision)) {
+    return {include: true, type: 'NEW', reason: 'P2首次进入人工采样，尚无人工研究记录', humanAction: '检查 Google Trends'};
+  }
   // Standalone legacy function tests evaluate this function without the
   // surrounding Apps Script constants; retain their preflight-neutral mode.
   const preflightEnabled = typeof STEAM_PREFLIGHT_ENABLED === 'undefined' ? false : STEAM_PREFLIGHT_ENABLED;
@@ -4678,6 +4903,123 @@ function readCandidateDecisions_(ss) {
   return out;
 }
 
+function addTodayActionHandledIdentity_(index, source, appId, name, legacyNameFallback) {
+  const normalizedAppId = String(appId || '').trim();
+  const normalizedName = normalizeGameName_(name);
+  if (isReliableSteamAppId_(normalizedAppId)) {
+    index.byAppId.add(normalizedAppId);
+    todayActionHandledSetAdd_(index.reasonsByAppId, normalizedAppId).add(source);
+  } else if (legacyNameFallback && normalizedName) {
+    index.byLegacyName.add(normalizedName);
+    todayActionHandledSetAdd_(index.reasonsByLegacyName, normalizedName).add(source);
+  }
+}
+
+function todayActionHandledSetAdd_(setMap, key) {
+  if (!setMap.has(key)) setMap.set(key, new Set());
+  return setMap.get(key);
+}
+
+function readTodayActionHandledRows_(sheet, appIdHeader, nameHeader) {
+  const rows = [];
+  if (!sheet || sheet.getLastRow() < 2) return rows;
+  const width = Math.max(sheet.getLastColumn(), 1);
+  const headers = sheet.getRange(1, 1, 1, width).getDisplayValues()[0];
+  const appIdColumn = headers.indexOf(appIdHeader);
+  const nameColumn = headers.indexOf(nameHeader);
+  if (appIdColumn < 0 && nameColumn < 0) return rows;
+  sheet.getRange(2, 1, sheet.getLastRow() - 1, width).getValues().forEach(row => {
+    rows.push({
+      appId: appIdColumn >= 0 ? row[appIdColumn] : '',
+      name: nameColumn >= 0 ? row[nameColumn] : ''
+    });
+  });
+  return rows;
+}
+
+function buildTodayActionAlreadyHandled_(ss, decisions) {
+  const index = {
+    byAppId: new Set(),
+    byLegacyName: new Set(),
+    reasonsByAppId: new Map(),
+    reasonsByLegacyName: new Map()
+  };
+  (decisions || new Map()).forEach(decision => {
+    const status = normalizeDecisionStatus_(decision && decision.status);
+    if (status === 'BUILD' || status === 'WATCH' || status === 'REJECT') {
+      addTodayActionHandledIdentity_(index, 'handledByDecision', decision.appId, decision.name, true);
+    }
+  });
+
+  const readRows = (sheet, appIdHeader, nameHeader) => readTodayActionHandledRows_(sheet, appIdHeader, nameHeader);
+  const researchSheet = ss && ss.getSheetByName ? ss.getSheetByName(HOTWORD_V2.sheets.trendsResearch) : null;
+  const researchHeaders = researchSheet && researchSheet.getLastColumn() > 0
+    ? researchSheet.getRange(1, 1, 1, researchSheet.getLastColumn()).getDisplayValues()[0] : [];
+  const researchRows = readRows(researchSheet, 'AppID', 'Game');
+  researchRows.forEach((row, indexNumber) => {
+    const values = researchSheet.getRange(indexNumber + 2, 1, 1, researchHeaders.length).getDisplayValues()[0];
+    const value = name => {
+      const column = researchHeaders.indexOf(name);
+      return column >= 0 ? values[column] : '';
+    };
+    const result = [value('研究结果'), value('Trends结论'), value('人工判定'), value('TrendVerdict')]
+      .some(item => hasCompletedManualResearchValue_(item));
+    const status = String(value('状态') || '').trim().toUpperCase();
+    const completedStatus = ['COMPLETED', 'COMPLETE', 'DONE', '已完成', '完成'].indexOf(status) >= 0;
+    if (result || completedStatus) {
+      addTodayActionHandledIdentity_(index, 'handledByTrendsResearch', row.appId, row.name, true);
+    }
+  });
+
+  const poolSheet = ss && ss.getSheetByName ? ss.getSheetByName(HOTWORD_V2.sheets.sitePool) : null;
+  const poolHeaders = poolSheet && poolSheet.getLastColumn() > 0
+    ? poolSheet.getRange(1, 1, 1, poolSheet.getLastColumn()).getDisplayValues()[0] : [];
+  readRows(poolSheet, 'Steam App ID', '游戏名称').forEach((row, indexNumber) => {
+    const values = poolSheet.getRange(indexNumber + 2, 1, 1, poolHeaders.length).getDisplayValues()[0];
+    const value = name => {
+      const column = poolHeaders.indexOf(name);
+      return column >= 0 ? String(values[column] || '').trim().toUpperCase() : '';
+    };
+    const terminal = ['LIVE', '已建站', '已上线', '已完成', 'BUILD_COMPLETE', 'COMPLETED', 'COMPLETE', 'DONE', 'PUBLISHED'];
+    if (terminal.indexOf(value('当前状态')) >= 0 || terminal.indexOf(value('Build状态')) >= 0) {
+      addTodayActionHandledIdentity_(index, 'handledBySitePool', row.appId, row.name, true);
+    }
+  });
+
+  const historySheet = ss && ss.getSheetByName ? ss.getSheetByName(HOTWORD_V2.sheets.history) : null;
+  readRows(historySheet, 'Steam App ID', '游戏名称').forEach((row, indexNumber) => {
+    const values = historySheet.getRange(indexNumber + 2, 1, 1, historySheet.getLastColumn()).getDisplayValues()[0];
+    const stageColumn = historySheet.getRange(1, 1, 1, historySheet.getLastColumn()).getDisplayValues()[0].indexOf('当前阶段');
+    const stage = stageColumn >= 0 ? String(values[stageColumn] || '').trim() : '';
+    if ([HISTORY_STAGE_BUILD_, HISTORY_STAGE_GSC_, '已上线', '已完成', 'BUILD_COMPLETE', 'COMPLETED'].indexOf(stage) >= 0) {
+      addTodayActionHandledIdentity_(index, 'handledByHistory', row.appId, row.name, true);
+    }
+  });
+
+  const planSheet = ss && ss.getSheetByName ? ss.getSheetByName(HOTWORD_V2.sheets.keywordPlan) : null;
+  if (planSheet && planSheet.getLastRow() >= 1) {
+    const plan = parseKeywordPlanValues_(planSheet.getRange(1, 1, planSheet.getLastRow(), Math.max(1, planSheet.getLastColumn())).getDisplayValues());
+    (plan.buildGames || []).forEach(game => addTodayActionHandledIdentity_(index, 'handledByBuildPlan', game.appId, game.name, true));
+  }
+  return index;
+}
+
+function isTodayActionAlreadyHandled_(rec, index) {
+  if (!rec || !index) return false;
+  const appId = String(rec.appId || '').trim();
+  if (isReliableSteamAppId_(appId)) return index.byAppId.has(appId);
+  const name = normalizeGameName_(rec.name);
+  return !!name && index.byLegacyName.has(name);
+}
+
+function todayActionHandledReasons_(rec, index) {
+  if (!rec || !index) return [];
+  const appId = String(rec.appId || '').trim();
+  if (isReliableSteamAppId_(appId)) return Array.from(index.reasonsByAppId.get(appId) || []);
+  const name = normalizeGameName_(rec.name);
+  return name ? Array.from(index.reasonsByLegacyName.get(name) || []) : [];
+}
+
 // ============================================================================
 // M7A — Steam Candidate Research bridge
 // ============================================================================
@@ -5237,7 +5579,7 @@ function actionRow_(rec) {
 // 输出到 Sheet
 // ============================================================================
 
-function upsertMaster_(ss, records, runTime, runId) {
+function upsertMaster_(ss, records, runTime, runId, stats) {
   const sheet = ss.getSheetByName(HOTWORD_V2.sheets.master);
   const index = new Map();
   const lastRow = sheet.getLastRow();
@@ -5263,6 +5605,24 @@ function upsertMaster_(ss, records, runTime, runId) {
     }
 
     const row = masterRow_(rec, runTime, firstSeen, runId, manualNote);
+
+    // A failed GP request is not a new observation and must not erase a
+    // previously successful enrichment in the master table.
+    if (existingRow && rec._gpEnrichmentFailed) {
+      const existing = sheet.getRange(existingRow, 1, 1, row.length).getValues()[0];
+      let preserved = false;
+      [11, 12, 13, 14, 15].forEach(index => {
+        const rowValue = row[index];
+        const existingValue = existing[index];
+        if ((rowValue === null || rowValue === undefined || String(rowValue).trim() === '') &&
+            existingValue !== null && existingValue !== undefined && String(existingValue).trim() !== '' &&
+            isFiniteNumber_(Number(existingValue))) {
+          row[index] = existing[index];
+          preserved = true;
+        }
+      });
+      if (preserved && stats) stats.failuresKept += 1;
+    }
 
     if (existingRow) {
       sheet.getRange(existingRow, 1, 1, row.length).setValues([row]);
@@ -5441,6 +5801,7 @@ function readCandidateMasterRecordsForTodayAction_(ss) {
       continueNext: value(row, '进入下一步') || '',
       firstRoundReason: value(row, '第一轮判定依据') || '',
       currentStage: value(row, '当前筛选阶段') || '',
+      nextAction: value(row, '下一步动作') || '',
       dataNotes: notes ? notes.split(' | ') : []
     });
   });
@@ -5533,14 +5894,44 @@ function refreshTodayActionsFromCandidateDecisions_(spreadsheet, runTime, runId,
   const now = runTime || new Date();
   const rules = loadRules_(ss);
   const decisions = readCandidateDecisions_(ss);
+  const alreadyHandled = buildTodayActionAlreadyHandled_(ss, decisions);
   const masterRecords = readCandidateMasterRecordsForTodayAction_(ss);
   const manualContent = readTodayActionManualContent_(actionSheet);
   const before = countTodayActionRows_(actionSheet);
   const actions = [];
+  let handledExcludedCount = 0;
+  const handledReasonBreakdown = {
+    handledByDecision: 0,
+    handledByTrendsResearch: 0,
+    handledBySitePool: 0,
+    handledByHistory: 0,
+    handledByBuildPlan: 0
+  };
 
-  decisions.forEach(decision => {
-    const rec = masterRecords.get(String(decision.appId || '').trim());
-    if (!rec || rec.continueNext !== '是') return;
+  masterRecords.forEach(rec => {
+    const decision = decisions.get(rec.appId) || {
+      appId: rec.appId,
+      name: rec.name,
+      status: '',
+      trendsResult: '',
+      socialResult: '',
+      serpCompetition: '',
+      keywordOpportunity: '',
+      currentStage: rec.currentStage,
+      nextAction: rec.nextAction
+    };
+    if (rec.continueNext !== '是') return;
+    // Preserve WATCH recheck rows and the existing BUILD/REJECT projection;
+    // only suppress a candidate with no Candidate Decision state when a
+    // persisted lifecycle/research source already handled its identity.
+    if (isTodayActionAlreadyHandled_(rec, alreadyHandled) &&
+        !normalizeDecisionStatus_(decision.status)) {
+      handledExcludedCount += 1;
+      todayActionHandledReasons_(rec, alreadyHandled).forEach(reason => {
+        if (Object.prototype.hasOwnProperty.call(handledReasonBreakdown, reason)) handledReasonBreakdown[reason] += 1;
+      });
+      return;
+    }
     const projectedDecision = todayActionDecisionProjection_(rec, decision);
     const projection = decideTodayActionProjection_(rec, projectedDecision, now, rules, ss);
     if (!projection.include) return;
@@ -5551,18 +5942,24 @@ function refreshTodayActionsFromCandidateDecisions_(spreadsheet, runTime, runId,
     rec.todayAction.lastCheckedDate = projectedDecision.lastCheckedDate;
     actions.push(rec);
   });
-  actions.sort(compareActions_);
+  const sampledActions = limitTodayActionSamples_(actions, rules);
+  sampledActions.sort(compareActions_);
 
   const summaryCounts = Object.assign({
     discoveredCount: masterRecords.size,
-    historyExcludedCount: 0,
+    historyExcludedCount: handledExcludedCount,
     pass1ACount: Array.from(masterRecords.values()).filter(rec => rec.continueNext === '是').length,
     trendCount: Array.from(masterRecords.values()).filter(rec => rec.firstRoundType === '🔥 趋势候选').length,
     earlyCount: Array.from(masterRecords.values()).filter(rec => rec.firstRoundType === '🌱 Early候选').length,
     controlCount: Array.from(masterRecords.values()).filter(rec => rec.firstRoundType === '🏢 大盘对照').length,
+    p2TrendCount: Array.from(masterRecords.values()).filter(rec => rec.firstRoundType === '🟡 Trend Watch').length,
+    p2EarlyCount: Array.from(masterRecords.values()).filter(rec => rec.firstRoundType === '🟢 Early Watch').length,
     anomalyCount: 0
   }, counts || {});
-  refreshTodayAction_(ss, actions, now, runId || todayActionRefreshRunId_(ss, now), summaryCounts);
+  refreshTodayAction_(ss, sampledActions, now, runId || todayActionRefreshRunId_(ss, now), summaryCounts);
+  if (typeof Logger !== 'undefined' && Logger.log && handledExcludedCount) {
+    Logger.log(JSON.stringify({todayActionHandledReasonBreakdown: handledReasonBreakdown}));
+  }
   const after = countTodayActionRows_(actionSheet);
   return {
     ok: true,
@@ -5570,8 +5967,61 @@ function refreshTodayActionsFromCandidateDecisions_(spreadsheet, runTime, runId,
     afterCount: after.total,
     beforePendingCount: before.pending,
     afterPendingCount: after.pending,
-    waitingCount: after.waiting
+    waitingCount: after.waiting,
+    handledReasonBreakdown
   };
+}
+
+function selectTodayActionQuota_(records, trendType, earlyType, totalLimit, trendLimit, earlyLimit) {
+  const ordered = (records || []).slice();
+  const selected = [];
+  const selectedSet = new Set();
+  const takeType = (type, limit) => {
+    ordered.filter(rec => rec.firstRoundType === type).slice(0, Math.max(0, limit)).forEach(rec => {
+      selected.push(rec);
+      selectedSet.add(rec);
+    });
+  };
+  takeType(trendType, trendLimit);
+  takeType(earlyType, earlyLimit);
+
+  // Priority quotas are preferred allocations; an undersupplied class lets the
+  // other class fill the remaining daily capacity without changing master data.
+  ordered.filter(rec => !selectedSet.has(rec) &&
+    (rec.firstRoundType === trendType || rec.firstRoundType === earlyType))
+    .slice(0, Math.max(0, totalLimit - selected.length))
+    .forEach(rec => selected.push(rec));
+  return selected;
+}
+
+function configuredTodayActionNumber_(rules, key, fallback) {
+  const value = Number(rules && rules[key]);
+  return isFinite(value) ? value : fallback;
+}
+
+function limitTodayActionSamples_(actions, rules) {
+  const waiting = (actions || []).filter(rec => rec.todayAction && rec.todayAction.isWaiting);
+  const pending = (actions || []).filter(rec => !rec.todayAction || !rec.todayAction.isWaiting);
+  const p1 = pending.filter(rec => rec.firstRoundType === '🔥 趋势候选' || rec.firstRoundType === '🌱 Early候选');
+  const p2 = pending.filter(rec => rec.firstRoundType === '🟡 Trend Watch' || rec.firstRoundType === '🟢 Early Watch');
+  const selected = selectTodayActionQuota_(
+    p1, '🔥 趋势候选', '🌱 Early候选',
+    configuredTodayActionNumber_(rules, 'P1_MAX_PER_DAY', 6),
+    configuredTodayActionNumber_(rules, 'P1_TREND_MAX_PER_DAY', 4),
+    configuredTodayActionNumber_(rules, 'P1_EARLY_MAX_PER_DAY', 2)
+  ).concat(selectTodayActionQuota_(
+    p2, '🟡 Trend Watch', '🟢 Early Watch',
+    configuredTodayActionNumber_(rules, 'P2_MAX_PER_DAY', 6),
+    configuredTodayActionNumber_(rules, 'P2_TREND_MAX_PER_DAY', 3),
+    configuredTodayActionNumber_(rules, 'P2_EARLY_MAX_PER_DAY', 3)
+  ));
+  const selectedSet = new Set(selected);
+  // Existing Control rows remain visible and are not counted against the P1/P2
+  // experiment quotas. All non-actionable rows were already excluded upstream.
+  pending.forEach(rec => {
+    if (rec.firstRoundType === '🏢 大盘对照' && !selectedSet.has(rec)) selected.push(rec);
+  });
+  return waiting.concat(selected);
 }
 
 // Public Apps Script API wrapper; the implementation remains the single
@@ -5658,7 +6108,10 @@ function appendRunLog_(ss, row) {
 }
 
 function compareActions_(a, b) {
-  const order = {'🔥 趋势候选': 1, '🌱 Early候选': 2, '🏢 大盘对照': 3};
+  const order = {
+    '🔥 趋势候选': 1, '🌱 Early候选': 2, '🏢 大盘对照': 3,
+    '🟡 Trend Watch': 4, '🟢 Early Watch': 5
+  };
   const oa = order[a.firstRoundType] || 9;
   const ob = order[b.firstRoundType] || 9;
   if (oa !== ob) return oa - ob;
@@ -5841,6 +6294,8 @@ function applyActionFormatting_(sheet, dataRows) {
       if (r[0] === '🔥 趋势候选') cell.setBackground('#FCE8E6');
       else if (r[0] === '🌱 Early候选') cell.setBackground('#E6F4EA');
       else if (r[0] === '🏢 大盘对照') cell.setBackground('#E8F0FE');
+      else if (r[0] === '🟡 Trend Watch') cell.setBackground('#FFF2CC');
+      else if (r[0] === '🟢 Early Watch') cell.setBackground('#E2F0D9');
     });
   }
 

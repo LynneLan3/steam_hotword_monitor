@@ -18,7 +18,8 @@ var context = {
 vm.createContext(context);
 ['hasCompletedManualResearchValue_', 'candidateExternalSignalIsNew_',
   'candidateGainGrowthReached_', 'candidateWatchRecheckGate_',
-  'candidateManualEvidenceNextAction_', 'candidateManualEvidenceNeedsNoProvider_']
+  'candidateManualEvidenceNextAction_', 'candidateManualEvidenceNeedsNoProvider_',
+  'isTodayActionP2Type_', 'hasNoManualResearchHistory_', 'isDirectP2TodayActionSample_']
   .forEach(function (name) { vm.runInContext(extract(name), context); });
 vm.runInContext(extract('decideTodayAction_'), context);
 vm.runInContext(extract('isUnfinishedResearchValue_'), context);
@@ -76,7 +77,7 @@ var migrated = migrateValidations(actionHeaders, validations);
 assert(migrated[23] === null, 'stale W4 validation removed');
 assert(migrated[19].join('|') === 'BUILD|WATCH|REJECT', 'Decision validation moved to current column');
 assert(src.indexOf('ensureSitePoolSchema_') >= 0, 'site pool schema migration');
-assert(src.indexOf("['Site ID', '游戏名称', 'Steam App ID', '当前状态', 'BUILD日期', 'Build状态', 'Repo URL', 'Vercel URL', '上线日期', '模板版本', 'GSC状态', 'GSC Site', 'GSC URL Prefix', 'GSC Last Sync', 'SEO阶段', 'Index状态', '首次曝光日期', 'Clicks', 'Impressions', 'CTR', 'Average Position']") >= 0, 'site pool final fields');
+assert(src.indexOf("['Site ID', '游戏名称', 'Steam App ID', '当前状态', 'BUILD日期', 'Build状态', 'Repo URL', 'Vercel URL', '上线日期', '模板版本', 'GSC状态', 'GSC Site', 'GSC URL Prefix', 'GSC Last Sync', 'SEO阶段', 'Index状态', '首次曝光日期', 'Clicks', 'Impressions', 'CTR', 'Average Position', 'OpportunityID', 'ExperimentType', 'ActualLiveAt', 'LaunchPageCount']") >= 0, 'site pool final fields');
 var orderBlock = src.match(/sheetUiOrder:\s*\[([\s\S]*?)\]/)[1];
 ['今日行动', '站点项目池', '项目GSC关联', '候选决策', '候选主表', 'Steam_每日快照', '历史游戏库', '使用说明'].forEach(function (name) {
   assert(orderBlock.indexOf("'" + name + "'") >= 0, 'sheet order missing ' + name);

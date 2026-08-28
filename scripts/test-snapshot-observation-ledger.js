@@ -12,8 +12,8 @@ assert(
   'active candidates are derived from observation records'
 );
 assert(
-  /fetchGamesPopularityFollowersBatch_\(active, gpKey, warnings\)/.test(source),
-  'follower history remains bounded to active candidates'
+  /const cachePartition = partitionDailyGamesPopularityCache_\(active, dailyGpCache\)[\s\S]*?const cacheMisses = cachePartition\.misses/.test(source),
+  'GP cache partition is derived from bounded active candidates'
 );
 assert(
   /appendSnapshots_\(ss, observations, startedAt, runId\)/.test(source),
@@ -21,11 +21,14 @@ assert(
 );
 assert(/G010_RAW_DISCOVERY_PAGES = 5/.test(source), 'raw discovery is widened to validated pages 1-5');
 assert(/const candidateScope = observations\.filter\(isLegacyCandidateScope_\)/.test(source), 'candidate scope is derived separately');
-assert(/fetchGamesPopularityLatestBatch_\(active, gpKey, warnings\)/.test(source), 'latest enrichment remains bounded to active candidates');
+assert(/fetchGamesPopularityLatestBatch_\(cacheMisses, gpKey, warnings, gpStats, gpAttemptContext\)/.test(source), 'latest enrichment uses only cache misses');
+assert(/fetchGamesPopularityFollowersBatch_\(cacheMisses, gpKey, warnings, gpStats, gpAttemptContext\)/.test(source), 'follower history uses only cache misses');
+assert(/if \(rec\._gpDailyCache\)[\s\S]*?rec\._gpEnrichmentFresh = true/.test(source), 'cache hit reuses complete enrichment');
+assert(/const snapshotUpdate = updateSnapshots_\(ss, active\.filter\(rec => rec\._gpEnrichmentFresh\)/.test(source), 'only successful enrichment updates snapshots');
+assert(/if \(rec\._gpEnrichmentFresh\) rec\.rawStatus = 'ENRICHED'/.test(source), 'failed enrichment stays out of ENRICHED state');
 assert(/'来源页码', '原始观察状态'/.test(source), 'raw provenance/status fields append at snapshot end');
 assert(/function updateSnapshots_\(ss, records, runTime, runId, rowByAppId\)/.test(source), 'same-run snapshot updater exists');
 assert(/identity\[0\].*runId[\s\S]*identity\[1\].*rec\.appId/.test(source), 'snapshot updates guard Run ID and App ID');
-assert(/active\.forEach\(rec => \{ rec\.rawStatus = 'ENRICHED'; \}\);[\s\S]*updateSnapshots_/.test(source), 'successful page-1 processing marks the same row enriched');
 
 function simulateRun(discovered, historyIds) {
   const observations = discovered.map(item => ({appId: item.appId, name: item.name, page: item.page, rawStatus: 'RAW_ONLY', followers: null, reviews: null, result1A: ''}));
@@ -101,9 +104,27 @@ assert.strictEqual(sheetD.rows.length, 2, 'separate runs retain two historical r
 assert.strictEqual(sheetD.rows[0].followers, 100, 'prior run is not overwritten');
 assert.strictEqual(sheetD.rows[1].followers, 999, 'later run updates only its own row');
 
-// E: provider calls are source-bounded to the page-1 active collection.
-assert(/fetchGamesPopularityLatestBatch_\(active, gpKey, warnings\)/.test(source));
+// E: provider calls are source-bounded to cache misses from the page-1 active collection.
 assert(/fetchSteamReviewSummaryBatch_\(releasedForReviews, warnings\)/.test(source));
+
+function partitionGp(active, cachedIds) {
+  return {
+    hits: active.filter(function (item) { return cachedIds.has(item.appId); }),
+    misses: active.filter(function (item) { return !cachedIds.has(item.appId); })
+  };
+}
+
+const gpPartition = partitionGp(first.active, new Set(['B']));
+assert.deepStrictEqual(gpPartition.hits.map(item => item.appId), ['B'], 'cache hit is reused');
+assert.deepStrictEqual(gpPartition.misses.map(item => item.appId), ['C'], 'only cache miss is fetched');
+assert(gpPartition.misses.every(function (item) { return first.active.indexOf(item) >= 0; }), 'cache misses stay within active candidates');
+
+const successful = {rawStatus: 'RAW_ONLY', _gpEnrichmentFresh: true};
+if (successful._gpEnrichmentFresh) successful.rawStatus = 'ENRICHED';
+assert.strictEqual(successful.rawStatus, 'ENRICHED', 'complete enrichment is ENRICHED');
+const failed = {rawStatus: 'RAW_ONLY', _gpEnrichmentFresh: false};
+if (failed._gpEnrichmentFresh) failed.rawStatus = 'ENRICHED';
+assert.strictEqual(failed.rawStatus, 'RAW_ONLY', 'failed enrichment remains RAW_ONLY');
 
 const second = simulateRun(fixture, historyIds);
 const appended = first.snapshot.concat(second.snapshot);

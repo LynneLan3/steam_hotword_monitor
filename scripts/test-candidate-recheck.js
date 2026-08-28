@@ -16,7 +16,8 @@ function extract(name) {
 }
 var helperSource = ['hasCompletedManualResearchValue_', 'candidateExternalSignalIsNew_',
   'candidateGainGrowthReached_', 'candidateWatchRecheckGate_',
-  'candidateManualEvidenceNextAction_', 'candidateManualEvidenceNeedsNoProvider_']
+  'candidateManualEvidenceNextAction_', 'candidateManualEvidenceNeedsNoProvider_',
+  'isTodayActionP2Type_', 'hasNoManualResearchHistory_', 'isDirectP2TodayActionSample_']
   .map(extract).join('\n');
 
 var context = {

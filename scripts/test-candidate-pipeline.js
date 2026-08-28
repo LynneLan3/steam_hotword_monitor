@@ -19,7 +19,8 @@ var context = {
 vm.createContext(context);
 ['hasCompletedManualResearchValue_', 'candidateExternalSignalIsNew_',
   'candidateGainGrowthReached_', 'candidateWatchRecheckGate_',
-  'candidateManualEvidenceNextAction_', 'candidateManualEvidenceNeedsNoProvider_']
+  'candidateManualEvidenceNextAction_', 'candidateManualEvidenceNeedsNoProvider_',
+  'isTodayActionP2Type_', 'hasNoManualResearchHistory_', 'isDirectP2TodayActionSample_']
   .forEach(function (name) { vm.runInContext(extract(name), context); });
 vm.runInContext(extract('decideTodayAction_'), context);
 vm.runInContext(extract('siteIdFromGameName_'), context);
