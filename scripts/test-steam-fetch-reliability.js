@@ -288,7 +288,8 @@ function simulateSourceRun_(opts) {
   assert(/function classify1BRaw_/.test(src), 'classify1BRaw_ still present');
   assert(/TREND_GAIN_MIN/.test(src), 'trend gain rule present');
   assert(/EARLY_GROWTH_MIN/.test(src), 'early growth rule present');
-  assert(/完整性下限40/.test(src), 'page integrity floor kept');
+  assert(/STEAM_DISCOVERY_RUNTIME_BUDGET_MS/.test(src), 'runtime budget is explicit');
+  assert(/stopReason = page === 1 \? 'empty-page-1' : 'empty-page'/.test(src), 'empty page is a valid pagination stop');
 
   // 正常 200 路径不走 cache，run 可为 SUCCESS
   var ok = simulateSourceRun_({
@@ -301,8 +302,8 @@ function simulateSourceRun_(opts) {
   assert(ok.usedCache === false, 'live 200 no cache');
   assertEqual(ok.items.length, 50, 'live items intact');
 
-  // 确认未引入“降低完整性门槛”的改动
-  assert(!/完整性下限\s*[0-3]\d/.test(src), 'integrity floor not lowered below 40');
+  // 业务发现不再用固定页数/条数完整性门槛截断。
+  assert(!/G010_RAW_DISCOVERY_PAGES\s*=/.test(src), 'no fixed discovery page cap');
   console.log('PASS 7: 正常成功路径 SUCCESS，1A/1B 规则函数保持');
 })();
 
@@ -323,7 +324,7 @@ function simulateSourceRun_(opts) {
 })();
 
 // --------------------------------------------------------------------------
-// 额外：100 条缓存必须可分片（覆盖 DISCOVERY_PAGES=2 / 生产 100 发现）
+// 额外：100 条缓存必须可分片（覆盖自动分页返回的大批量发现）
 // --------------------------------------------------------------------------
 (function testCacheChunking() {
   var rows = [];

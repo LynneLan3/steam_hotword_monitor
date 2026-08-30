@@ -23,9 +23,9 @@ vm.createContext(context);
   'isTodayActionP2Type_', 'hasNoManualResearchHistory_', 'isDirectP2TodayActionSample_']
   .forEach(function (name) { vm.runInContext(extract(name), context); });
 vm.runInContext(extract('decideTodayAction_'), context);
-vm.runInContext(extract('siteIdFromGameName_'), context);
+vm.runInContext(extract('discoveryIdentifierFromGameName_'), context);
 var decide = context.decideTodayAction_;
-var siteId = context.siteIdFromGameName_;
+var siteId = context.discoveryIdentifierFromGameName_;
 var rules = { RECHECK_GAIN_GROWTH_MIN: 0.30 };
 var today = new Date('2026-08-21T08:00:00+08:00');
 function assert(v, msg) { if (!v) throw new Error(msg); }

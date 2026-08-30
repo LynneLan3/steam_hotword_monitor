@@ -14,11 +14,11 @@ var vm = require('vm');
 var context = {String: String, Set: Set, Math: Math};
 vm.createContext(context);
 vm.runInContext(extract('isSiteIdContractValue_'), context);
-vm.runInContext(extract('siteIdFromGameName_'), context);
+vm.runInContext(extract('discoveryIdentifierFromGameName_'), context);
 assert(context.isSiteIdContractValue_('mortal-shell-ii'), 'lowercase kebab-case Site ID');
 assert(!context.isSiteIdContractValue_('Mortal Shell II'), 'non-kebab Site ID rejected');
-assert(context.siteIdFromGameName_('Twisted Tower™') === 'twisted-tower', 'stable human-readable Site ID');
-assert(context.siteIdFromGameName_('') === '', 'empty name does not use shared fallback Site ID');
+assert(context.discoveryIdentifierFromGameName_('Twisted Tower™') === 'twisted-tower', 'stable discovery identifier');
+assert(context.discoveryIdentifierFromGameName_('') === '', 'empty name does not use shared fallback identifier');
 
 var headers = ['Site ID', '游戏名称', 'Steam App ID', 'BUILD日期', '当前状态', '站点URL', 'GSC状态', '索引状态', '点击', '曝光'];
 var oldRow = ['demo-site', 'Demo Game', '123', '2026-08-21', 'BUILD_PENDING', 'https://demo.example', 'NOT_CONNECTED', 'UNKNOWN', 12, 345];

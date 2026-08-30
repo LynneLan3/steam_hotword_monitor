@@ -28,6 +28,7 @@ const HOTWORD_V2 = {
     usage: '使用说明',
     metrics: '指标说明',
     action: '今日行动',
+    candidateSnapshot: '今日候选快照',
     decisions: '候选决策',
     master: '候选主表',
     keywordPlan: '建站关键词规划',
@@ -40,8 +41,15 @@ const HOTWORD_V2 = {
     sitePool: '站点项目池',
     gscBinding: '项目GSC关联',
     externalEvidence: '外部证据记录',
-    trendsResearch: 'Trends研究记录',
+  trendsResearch: 'Trends研究记录',
     externalDataAttempts: '外部数据获取尝试'
+  },
+
+  rawArchive: {
+    folderName: 'Steam Raw Archive',
+    filePrefix: 'steam_raw_',
+    retentionDays: 60,
+    triggerHandler: 'runSteamRawArchiveMaintenance'
   },
 
   /**
@@ -59,6 +67,7 @@ const HOTWORD_V2 = {
    */
   sheetUiOrder: [
     '今日行动',
+    '今日候选快照',
     '站点项目池',
     '项目GSC关联',
     '候选决策',
@@ -150,7 +159,8 @@ const HOTWORD_V2 = {
     '评论数', '好评数', 'Steam评分',
     '1A结果', '1A排除原因', '第一轮类型', '第一轮优先级', '进入下一步', '下一步动作',
     '第一轮判定依据', '当前筛选阶段', '数据状态', '数据备注',
-    '首次发现日期', '最后发现日期', '最近Run ID', '人工备注'
+    '首次发现日期', '最后发现日期', '最近Run ID', '人工备注',
+    '上次Qualification时间', '上次Qualification排名', 'Eligibility原因', 'Qualification状态'
   ],
 
   snapshotHeaders: [
@@ -183,6 +193,12 @@ const HOTWORD_V2 = {
   externalDataAttemptHeaders: [
     '尝试时间', 'Run ID', 'Provider', 'Endpoint', 'Steam App ID', '游戏名称',
     '刷新原因', 'HTTP状态', '尝试结果', '错误摘要'
+  ],
+
+  candidateSnapshotHeaders: [
+    '日期', 'Run ID', '游戏名称', 'Steam App ID', '优先级', '第一轮类型',
+    'Steam Followers', 'Steam 7d Gain', '近似增长率', '发布阶段',
+    'Steam 发布日期', '距发售天数', '触发原因'
   ],
 
   actionHeaders: [
@@ -252,7 +268,19 @@ const STEAM_CANDIDATE_RECOMMENDATIONS = {
   RECOMMEND_REJECT: true
 };
 const STEAM_CANDIDATE_RESEARCH_CONFIDENCES = { HIGH: true, MEDIUM: true, LOW: true };
-const G010_RAW_DISCOVERY_PAGES = 5;
+const QUALIFICATION_ELIGIBILITY_PRODUCTION_SHEET_ID = '1WVg2p_Vero3MB2JN4yxmtHkLQRgkWO2mz95X4ms9nLE';
+// G010 discovery has no business page/count cap.  The only bound is the
+// Apps Script execution window; an interrupted source resumes from its next
+// page on the following run.
+const STEAM_DISCOVERY_RUNTIME_BUDGET_MS = 4 * 60 * 1000;
+const G010_EXECUTION_BUDGET_MS = 4 * 60 * 1000;
+const G010_STATE_KEYS = {
+  runId: 'G010_RUN_ID', phase: 'G010_PHASE', source: 'G010_SOURCE',
+  nextPage: 'G010_NEXT_PAGE', enrichmentCursor: 'G010_ENRICHMENT_CURSOR'
+};
+const G010_CONTINUATION_HANDLER = 'runG010Continuation_';
+const G010_403_CONTINUATION_DELAY_MS = 3 * 60 * 1000;
+const G010_CONTINUATION_STALE_MS = 10 * 60 * 1000;
 
 
 // ============================================================================
@@ -267,6 +295,18 @@ function onOpen() {
     .addItem('② 设置 Games Popularity API Key', 'setGamesPopularityApiKey')
     .addItem('③ 检查 API Key', 'checkGamesPopularityApiKey')
     .addItem('强制刷新 Games Popularity（一次）', 'forceRefreshGamesPopularity')
+    .addItem('Steam 日期解析 Smoke Test', 'steamReleaseDateParserSmokeTest')
+    .addItem('检查/恢复 G010 Continuation', 'inspectOrRestoreG010Continuation')
+    .addItem('停止 G010 当前 Run', 'stopG010CurrentRun')
+    .addItem('恢复 G010 当前 Run', 'restoreG010CurrentRun')
+    .addItem('Eligibility V1 初始化 + Dry Run', 'runQualificationEligibilityV1InitAndDryRun')
+    .addItem('初始化 Qualification Eligibility V1', 'initializeQualificationEligibilityV1')
+    .addItem('Qualification Eligibility baseline', 'backfillQualificationEligibilityBaselineV1')
+    .addItem('Qualification Eligibility dry-run（只读）', 'dryRunQualificationEligibilityV1')
+    .addSeparator()
+    .addItem('Raw 归档状态', 'showSteamRawArchiveStatus')
+    .addItem('执行 Raw 月度归档', 'executeSteamRawMonthlyArchive')
+    .addItem('设置 Raw 归档每日触发器', 'setupSteamRawArchiveMaintenance')
     .addSeparator()
     .addItem('▶ 立即运行 0→1B', 'runSteamHotword01B')
     .addItem('刷新今日行动', 'refreshTodayActionsFromCandidateDecisions')
@@ -569,6 +609,284 @@ function setupSteamScanner() {
   return setupSteamHotwordV2();
 }
 
+function formatSteamDateSmokeValue_(value) {
+  if (!value) return '';
+  const date = value instanceof Date ? value : new Date(value);
+  if (isNaN(date.getTime())) return '';
+  return date.getFullYear() + '-' + String(date.getMonth() + 1).padStart(2, '0') + '-' + String(date.getDate()).padStart(2, '0');
+}
+
+/** Read-only production HTML check; deliberately does not save cache or Sheet rows. */
+function steamReleaseDateParserSmokeTest() {
+  const summaries = [];
+  const logs = [];
+  HOTWORD_V2.sources.forEach(source => {
+    const summary = {source: source.name, rowsParsed: 0, explicitDates: 0, tbaComingSoon: 0, missingDates: 0, samples: [], error: ''};
+    try {
+      const fetched = fetchSteamSearchPageReliable_(source.name, source.url, 1, logs);
+      const rows = parseSteamSearchResults_(fetched.body);
+      summary.rowsParsed = rows.length;
+      rows.forEach(item => {
+        const raw = String(item.releaseDate || '').trim();
+        const parsed = parseExactSteamDate_(raw);
+        if (parsed) summary.explicitDates += 1;
+        else if (/coming soon|to be announced|\btba\b/i.test(raw)) summary.tbaComingSoon += 1;
+        else summary.missingDates += 1;
+      });
+      const shuffled = rows.slice();
+      for (let i = shuffled.length - 1; i > 0; i -= 1) {
+        const j = Math.floor(Math.random() * (i + 1));
+        const tmp = shuffled[i]; shuffled[i] = shuffled[j]; shuffled[j] = tmp;
+      }
+      summary.samples = shuffled.slice(0, 3).map(item => ({
+        game: item.name,
+        rawReleaseText: item.releaseDate || '',
+        parsedDate: formatSteamDateSmokeValue_(parseExactSteamDate_(item.releaseDate))
+      }));
+    } catch (err) {
+      summary.error = String(err && err.message || err);
+    }
+    summaries.push(summary);
+  });
+
+  const lines = ['Steam 日期解析 Smoke Test'];
+  summaries.forEach(summary => {
+    lines.push('', summary.source);
+    if (summary.error) {
+      lines.push('fetch error: ' + summary.error);
+      return;
+    }
+    lines.push(
+      'rows parsed: ' + summary.rowsParsed,
+      'release date 可明确解析: ' + summary.explicitDates,
+      'TBA / Coming soon: ' + summary.tbaComingSoon,
+      '日期缺失: ' + summary.missingDates,
+      '随机样本:'
+    );
+    summary.samples.forEach(sample => {
+      lines.push('  ' + sample.game + ' | raw=' + sample.rawReleaseText + ' | parsed=' + (sample.parsedDate || ''));
+    });
+  });
+  SpreadsheetApp.getUi().alert(lines.join('\n'));
+  return summaries;
+}
+
+/** Append-only schema migration; does not initialize any other Sheet. */
+function ensureQualificationEligibilityColumns_(sheet) {
+  const fields = ['上次Qualification时间', '上次Qualification排名', 'Eligibility原因', 'Qualification状态'];
+  const width = Math.max(sheet.getLastColumn(), 1);
+  const headers = sheet.getRange(1, 1, 1, width).getDisplayValues()[0];
+  let lastColumn = width;
+  let appended = 0;
+  fields.forEach(field => {
+    if (headers.indexOf(field) >= 0) return;
+    lastColumn += 1;
+    if (sheet.getMaxColumns && lastColumn > sheet.getMaxColumns() && sheet.insertColumnsAfter) {
+      sheet.insertColumnsAfter(sheet.getMaxColumns(), 1);
+    }
+    sheet.getRange(1, lastColumn).setValue(field);
+    headers.push(field);
+    appended += 1;
+  });
+  return {fields: fields, headers: headers, width: lastColumn, appended: appended};
+}
+
+function qualificationMasterSheet_() {
+  const ss = SpreadsheetApp.openById(QUALIFICATION_ELIGIBILITY_PRODUCTION_SHEET_ID);
+  const sheet = ss && ss.getSheetByName(HOTWORD_V2.sheets.master);
+  if (!sheet) throw new Error('候选主表不存在');
+  return sheet;
+}
+
+function initializeQualificationEligibilityV1() {
+  const sheet = qualificationMasterSheet_();
+  const schema = ensureQualificationEligibilityColumns_(sheet);
+  return {ok: true, appended: schema.appended, width: schema.width};
+}
+
+function backfillQualificationEligibilityBaselineV1() {
+  const sheet = qualificationMasterSheet_();
+  const schema = ensureQualificationEligibilityColumns_(sheet);
+  const headers = schema.headers;
+  const col = name => headers.indexOf(name);
+  const appIdCol = col('Steam App ID');
+  const result1ACol = col('1A结果');
+  const firstRoundCol = col('第一轮类型');
+  const lastScanCol = col('最后扫描时间');
+  const rankCol = col('来源排名');
+  const lastTimeCol = col('上次Qualification时间');
+  const lastRankCol = col('上次Qualification排名');
+  const reasonCol = col('Eligibility原因');
+  const statusCol = col('Qualification状态');
+  if (appIdCol < 0 || result1ACol < 0 || firstRoundCol < 0) throw new Error('候选主表缺少 baseline 所需旧字段');
+  if (sheet.getLastRow() < 2) return {ok: true, scanned: 0, backfilled: 0};
+
+  const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, schema.width).getValues();
+  let scanned = 0;
+  let backfilled = 0;
+  rows.forEach((row, index) => {
+    const appId = String(row[appIdCol] || '').trim();
+    if (!appId) return;
+    scanned += 1;
+    const hasQualification = STEAM_CANDIDATE_1A_PASS_RESULTS[String(row[result1ACol] || '').trim()] ||
+      !!String(row[firstRoundCol] || '').trim();
+    if (!hasQualification) return;
+    const time = lastScanCol >= 0 ? row[lastScanCol] : '';
+    const rank = rankCol >= 0 ? qualificationRankValue_(row[rankCol]) : null;
+    const alreadySet = lastTimeCol >= 0 && lastRankCol >= 0 &&
+      (row[lastTimeCol] !== '' || row[lastRankCol] !== '');
+    if (alreadySet) return;
+    const rowNumber = index + 2;
+    if (lastTimeCol >= 0) sheet.getRange(rowNumber, lastTimeCol + 1).setValue(time || '');
+    if (lastRankCol >= 0) sheet.getRange(rowNumber, lastRankCol + 1).setValue(rank || '');
+    if (reasonCol >= 0) sheet.getRange(rowNumber, reasonCol + 1).setValue('BASELINE');
+    if (statusCol >= 0) sheet.getRange(rowNumber, statusCol + 1).setValue('COMPLETE');
+    backfilled += 1;
+  });
+  return {ok: true, scanned: scanned, backfilled: backfilled};
+}
+
+function qualificationDateKey_(value, ss) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (isNaN(date.getTime())) return '';
+  const timezone = ss && ss.getSpreadsheetTimeZone ? ss.getSpreadsheetTimeZone() : 'Asia/Shanghai';
+  if (typeof Utilities !== 'undefined' && Utilities.formatDate) return Utilities.formatDate(date, timezone, 'yyyy-MM-dd');
+  return date.getFullYear() + '-' + String(date.getMonth() + 1).padStart(2, '0') + '-' + String(date.getDate()).padStart(2, '0');
+}
+
+function readQualificationDryRunObservations_(ss, today) {
+  const sheet = ss.getSheetByName(HOTWORD_V2.sheets.snapshot);
+  const todayKey = qualificationDateKey_(today, ss);
+  const todayByAppId = new Map();
+  const previousByAppId = new Map();
+  if (!sheet || sheet.getLastRow() < 2) return {todayKey: todayKey, today: todayByAppId, previous: previousByAppId};
+  const width = Math.max(sheet.getLastColumn(), HOTWORD_V2.snapshotHeaders.length);
+  const headers = sheet.getRange(1, 1, 1, width).getDisplayValues()[0];
+  const index = name => headers.indexOf(name);
+  const appIdCol = index('Steam App ID');
+  const timeCol = index('运行时间');
+  const rankCol = index('来源排名');
+  const stageCol = index('发布阶段');
+  const daysCol = index('距发售天数');
+  const nameCol = index('游戏名称');
+  if (appIdCol < 0 || timeCol < 0) return {todayKey: todayKey, today: todayByAppId, previous: previousByAppId};
+  sheet.getRange(2, 1, sheet.getLastRow() - 1, width).getValues().forEach(row => {
+    const appId = String(row[appIdCol] || '').trim();
+    if (!appId) return;
+    const rowKey = qualificationDateKey_(row[timeCol], ss);
+    const item = {
+      appId: appId,
+      name: nameCol >= 0 ? row[nameCol] : '',
+      sourceRank: rankCol >= 0 ? row[rankCol] : '',
+      releaseStage: stageCol >= 0 ? String(row[stageCol] || '').trim() : '',
+      daysToRelease: daysCol >= 0 ? row[daysCol] : null
+    };
+    if (rowKey === todayKey) todayByAppId.set(appId, item);
+    else if (rowKey && rowKey < todayKey) previousByAppId.set(appId, item);
+  });
+  return {todayKey: todayKey, today: todayByAppId, previous: previousByAppId};
+}
+
+function dryRunQualificationEligibilityV1() {
+  const ss = SpreadsheetApp.openById(QUALIFICATION_ELIGIBILITY_PRODUCTION_SHEET_ID);
+  const now = arguments.length && arguments[0] ? new Date(arguments[0]) : new Date();
+  const observations = readQualificationDryRunObservations_(ss, now);
+  const state = readQualificationStateIndex_(ss);
+  const decisions = readCandidateDecisions_(ss);
+  const historyIndex = buildHistoryIndex_(ss);
+  const masterScope = readQualificationMasterScopeIndex_(ss);
+  const counts = {
+    rawUniqueAppIds: observations.today.size,
+    NEW_IN_SCOPE: 0, ENTERED_SCOPE: 0, STAGE_CHANGED: 0, RANK_RISING: 0,
+    RECHECK: 0, UNCHANGED_SKIP: 0, OUT_OF_SCOPE: 0, SCOPE_UNKNOWN: 0, REJECT: 0, BUILD: 0,
+    eligibleTotal: 0
+  };
+  observations.today.forEach(rec => {
+    const master = masterScope.get(rec.appId);
+    if (master) {
+      if (!rec.releaseStage) rec.releaseStage = master.releaseStage;
+      if (!isFiniteNumber_(Number(rec.daysToRelease))) rec.daysToRelease = master.daysToRelease;
+    }
+    const decision = decisions.get(rec.appId);
+    const decisionStatus = String(decision && decision.status || '').trim().toUpperCase();
+    if (decisionStatus === 'REJECT') {
+      counts.REJECT += 1;
+      return;
+    }
+    if (decisionStatus === 'BUILD' || isInHistoryIndex_(rec, historyIndex)) {
+      counts.BUILD += 1;
+      return;
+    }
+    const scopeStatus = qualificationScopeStatus_(rec);
+    if (scopeStatus === 'SCOPE_UNKNOWN') {
+      counts.SCOPE_UNKNOWN += 1;
+      return;
+    }
+    const eligibility = evaluateQualificationEligibility_(rec, {
+      previousRaw: observations.previous.get(rec.appId),
+      qualification: state.get(rec.appId),
+      decision: decision,
+      now: now,
+      rules: {}
+    });
+    if (eligibility.reason === 'UNCHANGED_SKIP' && scopeStatus === 'OUT_OF_SCOPE') {
+      counts.OUT_OF_SCOPE += 1;
+    } else {
+      counts[eligibility.reason] = (counts[eligibility.reason] || 0) + 1;
+    }
+    if (eligibility.eligible) counts.eligibleTotal += 1;
+  });
+  Logger.log(JSON.stringify(counts));
+  return counts;
+}
+
+function readQualificationMasterScopeIndex_(ss) {
+  const result = new Map();
+  const sheet = ss.getSheetByName(HOTWORD_V2.sheets.master);
+  if (!sheet || sheet.getLastRow() < 2) return result;
+  const width = Math.max(sheet.getLastColumn(), HOTWORD_V2.masterHeaders.length);
+  const headers = sheet.getRange(1, 1, 1, width).getDisplayValues()[0];
+  const index = name => headers.indexOf(name);
+  const appIdCol = index('Steam App ID');
+  if (appIdCol < 0) return result;
+  const stageCol = index('发布阶段');
+  const daysCol = index('距发售天数');
+  sheet.getRange(2, 1, sheet.getLastRow() - 1, width).getValues().forEach(row => {
+    const appId = String(row[appIdCol] || '').trim();
+    if (!appId) return;
+    result.set(appId, {
+      releaseStage: stageCol >= 0 ? String(row[stageCol] || '').trim() : '',
+      daysToRelease: daysCol >= 0 ? row[daysCol] : null
+    });
+  });
+  return result;
+}
+
+/** Temporary operator menu action for this rollout; no scan or enrichment. */
+function runQualificationEligibilityV1InitAndDryRun() {
+  const baseline = backfillQualificationEligibilityBaselineV1();
+  const counts = dryRunQualificationEligibilityV1(new Date('2026-08-30T12:00:00+08:00'));
+  const message = [
+    'Qualification Eligibility V1 初始化 + Dry Run 完成',
+    '',
+    'baseline 回填数: ' + Number(baseline.backfilled || 0),
+    'Raw unique AppIDs: ' + Number(counts.rawUniqueAppIds || 0),
+    'NEW_IN_SCOPE: ' + Number(counts.NEW_IN_SCOPE || 0),
+    'ENTERED_SCOPE: ' + Number(counts.ENTERED_SCOPE || 0),
+    'STAGE_CHANGED: ' + Number(counts.STAGE_CHANGED || 0),
+    'RANK_RISING: ' + Number(counts.RANK_RISING || 0),
+    'RECHECK: ' + Number(counts.RECHECK || 0),
+    'UNCHANGED_SKIP: ' + Number(counts.UNCHANGED_SKIP || 0),
+    'OUT_OF_SCOPE: ' + Number(counts.OUT_OF_SCOPE || 0),
+    'SCOPE_UNKNOWN: ' + Number(counts.SCOPE_UNKNOWN || 0),
+    'REJECT: ' + Number(counts.REJECT || 0),
+    'BUILD: ' + Number(counts.BUILD || 0),
+    'eligibility=true 总数: ' + Number(counts.eligibleTotal || 0)
+  ].join('\n');
+  SpreadsheetApp.getUi().alert(message);
+  return {baseline: baseline, counts: counts};
+}
+
 function installDailySteamTrigger() {
   return installDailyHotwordTrigger();
 }
@@ -811,6 +1129,7 @@ function setupSteamHotwordV2() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
 
   ensureSheetWithHeaders_(ss, HOTWORD_V2.sheets.master, HOTWORD_V2.masterHeaders);
+  ensureSheetWithHeaders_(ss, HOTWORD_V2.sheets.candidateSnapshot, HOTWORD_V2.candidateSnapshotHeaders);
   ensureSheetWithHeaders_(ss, HOTWORD_V2.sheets.snapshot, HOTWORD_V2.snapshotHeaders);
   ensureSheetWithHeaders_(ss, HOTWORD_V2.sheets.anomalies, HOTWORD_V2.anomalyHeaders);
   ensureSheetWithHeaders_(ss, HOTWORD_V2.sheets.log, HOTWORD_V2.logHeaders);
@@ -837,6 +1156,180 @@ function setupSteamHotwordV2() {
   organizeSheetUi_(ss);
 
   safeToast_('V2.5 表结构已初始化。下一步设置免费 Games Popularity API Key。', 'Steam 0→1B', 8);
+}
+
+// ============================================================================
+// Steam Raw 月度 Drive CSV 归档 V1
+// ============================================================================
+
+function steamRawArchiveFolder_(createIfMissing) {
+  if (typeof DriveApp === 'undefined') throw new Error('DriveApp unavailable');
+  const folders = DriveApp.getFoldersByName(HOTWORD_V2.rawArchive.folderName);
+  if (folders.hasNext()) return folders.next();
+  if (createIfMissing) return DriveApp.createFolder(HOTWORD_V2.rawArchive.folderName);
+  return null;
+}
+
+function steamRawArchiveCsvEscape_(value) {
+  const text = value === null || value === undefined ? '' : String(value);
+  return /[",\r\n]/.test(text) ? '"' + text.replace(/"/g, '""') + '"' : text;
+}
+
+function steamRawArchiveCsv_(headers, rows) {
+  return [headers, ...(rows || [])]
+    .map(row => row.map(steamRawArchiveCsvEscape_).join(','))
+    .join('\r\n') + '\r\n';
+}
+
+function steamRawArchiveDate_(value) {
+  if (value instanceof Date) return isNaN(value.getTime()) ? null : new Date(value.getTime());
+  const text = String(value === null || value === undefined ? '' : value).trim();
+  if (!text) return null;
+  const date = new Date(text);
+  return isNaN(date.getTime()) ? null : date;
+}
+
+function steamRawArchiveMonthKey_(date, timezone) {
+  if (!date) return '';
+  if (typeof Utilities !== 'undefined' && Utilities.formatDate) {
+    return Utilities.formatDate(date, timezone || 'Asia/Shanghai', 'yyyy-MM');
+  }
+  return date.getFullYear() + '-' + String(date.getMonth() + 1).padStart(2, '0');
+}
+
+function steamRawArchiveMonthEnd_(monthKey, timezone) {
+  const match = /^(\d{4})-(\d{2})$/.exec(monthKey);
+  if (!match) return null;
+  // A month is eligible only when its final calendar day is before cutoff.
+  return new Date(Number(match[1]), Number(match[2]), 0, 23, 59, 59, 999);
+}
+
+function steamRawArchiveCutoff_(now, retentionDays) {
+  return new Date(new Date(now || new Date()).getTime() - Number(retentionDays || 60) * 24 * 60 * 60 * 1000);
+}
+
+function steamRawArchiveSchema_(sheet) {
+  const width = Math.max(sheet.getLastColumn(), HOTWORD_V2.snapshotHeaders.length);
+  const headers = sheet.getRange(1, 1, 1, width).getDisplayValues()[0];
+  const index = name => headers.indexOf(name);
+  const firstIndex = names => names.reduce((found, name) => found >= 0 ? found : index(name), -1);
+  const observation = firstIndex(['运行时间', 'observation time', '日期']);
+  const required = ['来源页码', '原始观察状态'];
+  if (observation < 0) throw new Error('Steam_每日快照 缺少 observation time/运行时间/日期 表头');
+  required.forEach(name => { if (index(name) < 0) throw new Error('Steam_每日快照 缺少表头: ' + name); });
+  const runId = firstIndex(['Run ID', 'run_id']);
+  const appId = firstIndex(['Steam App ID', 'steam_app_id']);
+  const source = firstIndex(['候选来源', 'source']);
+  const rank = firstIndex(['来源排名', 'rank']);
+  if (runId < 0 || appId < 0 || source < 0 || rank < 0) throw new Error('Steam_每日快照 缺少 Raw identity 表头');
+  return {width, headers, observation, runId, appId, source, rank};
+}
+
+function steamRawArchiveExistingFile_(folder, name) {
+  const files = folder.getFilesByName(name);
+  if (!files.hasNext()) return null;
+  const file = files.next();
+  if (files.hasNext()) throw new Error('Drive 中存在重复 archive 文件: ' + name);
+  return file;
+}
+
+function steamRawArchiveValidateCsv_(csv, headers, expectedRows, keyRows) {
+  const lines = String(csv || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+  if (lines[lines.length - 1] === '') lines.pop();
+  if (!lines.length || lines[0] !== headers.map(steamRawArchiveCsvEscape_).join(',')) throw new Error('archive header mismatch');
+  if (lines.length - 1 !== expectedRows.length) throw new Error('archive row count mismatch');
+  const expectedKeys = new Set(keyRows.map(row => String(row[0]) + '|' + String(row[1])));
+  const runIdIndex = headers.indexOf('Run ID');
+  const appIdIndex = headers.indexOf('Steam App ID');
+  if (runIdIndex < 0 || appIdIndex < 0) throw new Error('archive key columns missing');
+  const actualKeys = new Set();
+  expectedRows.forEach(row => {
+    actualKeys.add(String(row[runIdIndex]) + '|' + String(row[appIdIndex]));
+  });
+  if (actualKeys.size !== expectedKeys.size || Array.from(expectedKeys).some(key => !actualKeys.has(key))) {
+    throw new Error('archive key rows mismatch');
+  }
+  return {header: true, rowCount: expectedRows.length, keyRows: actualKeys.size};
+}
+
+function steamRawArchivePlan_(ss, now) {
+  const sheet = ss.getSheetByName(HOTWORD_V2.sheets.snapshot);
+  if (!sheet) throw new Error('Steam_每日快照 不存在');
+  const schema = steamRawArchiveSchema_(sheet);
+  const timezone = ss.getSpreadsheetTimeZone ? ss.getSpreadsheetTimeZone() : 'Asia/Shanghai';
+  const values = sheet.getLastRow() >= 2 ? sheet.getRange(2, 1, sheet.getLastRow() - 1, schema.width).getValues() : [];
+  const display = sheet.getLastRow() >= 2 ? sheet.getRange(2, 1, sheet.getLastRow() - 1, schema.width).getDisplayValues() : [];
+  const cutoff = steamRawArchiveCutoff_(now, HOTWORD_V2.rawArchive.retentionDays);
+  const months = {};
+  values.forEach((row, i) => {
+    const date = steamRawArchiveDate_(row[schema.observation]);
+    if (!date) return;
+    const month = steamRawArchiveMonthKey_(date, timezone);
+    if (!months[month]) months[month] = {month, rows: [], displayRows: [], rowNumbers: []};
+    months[month].rows.push(row);
+    months[month].displayRows.push(display[i]);
+    months[month].rowNumbers.push(i + 2);
+  });
+  Object.keys(months).forEach(month => {
+    months[month].eligible = steamRawArchiveMonthEnd_(month, timezone).getTime() < cutoff.getTime();
+  });
+  const dates = values.map(row => steamRawArchiveDate_(row[schema.observation])).filter(Boolean).sort((a, b) => a - b);
+  return {sheet, schema, cutoff, earliest: dates.length ? dates[0] : null, latest: dates.length ? dates[dates.length - 1] : null, months: months};
+}
+
+function getSteamRawArchiveStatus_(ss, now) {
+  const plan = steamRawArchivePlan_(ss || SpreadsheetApp.getActiveSpreadsheet(), now || new Date());
+  const folder = steamRawArchiveFolder_(false);
+  const months = Object.keys(plan.months).sort().map(month => {
+    const item = plan.months[month];
+    const name = HOTWORD_V2.rawArchive.filePrefix + month + '.csv';
+    return {month, rows: item.rows.length, eligible: item.eligible, archiveExists: !!(folder && steamRawArchiveExistingFile_(folder, name)), fileName: name};
+  });
+  return {rowCount: plan.sheet.getLastRow() >= 2 ? plan.sheet.getLastRow() - 1 : 0, earliest: plan.earliest, latest: plan.latest, cutoff: plan.cutoff, eligibleMonths: months.filter(item => item.eligible), months};
+}
+
+function showSteamRawArchiveStatus() {
+  const status = getSteamRawArchiveStatus_();
+  const lines = ['Steam Raw 归档状态', '', 'Steam_每日快照 当前行数: ' + status.rowCount, '最早 observation date: ' + (status.earliest ? status.earliest.toISOString() : '无'), '最新 observation date: ' + (status.latest ? status.latest.toISOString() : '无'), '当前 cutoff: ' + status.cutoff.toISOString(), '', '月份 | 行数 | 可归档 | Drive archive'];
+  status.months.forEach(item => lines.push(item.month + ' | ' + item.rows + ' | ' + (item.eligible ? '是' : '否') + ' | ' + (item.archiveExists ? '已有' : '无')));
+  SpreadsheetApp.getUi().alert(lines.join('\n'));
+  return status;
+}
+
+function executeSteamRawMonthlyArchive(now) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const plan = steamRawArchivePlan_(ss, now || new Date());
+  const folder = steamRawArchiveFolder_(true);
+  const results = [];
+  Object.keys(plan.months).sort().forEach(month => {
+    const item = plan.months[month];
+    if (!item.eligible) return;
+    const fileName = HOTWORD_V2.rawArchive.filePrefix + month + '.csv';
+    const csv = steamRawArchiveCsv_(plan.schema.headers, item.displayRows);
+    const keyRows = item.displayRows.map(row => [row[plan.schema.runId], row[plan.schema.appId]]);
+    let file = steamRawArchiveExistingFile_(folder, fileName);
+    if (file) {
+      if (file.getBlob().getDataAsString() !== csv) throw new Error('已有 archive 内容不一致，禁止删除 Sheet 行: ' + fileName);
+    } else {
+      file = folder.createFile(fileName, csv, 'text/csv');
+    }
+    steamRawArchiveValidateCsv_(file.getBlob().getDataAsString(), plan.schema.headers, item.displayRows, keyRows);
+    item.rowNumbers.slice().sort((a, b) => b - a).forEach(rowNumber => plan.sheet['delete' + 'Rows'](rowNumber, 1));
+    results.push({month, rows: item.rows.length, fileName, deleted: item.rows.length});
+  });
+  safeToast_('Steam Raw 月度归档完成：' + results.length + ' 个月份。', 'Steam Raw Archive', 7);
+  return {ok: true, results};
+}
+
+function runSteamRawArchiveMaintenance() {
+  return executeSteamRawMonthlyArchive();
+}
+
+function setupSteamRawArchiveMaintenance() {
+  const triggers = ScriptApp.getProjectTriggers().filter(trigger => trigger.getHandlerFunction() === HOTWORD_V2.rawArchive.triggerHandler);
+  triggers.slice(1).forEach(trigger => ScriptApp.deleteTrigger(trigger));
+  if (!triggers.length) ScriptApp.newTrigger(HOTWORD_V2.rawArchive.triggerHandler).timeBased().everyDays(1).atHour(3).create();
+  return {existing: triggers.length, ensured: true};
 }
 
 function setupRulesSheet_(ss) {
@@ -894,7 +1387,7 @@ function setupRulesSheet_(ss) {
     ['RECHECK_GAIN_GROWTH_MIN', 0.30, '比例', 'WATCH候选重新进入今日行动所需的7d Gain增长', '候选人工复查 V1'],
     ['WATCH_RECHECK_DAYS_STRONG', 3, '天', '强信号 WATCH 的默认复查间隔', '候选人工复查 V1'],
     ['WATCH_RECHECK_DAYS_NORMAL', 7, '天', '普通 WATCH 的默认复查间隔', '候选人工复查 V1'],
-    ['DISCOVERY_PAGES', 5, '页/来源', '每个Steam来源抓取页数（raw observation）', 'G010：已验证 pages 1–5；candidate scope 仍为 page 1'],
+    ['DISCOVERY_PAGES', 'AUTO', '自动分页', '每个Steam来源持续抓取，直到空页、重复页、来源耗尽或保存续抓', 'G010：仅用于显示语义；不限制页数或候选数量'],
     ['DAILY_HOUR', 8, '小时', '自动触发器运行小时', '表格/脚本时区下08:00–09:00窗口']
   ];
 
@@ -911,6 +1404,13 @@ function setupRulesSheet_(ss) {
   if (toAppend.length) {
     sheet.getRange(sheet.getLastRow() + 1, 1, toAppend.length, 5).setValues(toAppend);
   }
+  const discoveryRow = sheet.getRange(2, 1, Math.max(0, sheet.getLastRow() - 1), 1)
+    .getDisplayValues().findIndex(r => String(r[0] || '').trim() === 'DISCOVERY_PAGES');
+  if (discoveryRow >= 0) {
+    const rowNumber = discoveryRow + 2;
+    const discoveryDefault = defaults.find(r => r[0] === 'DISCOVERY_PAGES');
+    sheet.getRange(rowNumber, 2, 1, 4).setValues([discoveryDefault.slice(1)]);
+  }
 }
 
 function setupActionSheet_(ss) {
@@ -918,7 +1418,7 @@ function setupActionSheet_(ss) {
   if (!sheet) sheet = ss.insertSheet(HOTWORD_V2.sheets.action, 0);
 
   sheet.getRange(1, 1, 1, sheet.getMaxColumns()).breakApart();
-  sheet.getRange('A1').setValue('今日行动：P1 主样本 + P2 边界实验样本；从这里开始手动做 Google Trends / Social');
+  sheet.getRange('A1').setValue('今日行动：实时待办队列；只显示当前仍需人工处理的任务，完成研究或 BUILD / REJECT 后会移出');
   sheet.getRange(3, 1, 1, HOTWORD_V2.actionHeaders.length).setValues([HOTWORD_V2.actionHeaders]);
   const oldLastColumn = sheet.getLastColumn();
   if (oldLastColumn > HOTWORD_V2.actionHeaders.length) {
@@ -1095,7 +1595,8 @@ function getUsageGuideLines_() {
     'Google Trends / Social / SERP / KD / 最终建站决定，目前仍属于 Human Gate。',
     '',
     '—— 各 Sheet 职责 ——',
-    '今日行动：每天主要入口。这里包含 P1 主样本与 P2 边界实验样本；进入今日行动 ≠ 一定建站。',
+    '今日行动：实时待办队列。这里只保留当前仍需人工处理的任务；研究完成、BUILD、REJECT 后会实时移出。它不是每日候选快照。',
+    '今日候选快照：每天正式 Steam 扫描完成后保存当天首次筛出的完整 P1/P2 候选；按日期+Steam App ID 去重，历史日期永久保留。',
     '候选决策：后台自动同步数据库，以 Steam App ID 唯一标识；日常无需打开或人工编辑。',
     '每天操作：1.只打开今日行动；2.点击 Google Trends 链接；3.在同一行选择 Trends、Social、SERP、Keyword 结果；4.最后选择 BUILD / WATCH / REJECT；5.必要时写一句人工备注。其余字段自动记录。',
     '今日行动复查规则：无人工记录的1B候选标记 NEW；WATCH 仅在到期或当前7d Gain较上次检查增长至少30%时出现；BUILD / REJECT 不再出现。每天最多采样 P1 6 个、P2 6 个；未采样候选仍保留在候选主表。',
@@ -1104,6 +1605,7 @@ function getUsageGuideLines_() {
     '建站关键词规划：只有人工二次验证确认值得 BUILD 或重点 WATCH 后才进入。把游戏机会 → 搜索意图 → 页面结构 → URL / Page Type。不是候选发现入口。',
     '规则配置：当前 1A / 1B 参数。这些是热词站项目当前实验规则，不是 Steam / Google / SEO 行业官方标准。不要为了日常候选结果随意修改。',
     '1B规则回测：观察历史样本是否仍支持当前规则。不是每日运营页。',
+    '今日候选快照：每日首次完整 P1/P2 候选的静态历史查看页，今天的记录优先显示。',
     'Steam_每日快照：保存历史运行时的数据状态。主要用于看 Followers 变化、追溯某一天的分类、后续规则回测。日常不需要查看。',
     '数据异常 / 运行日志_V2：只在今天没有正常产生候选、Followers/评论/评分缺失、或 API / 自动任务异常时检查。',
     '历史游戏库：系统去重账本。每日扫描前会把「建站关键词规划」中至少有一条动作为 Build 的游戏自动同步进来。通常不要人工修改。',
@@ -1632,7 +2134,557 @@ function forceRefreshGamesPopularity() {
 // 主流程 0 → 1B
 // ============================================================================
 
+function g010StateProperties_() {
+  return PropertiesService.getScriptProperties();
+}
+
+function g010ReadState_() {
+  const props = g010StateProperties_();
+  const runId = String(props.getProperty(G010_STATE_KEYS.runId) || '').trim();
+  if (!runId) return null;
+  return {
+    runId: runId,
+    phase: String(props.getProperty(G010_STATE_KEYS.phase) || 'DISCOVERY').trim(),
+    source: String(props.getProperty(G010_STATE_KEYS.source) || HOTWORD_V2.sources[0].name).trim(),
+    nextPage: Math.max(1, Number(props.getProperty(G010_STATE_KEYS.nextPage) || 1)),
+    enrichmentCursor: Math.max(0, Number(props.getProperty(G010_STATE_KEYS.enrichmentCursor) || 0))
+  };
+}
+
+function g010WriteState_(state) {
+  const props = g010StateProperties_();
+  props.setProperty(G010_STATE_KEYS.runId, String(state.runId));
+  props.setProperty(G010_STATE_KEYS.phase, String(state.phase));
+  props.setProperty(G010_STATE_KEYS.source, String(state.source || ''));
+  props.setProperty(G010_STATE_KEYS.nextPage, String(Math.max(1, Number(state.nextPage || 1))));
+  props.setProperty(G010_STATE_KEYS.enrichmentCursor, String(Math.max(0, Number(state.enrichmentCursor || 0))));
+}
+
+function g010ClearState_() {
+  const props = g010StateProperties_();
+  Object.keys(G010_STATE_KEYS).forEach(key => props.deleteProperty(G010_STATE_KEYS[key]));
+  ScriptApp.getProjectTriggers().forEach(trigger => {
+    if (trigger.getHandlerFunction() === G010_CONTINUATION_HANDLER) ScriptApp.deleteTrigger(trigger);
+  });
+}
+
+function g010ScheduleContinuation_(delayMs) {
+  const triggers = ScriptApp.getProjectTriggers().filter(trigger =>
+    trigger.getHandlerFunction() === G010_CONTINUATION_HANDLER
+  );
+  // Keep one existing trigger when possible; deleting it before create could
+  // leave a PARTIAL run without recovery if trigger creation is rejected.
+  triggers.slice(1).forEach(trigger => ScriptApp.deleteTrigger(trigger));
+  if (!triggers.length) {
+    ScriptApp.newTrigger(G010_CONTINUATION_HANDLER).timeBased()
+      .after(Math.max(60 * 1000, Number(delayMs || 0))).create();
+  }
+}
+
+function g010RearmContinuation_(delayMs) {
+  const oldTriggers = ScriptApp.getProjectTriggers().filter(trigger =>
+    trigger.getHandlerFunction() === G010_CONTINUATION_HANDLER
+  );
+  // Create first. If Apps Script rejects creation, the old trigger remains
+  // available and the PARTIAL run is still recoverable.
+  ScriptApp.newTrigger(G010_CONTINUATION_HANDLER).timeBased()
+    .after(Math.max(60 * 1000, Number(delayMs || 0))).create();
+  oldTriggers.forEach(trigger => ScriptApp.deleteTrigger(trigger));
+  return true;
+}
+
+function g010EnsureContinuationTrigger_() {
+  const triggers = ScriptApp.getProjectTriggers().filter(trigger =>
+    trigger.getHandlerFunction() === G010_CONTINUATION_HANDLER
+  );
+  const action = g010ContinuationTriggerAction_(g010ReadState_() && g010ReadState_().phase, triggers.length);
+  if (action === 'CREATE') g010ScheduleContinuation_(60 * 1000);
+  else if (action === 'REMOVE_DUPLICATES') triggers.slice(1).forEach(trigger => ScriptApp.deleteTrigger(trigger));
+}
+
+function g010ContinuationTriggerAction_(phase, triggerCount) {
+  if (['DONE', 'SUCCESS'].indexOf(String(phase || '').toUpperCase()) >= 0) return 'CLEAR';
+  if (Number(triggerCount) <= 0) return 'CREATE';
+  if (Number(triggerCount) > 1) return 'REMOVE_DUPLICATES';
+  return 'KEEP';
+}
+
+function g010ContinuationHealth_(phase, triggerCount, lastProgressMs, nowMs, staleMs) {
+  const terminal = ['DONE', 'SUCCESS'].indexOf(String(phase || '').toUpperCase()) >= 0;
+  if (terminal) return {health: 'DONE', action: 'CLEAR'};
+  const last = Number(lastProgressMs || 0);
+  const age = last > 0 ? Math.max(0, Number(nowMs) - last) : Infinity;
+  if (age > Number(staleMs || G010_CONTINUATION_STALE_MS)) {
+    return {health: 'STALE', action: 'REARM', ageMs: age};
+  }
+  if (Number(triggerCount) <= 0) return {health: 'MISSING', action: 'CREATE', ageMs: age};
+  if (Number(triggerCount) > 1) return {health: 'HEALTHY', action: 'REMOVE_DUPLICATES', ageMs: age};
+  return {health: 'HEALTHY', action: 'KEEP', ageMs: age};
+}
+
+function g010LastProgressTime_(ss, runId) {
+  const sheet = ss.getSheetByName(HOTWORD_V2.sheets.log);
+  if (!sheet || sheet.getLastRow() < 2) return null;
+  const width = Math.max(sheet.getLastColumn(), HOTWORD_V2.logHeaders.length);
+  const headers = sheet.getRange(1, 1, 1, width).getDisplayValues()[0];
+  const runCol = headers.indexOf('Run ID');
+  const timeCol = headers.indexOf('运行时间');
+  if (runCol < 0 || timeCol < 0) return null;
+  let latest = 0;
+  sheet.getRange(2, 1, sheet.getLastRow() - 1, width).getValues().forEach(row => {
+    if (String(row[runCol] || '').trim() !== String(runId || '').trim()) return;
+    const value = row[timeCol] instanceof Date ? row[timeCol].getTime() : Date.parse(String(row[timeCol] || ''));
+    if (isFinite(value) && value > latest) latest = value;
+  });
+  return latest ? new Date(latest) : null;
+}
+
+/** Temporary operator action: restore the confirmed interrupted Run only. */
+function restoreG010CurrentRun() {
+  const targetRunId = '20260830-142107';
+  const targetSource = 'Popular Upcoming';
+  const targetPage = 13;
+  const ss = SpreadsheetApp.openById(QUALIFICATION_ELIGIBILITY_PRODUCTION_SHEET_ID);
+  const rawRecords = g010RawRecordsForRun_(ss, targetRunId);
+  if (!rawRecords.length) {
+    SpreadsheetApp.getUi().alert('未找到 Run ID ' + targetRunId + ' 的 Raw Observation，未恢复任何状态。');
+    return {ok: false, runId: targetRunId, rawCount: 0};
+  }
+  const state = {
+    runId: targetRunId,
+    phase: 'DISCOVERY',
+    source: targetSource,
+    nextPage: targetPage,
+    enrichmentCursor: 0
+  };
+  g010WriteState_(state);
+  g010UpsertAuditRow_(ss, state, 'PARTIAL',
+    'G010 manual recovery; raw=' + rawRecords.length + ' source=' + targetSource + ' nextPage=' + targetPage);
+  g010ScheduleContinuation_(G010_403_CONTINUATION_DELAY_MS);
+  SpreadsheetApp.getUi().alert(
+    'G010 当前 Run 已恢复\nRun ID: ' + targetRunId + '\nRaw: ' + rawRecords.length +
+    '\n继续位置: ' + targetSource + ' page ' + targetPage + '\n已安排唯一 continuation trigger。'
+  );
+  return {ok: true, runId: targetRunId, rawCount: rawRecords.length, source: targetSource, nextPage: targetPage};
+}
+
+/** Temporary operator action: stop only the confirmed G010 production Run. */
+function stopG010CurrentRun() {
+  const targetRunId = '20260830-142107';
+  const state = g010ReadState_();
+  if (!state || state.runId !== targetRunId) {
+    const message = '未停止：当前 G010 state 不匹配目标 Run ' + targetRunId;
+    SpreadsheetApp.getUi().alert(message);
+    return {ok: false, runId: targetRunId, state: state};
+  }
+  const ss = SpreadsheetApp.openById(QUALIFICATION_ELIGIBILITY_PRODUCTION_SHEET_ID);
+  g010UpsertAuditRow_(ss, state, 'STOPPED',
+    'PARTIAL_VALIDATED; production validation sufficient; AUTO pagination / Raw persistence / ' +
+    'release-date parser / eligibility gate verified; long-running Apps Script trigger reliability deferred');
+  // This clears only G010 ScriptProperties and runG010Continuation_ triggers;
+  // Raw Observation rows are append-only and are deliberately untouched.
+  g010ClearState_();
+  SpreadsheetApp.getUi().alert(
+    'G010 当前 Run 已停止\nRun ID: ' + targetRunId +
+    '\n状态: STOPPED / PARTIAL_VALIDATED\nRaw Observation 已保留，未继续抓取 page57。'
+  );
+  return {ok: true, runId: targetRunId, status: 'STOPPED', validation: 'PARTIAL_VALIDATED'};
+}
+
+/** Temporary operator action: inspect state and repair a missing trigger only. */
+function inspectOrRestoreG010Continuation() {
+  const ss = SpreadsheetApp.openById(QUALIFICATION_ELIGIBILITY_PRODUCTION_SHEET_ID);
+  const state = g010ReadState_();
+  const triggers = ScriptApp.getProjectTriggers().filter(trigger =>
+    trigger.getHandlerFunction() === G010_CONTINUATION_HANDLER
+  );
+  const lastProgress = state ? g010LastProgressTime_(ss, state.runId) : null;
+  const health = state ? g010ContinuationHealth_(state.phase, triggers.length,
+    lastProgress ? lastProgress.getTime() : 0, Date.now(), G010_CONTINUATION_STALE_MS) :
+    {health: 'NONE', action: 'NO_ACTION'};
+  let repaired = false;
+  if (state && health.action === 'REARM') {
+    g010RearmContinuation_(60 * 1000);
+    repaired = true;
+    g010UpsertAuditRow_(ss, state, 'PARTIAL', 'G010 continuation stale; re-armed; phase=' + state.phase +
+      ' source=' + state.source + ' nextPage=' + state.nextPage);
+  } else if (state && health.action === 'CREATE') {
+    g010EnsureContinuationTrigger_();
+    g010UpsertAuditRow_(ss, state, 'PARTIAL', 'G010 continuation trigger restored; phase=' + state.phase +
+      ' source=' + state.source + ' nextPage=' + state.nextPage);
+    repaired = true;
+  } else if (state && health.action === 'REMOVE_DUPLICATES') {
+    g010EnsureContinuationTrigger_();
+  }
+  const currentTriggers = ScriptApp.getProjectTriggers().filter(trigger =>
+    trigger.getHandlerFunction() === G010_CONTINUATION_HANDLER
+  );
+  const message = [
+    'G010 Continuation 状态',
+    'state: ' + (state ? JSON.stringify(state) : 'NONE'),
+    'trigger count: ' + currentTriggers.length,
+    'last progress: ' + (lastProgress ? lastProgress.toISOString() : 'NONE'),
+    'health: ' + health.health,
+    'repair: ' + (repaired ? (health.action === 'REARM' ? 'RE-ARMED' : 'CREATED') : 'NO ACTION')
+  ].join('\n');
+  SpreadsheetApp.getUi().alert(message);
+  return {ok: true, state: state, triggerCount: currentTriggers.length, lastProgress: lastProgress,
+    health: health.health, repaired: repaired};
+}
+
+function g010UpsertAuditRow_(ss, state, status, detail) {
+  const sheet = ss.getSheetByName(HOTWORD_V2.sheets.log);
+  if (!sheet) return;
+  const width = Math.max(sheet.getLastColumn(), HOTWORD_V2.logHeaders.length);
+  const headers = sheet.getRange(1, 1, 1, width).getDisplayValues()[0];
+  const runCol = headers.indexOf('Run ID');
+  if (runCol < 0) return;
+  let rowNumber = 0;
+  if (sheet.getLastRow() >= 2) {
+    const rows = sheet.getRange(2, runCol + 1, sheet.getLastRow() - 1, 1).getDisplayValues();
+    rows.some((row, index) => {
+      if (String(row[0] || '').trim() !== String(state.runId)) return false;
+      rowNumber = index + 2;
+      return true;
+    });
+  }
+  if (!rowNumber) {
+    const row = Array(HOTWORD_V2.logHeaders.length).fill(0);
+    row[0] = new Date(); row[1] = state.runId; row[2] = status;
+    row[15] = detail || ''; row[19] = 'resumable';
+    sheet.appendRow(row);
+    return;
+  }
+  sheet.getRange(rowNumber, 1).setValue(new Date());
+  sheet.getRange(rowNumber, 3).setValue(status);
+  sheet.getRange(rowNumber, 16).setValue(detail || '');
+}
+
+function g010ShouldYield_(startedAtMs, nowMs) {
+  return Number(nowMs) - Number(startedAtMs) >= G010_EXECUTION_BUDGET_MS;
+}
+
+function g010ContinuationState_(state) {
+  return Object.assign({}, state, {runId: state.runId});
+}
+
+function g010NextDiscoveryState_(state, sourceIndex, sourceCount) {
+  const next = Object.assign({}, state);
+  if (sourceIndex + 1 < sourceCount) {
+    next.source = HOTWORD_V2.sources[sourceIndex + 1].name;
+    next.nextPage = 1;
+  } else {
+    next.phase = 'ELIGIBILITY';
+    next.source = '';
+    next.nextPage = 1;
+    next.enrichmentCursor = 0;
+  }
+  return next;
+}
+
+function g010EnrichmentEligible_(eligibility) {
+  return !!(eligibility && eligibility.eligible === true);
+}
+
+function g010DoneState_(state) {
+  return Object.assign({}, state, {phase: 'DONE'});
+}
+
+function g010DiscoveryFailureRecovery_(state, error) {
+  const message = String(error && error.message || error || '');
+  const retryable = isSteamRetryableHttpStatus_(error && error.httpStatus) || /HTTP\s+(403|429|5\d\d)/i.test(message);
+  if (!retryable) return {retryable: false, state: state, message: message};
+  return {
+    retryable: true,
+    state: Object.assign({}, state, {phase: 'DISCOVERY', nextPage: state.nextPage}),
+    message: message,
+    continuationDelayMs: G010_403_CONTINUATION_DELAY_MS
+  };
+}
+
+function runG010Continuation_() {
+  return runSteamHotword01B();
+}
+
+function g010RawRecordsForRun_(ss, runId) {
+  const sheet = ss.getSheetByName(HOTWORD_V2.sheets.snapshot);
+  if (!sheet || sheet.getLastRow() < 2) return [];
+  const width = Math.max(sheet.getLastColumn(), HOTWORD_V2.snapshotHeaders.length);
+  const headers = sheet.getRange(1, 1, 1, width).getDisplayValues()[0];
+  const index = name => headers.indexOf(name);
+  const runCol = index('Run ID');
+  const appIdCol = index('Steam App ID');
+  if (runCol < 0 || appIdCol < 0) return [];
+  const field = (row, name) => { const i = index(name); return i >= 0 ? row[i] : ''; };
+  const out = new Map();
+  sheet.getRange(2, 1, sheet.getLastRow() - 1, width).getValues().forEach((row, offset) => {
+    if (String(row[runCol] || '').trim() !== String(runId)) return;
+    const appId = String(row[appIdCol] || '').trim();
+    if (!appId) return;
+    out.set(appId, {
+      appId: appId,
+      name: field(row, '游戏名称') || '',
+      url: field(row, 'Steam URL') || '',
+      source: field(row, '候选来源') || '',
+      sourceRank: field(row, '来源排名') || '',
+      releaseRaw: field(row, 'Steam 发布日期') || '',
+      releaseDate: field(row, 'Steam 发布日期') || '',
+      releaseStage: field(row, '发布阶段') || '',
+      daysToRelease: field(row, '距发售天数'),
+      followers: null, baselineFollowers: null, gain7d: null, growthRate: null, coverageDays: null,
+      reviews: field(row, '评论数'), positiveReviews: field(row, '好评数'), rating: field(row, 'Steam评分'),
+      result1A: '', reason1A: '', firstRoundType: '', priority: '', continueNext: '', nextAction: '',
+      firstRoundReason: '', currentStage: '', dataStatus: 'OK', dataNotes: [],
+      observationDataStatus: '', observationDataNotes: [], controlOnly: false,
+      qualificationEligible: true, eligibilityReason: '', qualificationStatus: '',
+      _g010RawRowNumber: offset + 2
+    });
+  });
+  return Array.from(out.values());
+}
+
+function g010PreviousRawIndex_(ss, runId) {
+  const result = new Map();
+  const sheet = ss.getSheetByName(HOTWORD_V2.sheets.snapshot);
+  if (!sheet || sheet.getLastRow() < 2) return result;
+  const width = Math.max(sheet.getLastColumn(), HOTWORD_V2.snapshotHeaders.length);
+  const headers = sheet.getRange(1, 1, 1, width).getDisplayValues()[0];
+  const index = name => headers.indexOf(name);
+  const runCol = index('Run ID');
+  const appIdCol = index('Steam App ID');
+  const stageCol = index('发布阶段');
+  const daysCol = index('距发售天数');
+  if (runCol < 0 || appIdCol < 0) return result;
+  sheet.getRange(2, 1, sheet.getLastRow() - 1, width).getValues().forEach(row => {
+    if (String(row[runCol] || '').trim() === String(runId)) return;
+    const appId = String(row[appIdCol] || '').trim();
+    if (!appId) return;
+    result.set(appId, {
+      releaseStage: stageCol >= 0 ? String(row[stageCol] || '').trim() : '',
+      daysToRelease: daysCol >= 0 ? row[daysCol] : null
+    });
+  });
+  return result;
+}
+
+function g010AppendRawPage_(ss, records, runTime, runId) {
+  const sheet = ss.getSheetByName(HOTWORD_V2.sheets.snapshot);
+  const width = Math.max(sheet.getLastColumn(), HOTWORD_V2.snapshotHeaders.length);
+  const headers = sheet.getRange(1, 1, 1, width).getDisplayValues()[0];
+  const runCol = headers.indexOf('Run ID');
+  const appIdCol = headers.indexOf('Steam App ID');
+  const seen = new Set();
+  if (sheet.getLastRow() >= 2 && runCol >= 0 && appIdCol >= 0) {
+    sheet.getRange(2, 1, sheet.getLastRow() - 1, width).getValues().forEach(row => {
+      if (String(row[runCol] || '').trim() === String(runId)) seen.add(String(row[appIdCol] || '').trim());
+    });
+  }
+  const unique = (records || []).filter(rec => {
+    const id = String(rec.appId || '').trim();
+    if (!id || seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
+  if (!unique.length) return {persisted: 0, rowByAppId: {}};
+  const firstRow = sheet.getLastRow() + 1;
+  sheet.getRange(firstRow, 1, unique.length, HOTWORD_V2.snapshotHeaders.length)
+    .setValues(unique.map(rec => snapshotRow_(rec, runTime, runId)));
+  const rowByAppId = {};
+  unique.forEach((rec, index) => { rowByAppId[String(rec.appId)] = firstRow + index; });
+  return {persisted: unique.length, rowByAppId: rowByAppId};
+}
+
+function g010EnrichChunk_(ss, records, runId, runTime, warnings) {
+  if (!records.length) return;
+  const rules = loadRules_(ss);
+  const gpKey = getGamesPopularityApiKey_();
+  const gpStats = {cacheHits: 0, realtimeRequests: 0, realtimeSuccess: 0, rateLimited: 0, failuresKept: 0};
+  const cache = readDailyGamesPopularityCache_(ss, runTime);
+  const partition = partitionDailyGamesPopularityCache_(records, cache);
+  partition.hits.forEach(rec => { rec._gpDailyCache = cache.get(String(rec.appId)); });
+  const context = {ss: ss, runId: runId, runTime: runTime, refreshReason: 'POLICY_MISS'};
+  const latestMap = fetchGamesPopularityLatestBatch_(partition.misses, gpKey, warnings, gpStats, context);
+  records.forEach(rec => {
+    if (rec._gpDailyCache) {
+      Object.assign(rec, rec._gpDailyCache);
+      rec.followers = rec._gpDailyCache.followers;
+      rec.baselineFollowers = rec._gpDailyCache.baselineFollowers;
+      rec.gain7d = rec._gpDailyCache.gain7d;
+      rec.growthRate = rec._gpDailyCache.growthRate;
+      rec.coverageDays = rec._gpDailyCache.coverageDays;
+      rec._gpEnrichmentFresh = true;
+    } else {
+      const latest = latestMap.get(rec.appId);
+      if (latest && latest.followers && isFiniteNumber_(latest.followers.followers)) {
+        rec.followers = Number(latest.followers.followers);
+        rec._gpLatestFresh = true;
+      } else rec._gpEnrichmentFailed = true;
+    }
+  });
+  const released = records.filter(rec => rec.releaseStage === '已发售' && isFiniteNumber_(Number(rec.daysToRelease)) &&
+    Math.abs(Number(rec.daysToRelease)) <= Number(rules.RELEASED_DAYS_MAX) &&
+    (!isFiniteNumber_(rec.reviews) || !isFiniteNumber_(rec.rating)));
+  const reviews = fetchSteamReviewSummaryBatch_(released, warnings);
+  released.forEach(rec => {
+    const summary = reviews.get(rec.appId);
+    if (!summary) return;
+    rec.reviews = summary.totalReviews;
+    rec.positiveReviews = summary.totalPositive;
+    rec.rating = summary.totalReviews > 0 ? summary.totalPositive / summary.totalReviews : null;
+  });
+  const history = fetchGamesPopularityFollowersBatch_(partition.misses, gpKey, warnings, gpStats, context);
+  const pass1A = [];
+  records.forEach(rec => {
+    const result = classify1A_(rec, rules);
+    rec.result1A = result.pass ? (result.controlOnly ? '✅ 通过（对照预留）' : '✅ 通过（主池）') :
+      (result.dataIssue ? '⚠ 数据异常' : '❌ 排除');
+    rec.reason1A = result.reason; rec.controlOnly = Boolean(result.controlOnly);
+    if (result.pass) pass1A.push(rec);
+  });
+  const passSet = new Set(pass1A);
+  records.forEach(rec => {
+    if (rec._gpDailyCache && isFiniteNumber_(rec.gain7d) && isFiniteNumber_(rec.growthRate)) return;
+    const growth = computeFollowerGrowth_(history.get(rec.appId), rec.followers, runTime, rules.FOLLOWER_HISTORY_MIN_DAYS);
+    if (!growth.ok) {
+      rec.dataStatus = '待数据'; rec.firstRoundType = '⏳ 等待历史'; rec.currentStage = '1B等待历史';
+      rec._gpEnrichmentFailed = true; return;
+    }
+    Object.assign(rec, {baselineFollowers: growth.baselineFollowers, gain7d: growth.gain,
+      growthRate: growth.growthRate, coverageDays: growth.coverageDays, _gpEnrichmentFresh: true});
+  });
+  records.filter(rec => passSet.has(rec) && rec._gpEnrichmentFresh).forEach(rec => {
+    const raw = classify1BRaw_(rec, rules);
+    applyFirstRoundDecision_(rec, raw.type === '🏢 对照候选' ? '🏢 大盘对照' : raw.type,
+      raw.type === '⚪ 低优先级' ? 'P3 暂缓' : raw.type.indexOf('Watch') >= 0 ? 'P2 观察' : 'P1 高',
+      raw.type === '⚪ 低优先级' ? '否（本轮）' : '是', 'Google Trends', raw.reason);
+  });
+  records.forEach(rec => {
+    if (!rec.firstRoundType && rec.result1A === '❌ 排除') {
+      rec.firstRoundType = '❌ 1A排除'; rec.priority = '不进入1B'; rec.continueNext = '否';
+      rec.currentStage = '1A排除'; rec.firstRoundReason = rec.reason1A;
+    }
+    rec.qualificationStatus = rec._gpEnrichmentFresh ? 'COMPLETE' : 'INCOMPLETE';
+    if (rec._gpEnrichmentFresh) rec.rawStatus = 'ENRICHED';
+  });
+  upsertMaster_(ss, records, runTime, runId, gpStats);
+  const refs = {}; records.forEach(rec => { refs[rec.appId] = rec._g010RawRowNumber; });
+  updateSnapshots_(ss, records.filter(rec => rec._gpEnrichmentFresh), runTime, runId, refs);
+  writeDailyCandidateSnapshot_(ss, records, runTime, runId);
+}
+
 function runSteamHotword01B() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(5000)) {
+    const lockedState = g010ReadState_();
+    if (lockedState) {
+      try {
+        const lockedSheet = SpreadsheetApp.openById(QUALIFICATION_ELIGIBILITY_PRODUCTION_SHEET_ID);
+        g010EnsureContinuationTrigger_();
+        g010UpsertAuditRow_(lockedSheet, lockedState, 'PARTIAL', 'G010 lock busy; continuation rechecked');
+      } catch (lockErr) {
+        // The owner execution remains responsible for its PARTIAL audit.
+      }
+      return {status: 'PARTIAL', runId: lockedState.runId, phase: lockedState.phase,
+        source: lockedState.source, nextPage: lockedState.nextPage,
+        enrichmentCursor: lockedState.enrichmentCursor};
+    }
+    return {status: 'SKIPPED', reason: 'LOCKED'};
+  }
+  const startedAt = new Date();
+  const deadline = startedAt.getTime() + G010_EXECUTION_BUDGET_MS;
+  const ss = SpreadsheetApp.openById(QUALIFICATION_ELIGIBILITY_PRODUCTION_SHEET_ID);
+  const tz = ss.getSpreadsheetTimeZone();
+  const warnings = [];
+  let state = g010ReadState_();
+  if (!state) {
+    state = {runId: Utilities.formatDate(startedAt, tz, 'yyyyMMdd-HHmmss'), phase: 'DISCOVERY',
+      source: HOTWORD_V2.sources[0].name, nextPage: 1, enrichmentCursor: 0};
+    g010WriteState_(state);
+  }
+  try {
+    setupSteamHotwordV2();
+    g010UpsertAuditRow_(ss, state, state.enrichmentCursor || state.nextPage > 1 ? 'PARTIAL' : 'RUNNING',
+      'G010 phase=' + state.phase + ' source=' + state.source + ' nextPage=' + state.nextPage +
+      ' enrichmentCursor=' + state.enrichmentCursor);
+    while (!g010ShouldYield_(startedAt.getTime(), Date.now()) && Date.now() < deadline) {
+      if (state.phase === 'DISCOVERY') {
+        const sourceIndex = HOTWORD_V2.sources.findIndex(source => source.name === state.source);
+        if (sourceIndex < 0) throw new Error('Unknown G010 source: ' + state.source);
+        const source = HOTWORD_V2.sources[sourceIndex];
+        const fetched = fetchSteamSearchPageReliable_(source.name,
+          state.nextPage === 1 ? source.url : source.url + '&page=' + state.nextPage,
+          state.nextPage, warnings);
+        const items = parseSteamSearchResults_(fetched.body);
+        if (!items.length) {
+          if (sourceIndex + 1 < HOTWORD_V2.sources.length) {
+            state = g010NextDiscoveryState_(state, sourceIndex, HOTWORD_V2.sources.length); g010WriteState_(state); continue;
+          }
+          state = g010NextDiscoveryState_(state, sourceIndex, HOTWORD_V2.sources.length); g010WriteState_(state); continue;
+        }
+        const records = items.map((item, idx) => {
+          item._sourceRank = (state.nextPage - 1) * 50 + idx + 1; item._sourcePage = state.nextPage;
+          const rec = createCandidateRecord_({appId: String(item.appId), name: item.name, url: item.url,
+            releaseRaw: item.releaseDate || '', sources: [source.name],
+            ranks: [source.name + '#' + item._sourceRank], sourcePages: [source.name + '#' + state.nextPage],
+            reviewCount: item.reviewCount, reviewRating: item.reviewRating});
+          fillReleaseStage_(rec, startedAt, tz); return rec;
+        });
+        g010AppendRawPage_(ss, records, startedAt, state.runId);
+        state.nextPage += 1; g010WriteState_(state);
+        continue;
+      }
+      if (state.phase === 'ELIGIBILITY') {
+        state.phase = 'ENRICHMENT';
+        state.enrichmentCursor = 0;
+        g010WriteState_(state);
+        continue;
+      }
+      if (state.phase === 'ENRICHMENT') {
+        const all = g010RawRecordsForRun_(ss, state.runId);
+        const previous = g010PreviousRawIndex_(ss, state.runId);
+        const qualification = readQualificationStateIndex_(ss);
+        const decisions = readCandidateDecisions_(ss);
+        const history = buildHistoryIndex_(ss);
+        const eligible = all.filter(rec => !isInHistoryIndex_(rec, history) && g010EnrichmentEligible_(evaluateQualificationEligibility_(rec, {
+          previousRaw: previous.get(rec.appId), qualification: qualification.get(rec.appId),
+          decision: decisions.get(rec.appId), now: startedAt, rules: loadRules_(ss)
+        })));
+        if (state.enrichmentCursor >= eligible.length) {
+          refreshTodayActionsFromCandidateDecisions_(ss, startedAt, state.runId, {});
+          g010UpsertAuditRow_(ss, state, 'SUCCESS', 'G010 DONE; rows=' + all.length + '; eligible=' + eligible.length);
+          g010ClearState_();
+          return {status: 'SUCCESS', runId: state.runId, eligible: eligible.length};
+        }
+        const chunk = eligible.slice(state.enrichmentCursor, state.enrichmentCursor + 20);
+        g010EnrichChunk_(ss, chunk, state.runId, startedAt, warnings);
+        state.enrichmentCursor += chunk.length; g010WriteState_(state);
+        continue;
+      }
+      throw new Error('Unknown G010 phase: ' + state.phase);
+    }
+    state = g010ContinuationState_(state);
+    g010WriteState_(state); g010EnsureContinuationTrigger_();
+    g010UpsertAuditRow_(ss, state, 'PARTIAL', 'G010 continuation phase=' + state.phase + ' source=' + state.source +
+      ' nextPage=' + state.nextPage + ' enrichmentCursor=' + state.enrichmentCursor);
+    return {status: 'PARTIAL', runId: state.runId, phase: state.phase, source: state.source, nextPage: state.nextPage, enrichmentCursor: state.enrichmentCursor};
+  } catch (err) {
+    const recovery = g010DiscoveryFailureRecovery_(state, err);
+    const message = recovery.message;
+    g010WriteState_(recovery.state);
+    g010UpsertAuditRow_(ss, recovery.state, 'PARTIAL', 'G010 paused: ' + message + ' | phase=' + recovery.state.phase +
+      ' source=' + recovery.state.source + ' nextPage=' + recovery.state.nextPage);
+    if (recovery.retryable) {
+      g010ScheduleContinuation_(recovery.continuationDelayMs);
+      return {status: 'PARTIAL', runId: recovery.state.runId, phase: recovery.state.phase, source: recovery.state.source,
+        nextPage: recovery.state.nextPage, enrichmentCursor: recovery.state.enrichmentCursor, continuationDelayMs: recovery.continuationDelayMs};
+    }
+    throw err;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function runSteamHotword01BLegacy_() {
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(5000)) {
     const startedAt = new Date();
@@ -1647,7 +2699,7 @@ function runSteamHotword01B() {
         'SKIPPED',
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         'LockService：已有完整抓取 run 在执行，本轮被阻止（防止手动与定时重叠）',
-        0, 0, 0, 'page1-only (bounded; skipped)', 0, 0, 0, 0, 0, 0, 0, 0
+        0, 0, 0, 'all-raw-observations (auto-pagination; skipped)', 0, 0, 0, 0, 0, 0, 0, 0
       ]);
     } catch (logErr) {
       // 锁冲突日志失败也不再抛出，避免叠加重试压力。
@@ -1705,16 +2757,15 @@ function runSteamHotword01B() {
     // ------------------------------------------------------------------------
     // 0A. 发现候选
     // ------------------------------------------------------------------------
-    const rawDiscoveryPages = Math.max(G010_RAW_DISCOVERY_PAGES, Math.floor(Number(rules.DISCOVERY_PAGES || 1)));
-    const discovery = discoverSteamCandidates_(rawDiscoveryPages, warnings, discoveryNotes);
+    const discovery = discoverSteamCandidates_(warnings, discoveryNotes);
     const discovered = discovery.items;
     discoveredCount = discovered.length;
 
-    if (discovery.usedCache) {
+    if (discovery.usedCache || discovery.partial) {
       status = 'PARTIAL';
     }
 
-    if (discoveredCount === 0) {
+    if (discoveredCount === 0 && !discovery.partial) {
       throw new Error('两个 Steam 发现来源都没有解析到游戏，停止本轮。');
     }
 
@@ -1723,6 +2774,10 @@ function runSteamHotword01B() {
     // Steam_每日快照是 raw discovery observation ledger，不能因历史排除丢失观察。
     // ------------------------------------------------------------------------
     const observations = discovered.map(createCandidateRecord_);
+    observations.forEach(rec => fillReleaseStage_(rec, startedAt, tz));
+    // Read the prior ledger before appending this run, otherwise every item
+    // would look historical and NEW_IN_SCOPE could never fire.
+    const previousRaw = readLatestRawObservationIndex_(ss);
     const rawPersistence = appendSnapshots_(ss, observations, startedAt, runId);
     rawUniqueAppIdCount = rawPersistence.uniqueAppIds;
     rawPersistedCount = rawPersistence.persisted;
@@ -1732,12 +2787,15 @@ function runSteamHotword01B() {
       ' bySourcePage=' + rawPersistence.bySourcePage
     );
 
-    // The existing production candidate boundary is page 1. Deep pages are
-    // retained above, but do not enter follower/review/1A/1B or research.
-    const candidateScope = observations.filter(isLegacyCandidateScope_);
+    // Eligibility is deliberately computed from the pre-run raw ledger and
+    // local candidate/decision state. It must run before any paid/external
+    // enrichment request; Raw Observation remains append-only for every item.
+    const qualificationState = readQualificationStateIndex_(ss);
+    const eligibilityDecisions = readCandidateDecisions_(ss);
+    const candidateScope = observations;
     candidateInputCount = candidateScope.length;
-    const gpKey = getGamesPopularityApiKey_();
     const active = [];
+    const skipped = [];
 
     for (let i = 0; i < candidateScope.length; i += 1) {
       const rec = candidateScope[i];
@@ -1746,8 +2804,24 @@ function runSteamHotword01B() {
         continue;
       }
 
-      active.push(rec);
+      const eligibility = evaluateQualificationEligibility_(rec, {
+        previousRaw: previousRaw.get(String(rec.appId)),
+        qualification: qualificationState.get(String(rec.appId)),
+        decision: eligibilityDecisions.get(String(rec.appId)),
+        now: startedAt,
+        rules: rules
+      });
+      rec.eligibilityReason = eligibility.reason;
+      rec.qualificationEligible = eligibility.eligible;
+      if (eligibility.eligible) {
+        rec.eligibilityReason = eligibility.reason;
+        active.push(rec);
+      } else {
+        skipped.push(rec);
+      }
     }
+    discoveryNotes.push('eligibility eligible=' + active.length + ' skipped=' + skipped.length);
+    const gpKey = active.length ? getGamesPopularityApiKey_() : '';
 
     // ------------------------------------------------------------------------
     // 0C. Followers 当前值（Games Popularity latest）
@@ -1788,13 +2862,6 @@ function runSteamHotword01B() {
         addDataNote_(rec, '缺少 Followers 当前值');
         rec._gpEnrichmentFailed = true;
       }
-    }
-
-    // ------------------------------------------------------------------------
-    // 0D. 解析发售日 / 发布阶段
-    // ------------------------------------------------------------------------
-    for (const rec of active) {
-      fillReleaseStage_(rec, startedAt, tz);
     }
 
     // ------------------------------------------------------------------------
@@ -1857,7 +2924,7 @@ function runSteamHotword01B() {
     }
 
     // ------------------------------------------------------------------------
-    // 1B 前置：仅对既有 page-1 candidate scope 拉 Followers 历史；
+    // 1B 前置：对全部 active candidates 拉 Followers 历史；
     // 只有 active 中的 1A 通过对象才继续进入 1B 分类。
     // ------------------------------------------------------------------------
     const followerHistoryMap = fetchGamesPopularityFollowersBatch_(cacheMisses, gpKey, warnings, gpStats, gpAttemptContext);
@@ -1988,13 +3055,24 @@ function runSteamHotword01B() {
     // Enrich the already-persisted rows for this run. Deep observations stay
     // RAW_ONLY; the row identity prevents appending a second snapshot row.
     active.forEach(rec => { if (rec._gpEnrichmentFresh) rec.rawStatus = 'ENRICHED'; });
+    active.forEach(rec => {
+      rec.qualificationStatus = rec._gpEnrichmentFresh ? 'COMPLETE' : 'INCOMPLETE';
+    });
+    skipped.forEach(rec => { rec.qualificationStatus = 'SKIPPED'; });
     const snapshotUpdate = updateSnapshots_(ss, active.filter(rec => rec._gpEnrichmentFresh), startedAt, runId, rawPersistence.rowByAppId);
     discoveryNotes.push('G010 snapshot enriched=' + snapshotUpdate.updated + ' same-run rows');
 
     // ------------------------------------------------------------------------
     // 输出
     // ------------------------------------------------------------------------
-    upsertMaster_(ss, active, startedAt, runId, gpStats);
+    upsertMaster_(ss, active.concat(skipped), startedAt, runId, gpStats);
+    const candidateSnapshot = writeDailyCandidateSnapshot_(
+      ss,
+      active,
+      startedAt,
+      runId
+    );
+    discoveryNotes.push('今日候选快照新增=' + candidateSnapshot.persisted + '，跳过重复=' + candidateSnapshot.skipped);
     const decisions = syncCandidateDecisions_(ss, active, startedAt, rules);
     try {
       const queueResult = enqueueSteamCandidateResearchJobs_(ss, startedAt);
@@ -2019,7 +3097,7 @@ function runSteamHotword01B() {
     actionCount = actionRefresh && actionRefresh.afterPendingCount || 0;
 
     // 使用了 source cache，或有 warnings，但主链路能完成 → PARTIAL（不可伪装 SUCCESS）。
-    if (discovery.usedCache || warnings.length > 0) status = 'PARTIAL';
+    if (discovery.usedCache || discovery.partial || warnings.length > 0) status = 'PARTIAL';
 
     const logMessage = discoveryNotes.concat(warnings).join(' | ');
 
@@ -2043,7 +3121,7 @@ function runSteamHotword01B() {
       rawUniqueAppIdCount,
       rawPersistedCount,
       candidateInputCount,
-      'page1-only (bounded)',
+      'all-raw-observations (auto-pagination)',
       p2TrendCount,
       p2EarlyCount,
       historyInsufficientCount,
@@ -2092,7 +3170,7 @@ function runSteamHotword01B() {
         rawUniqueAppIdCount,
         rawPersistedCount,
         candidateInputCount,
-        'page1-only (bounded; run failed)',
+        'all-raw-observations (auto-pagination; run failed)',
         p2TrendCount,
         p2EarlyCount,
         historyInsufficientCount,
@@ -2117,23 +3195,27 @@ function runSteamHotword01B() {
 // 0：Steam 候选发现（含节流 / 有限重试 / 24h 成功缓存）
 // ============================================================================
 
-function discoverSteamCandidates_(pagesPerSource, warnings, fetchLogs) {
-  const pages = Math.max(1, Math.floor(Number(pagesPerSource || 1)));
+function discoverSteamCandidates_(warnings, fetchLogs) {
   const merged = new Map();
   let usedCache = false;
   const degradeNotes = Array.isArray(warnings) ? warnings : [];
   const logs = Array.isArray(fetchLogs) ? fetchLogs : degradeNotes;
 
   for (const source of HOTWORD_V2.sources) {
-    const sourceResult = fetchSteamSourceWithFallback_(source, pages, degradeNotes, logs);
+    const sourceResult = fetchSteamSourceWithFallback_(source, degradeNotes, logs);
     if (sourceResult.fromCache) usedCache = true;
+    logs.push(
+      'source=' + source.name +
+      ' | pagesFetched=' + sourceResult.pagesFetched +
+      ' | stopReason=' + sourceResult.stopReason +
+      ' | continuation=' + (sourceResult.continuation ? 'saved' : 'none') +
+      ' | rawItems=' + sourceResult.items.length
+    );
 
     sourceResult.items.forEach((item, idx) => {
       const key = String(item.appId);
       // 缓存回放时保留首次发现时的 sourceRank；实时抓取按页序重算。
-      const sourceRank = sourceResult.fromCache && item._sourceRank
-        ? item._sourceRank
-        : idx + 1;
+      const sourceRank = item._sourceRank || idx + 1;
 
       if (!merged.has(key)) {
         merged.set(key, {
@@ -2167,30 +3249,38 @@ function discoverSteamCandidates_(pagesPerSource, warnings, fetchLogs) {
 
   return {
     items: Array.from(merged.values()),
-    usedCache: usedCache
+    usedCache: usedCache,
+    partial: HOTWORD_V2.sources.some(source => {
+      const key = steamSourceContinuationPropertyKey_(source.name);
+      return !!PropertiesService.getScriptProperties().getProperty(key);
+    })
   };
 }
 
 /**
  * 抓取单个 Steam source；403/429 最终失败时尝试 <24h 缓存。
  */
-function fetchSteamSourceWithFallback_(source, pages, warnings, fetchLogs) {
+function fetchSteamSourceWithFallback_(source, warnings, fetchLogs) {
   let lastHttpStatus = null;
   let lastErrorMessage = '';
   const logs = Array.isArray(fetchLogs) ? fetchLogs : warnings;
 
   try {
-    const liveItems = fetchSteamSourcePagesLive_(source, pages, logs);
-    const cacheSaved = saveSteamSourceCache_(source.name, liveItems);
+    const liveResult = fetchSteamSourcePagesLive_(source, logs);
+    const liveItems = liveResult.items;
+    // A partial retrieval must never replace the last-known-good complete
+    // source cache. Continuation is persisted under a separate key.
+    const cacheSaved = liveResult.continuation ? false : saveSteamSourceCache_(source.name, liveItems);
     logs.push(
       'source=' + source.name +
-      ' | result=LIVE_OK' +
-      ' | pages=' + pages +
+      ' | result=' + (liveResult.continuation ? 'LIVE_PARTIAL' : 'LIVE_OK') +
+      ' | pagesFetched=' + liveResult.pagesFetched +
+      ' | stopReason=' + liveResult.stopReason +
       ' | items=' + liveItems.length +
       ' | cache=false' +
       ' | cacheSaved=' + cacheSaved
     );
-    return { items: liveItems, fromCache: false };
+    return { items: liveItems, fromCache: false, pagesFetched: liveResult.pagesFetched, stopReason: liveResult.stopReason, continuation: liveResult.continuation };
   } catch (err) {
     lastHttpStatus = err && err.httpStatus ? err.httpStatus : null;
     lastErrorMessage = String(err && err.message ? err.message : err);
@@ -2231,45 +3321,92 @@ function fetchSteamSourceWithFallback_(source, pages, warnings, fetchLogs) {
     warnings.push(cacheNote);
     logs.push(cacheNote);
 
-    return { items: cached.items, fromCache: true };
+    return { items: cached.items, fromCache: true, pagesFetched: 0, stopReason: 'cache-fallback-after-' + (lastHttpStatus || 'error'), continuation: false };
   }
 }
 
-function fetchSteamSourcePagesLive_(source, pages, fetchLogs) {
+function fetchSteamSourcePagesLive_(source, fetchLogs) {
   const allItems = [];
+  const logs = Array.isArray(fetchLogs) ? fetchLogs : [];
+  const props = PropertiesService.getScriptProperties();
+  const continuationKey = steamSourceContinuationPropertyKey_(source.name);
+  const saved = Number(props.getProperty(continuationKey) || 1);
+  let page = Number.isFinite(saved) && saved > 0 ? Math.floor(saved) : 1;
+  const seenPageSignatures = new Set();
+  const seenAppIds = new Set();
+  const startedAtMs = Date.now();
+  let stopReason = 'source-exhausted';
+  let continuation = false;
+  let pagesFetched = 0;
+  let consecutiveNoNewPages = 0;
 
-  for (let page = 1; page <= pages; page++) {
-    // V2.2：
-    // Steam 基础榜单 URL（不带 page=1）实际会返回约 50 条；
-    // 显式追加 page=1 时，Steam 当前只返回约 25 条。
-    // 因此第一页必须使用原始 URL；只有第二页及以后才追加 page 参数。
+  while (true) {
+    if (Date.now() - startedAtMs >= STEAM_DISCOVERY_RUNTIME_BUDGET_MS) {
+      stopReason = 'runtime-budget';
+      continuation = true;
+      props.setProperty(continuationKey, String(page));
+      break;
+    }
+    // The base URL is used for page 1; later pages use the explicit cursor.
     const url = page === 1
       ? source.url
       : source.url + (source.url.includes('?') ? '&' : '?') + 'page=' + page;
 
-    const fetched = fetchSteamSearchPageReliable_(source.name, url, page, fetchLogs);
+    let fetched;
+    try {
+      fetched = fetchSteamSearchPageReliable_(source.name, url, page, fetchLogs);
+    } catch (err) {
+      const retryable = isSteamRetryableHttpStatus_(err && err.httpStatus) ||
+        /HTTP\s+(403|429|5\d\d)/i.test(String(err && err.message || err));
+      if (!retryable) throw err;
+      stopReason = 'temporary-fetch-failure:' + (err && err.httpStatus ? err.httpStatus : 'error');
+      continuation = true;
+      props.setProperty(continuationKey, String(page));
+      break;
+    }
     const items = parseSteamSearchResults_(fetched.body);
+    pagesFetched += 1;
     if (items.length === 0) {
-      throw new Error(source.name + ' 第' + page + '页解析结果为0');
+      stopReason = page === 1 ? 'empty-page-1' : 'empty-page';
+      if (page === 1) throw new Error(source.name + ' 第1页解析结果为0');
+      props.deleteProperty(continuationKey);
+      break;
     }
 
-    // V2.2：第一页使用原始榜单 URL，正常应接近 50 条。
-    // 如果只解析到明显偏少的数据，不再继续生成“看似成功但漏掉一半候选”的结果。
-    if (page === 1 && items.length < 40) {
-      throw new Error(
-        source.name + ' 第1页仅解析到 ' + items.length +
-        ' 条，低于完整性下限40。停止本轮，避免漏候选。'
-      );
-    }
+    const signature = items.map(item => String(item.appId)).join(',');
+    const duplicatePage = seenPageSignatures.has(signature);
+    seenPageSignatures.add(signature);
 
+    let newCount = 0;
     items.forEach((item, idx) => {
       item._sourceRank = (page - 1) * 50 + idx + 1;
       item._sourcePage = page;
+      if (!seenAppIds.has(String(item.appId))) {
+        seenAppIds.add(String(item.appId));
+        newCount += 1;
+      }
       allItems.push(item);
     });
+    if (newCount === 0) {
+      consecutiveNoNewPages += 1;
+      if (consecutiveNoNewPages >= 2) {
+        stopReason = duplicatePage ? 'duplicate-page-2-pages' : 'no-new-appids-2-pages';
+        props.deleteProperty(continuationKey);
+        break;
+      }
+    } else {
+      consecutiveNoNewPages = 0;
+    }
+    page += 1;
   }
 
-  return allItems;
+  logs.push('source=' + source.name + ' | pagesFetched=' + pagesFetched + ' | stopReason=' + stopReason);
+  return {items: allItems, pagesFetched: pagesFetched, stopReason: stopReason, continuation: continuation};
+}
+
+function steamSourceContinuationPropertyKey_(sourceName) {
+  return 'STEAM_SOURCE_CONTINUATION_V1_' + String(sourceName || '')
+    .replace(/\s+/g, '_').toUpperCase();
 }
 
 /**
@@ -2711,10 +3848,8 @@ function parseSteamSearchResults_(html) {
     const titleMatch = row.match(/<span\b[^>]*class=["'][^"']*\btitle\b[^"']*["'][^>]*>([\s\S]*?)<\/span>/i);
     if (!titleMatch) continue;
 
-    const releaseMatch = row.match(/<div\b[^>]*class=["'][^"']*\bsearch_released\b[^"']*["'][^>]*>([\s\S]*?)<\/div>/i);
-
     const name = decodeHtml_(stripTags_(titleMatch[1])).trim();
-    const releaseDate = releaseMatch ? decodeHtml_(stripTags_(releaseMatch[1])).trim() : '';
+    const releaseDate = extractSteamSearchReleaseText_(row);
     const cleanUrl = hrefMatch[1].replace(/&amp;/g, '&').split('?')[0];
 
     // V2.6：
@@ -2768,6 +3903,14 @@ function parseSteamSearchResults_(html) {
   return Array.from(unique.values());
 }
 
+/** Steam search card release field: <div class="search_released">...</div>. */
+function extractSteamSearchReleaseText_(row) {
+  const releaseMatch = String(row || '').match(
+    /<div\b[^>]*class=["'][^"']*\bsearch_released\b[^"']*["'][^>]*>([\s\S]*?)<\/div>/i
+  );
+  return releaseMatch ? decodeHtml_(stripTags_(releaseMatch[1])).replace(/\s+/g, ' ').trim() : '';
+}
+
 function createCandidateRecord_(item) {
   return {
     appId: String(item.appId),
@@ -2806,18 +3949,131 @@ function createCandidateRecord_(item) {
     dataNotes: [],
     observationDataStatus: '',
     observationDataNotes: [],
-    controlOnly: false
+    controlOnly: false,
+    qualificationEligible: false,
+    eligibilityReason: '',
+    qualificationStatus: ''
   };
 }
 
-/** Preserve the pre-G010 production candidate universe: page 1 only. */
-function isLegacyCandidateScope_(rec) {
-  return String(rec.sourcePage || '').split(' + ').some(value => {
-    const match = value.match(/#(\d+)$/);
-    return match && Number(match[1]) === 1;
-  });
+// ============================================================================
+// Raw Observation -> Qualification Eligibility V1
+// ============================================================================
+
+function qualificationRankValue_(value) {
+  const matches = String(value || '').match(/#(\d+)/g) || [];
+  const ranks = matches.map(value => Number(value.slice(1))).filter(isFiniteNumber_);
+  return ranks.length ? Math.min.apply(null, ranks) : null;
 }
 
+function qualificationRankBucket_(rank) {
+  const value = Number(rank);
+  if (!isFiniteNumber_(value) || value <= 0) return -1;
+  if (value <= 50) return 5;
+  if (value <= 100) return 4;
+  if (value <= 250) return 3;
+  if (value <= 500) return 2;
+  if (value <= 1000) return 1;
+  return 0;
+}
+
+function qualificationInScopeWindow_(rec) {
+  const days = Number(rec && rec.daysToRelease);
+  if (rec && rec.releaseStage === '即将发售' && isFiniteNumber_(days)) return days >= 0 && days <= 30;
+  if (rec && rec.releaseStage === '已发售' && isFiniteNumber_(days)) return days <= 0 && days >= -14;
+  return false;
+}
+
+function qualificationScopeStatus_(rec) {
+  const days = Number(rec && rec.daysToRelease);
+  const stage = String(rec && rec.releaseStage || '').trim();
+  if (!stage || !isFiniteNumber_(days) || (stage !== '即将发售' && stage !== '已发售')) return 'SCOPE_UNKNOWN';
+  return qualificationInScopeWindow_(rec) ? 'IN_SCOPE' : 'OUT_OF_SCOPE';
+}
+
+function qualificationRecheckDue_(decision, now) {
+  if (!decision || String(decision.status || '').trim().toUpperCase() !== 'WATCH') return false;
+  const due = dateAtStart_(decision.nextRecheckDate);
+  const today = dateAtStart_(now);
+  return !!due && !!today && due.getTime() <= today.getTime();
+}
+
+function evaluateQualificationEligibility_(rec, context) {
+  const ctx = context || {};
+  const previous = ctx.previousRaw || null;
+  const state = ctx.qualification || null;
+  const decision = ctx.decision || null;
+  const inScope = qualificationInScopeWindow_(rec);
+  const currentRank = qualificationRankValue_(rec && rec.sourceRank);
+  const previousRank = state && state.lastRank;
+  const previousBucket = qualificationRankBucket_(previousRank);
+  const currentBucket = qualificationRankBucket_(currentRank);
+
+  if (qualificationScopeStatus_(rec) === 'SCOPE_UNKNOWN') {
+    return {eligible: false, reason: 'SCOPE_UNKNOWN'};
+  }
+  if (!previous && inScope) return {eligible: true, reason: 'NEW_IN_SCOPE'};
+  if (previous && inScope && !qualificationInScopeWindow_(previous)) {
+    return {eligible: true, reason: 'ENTERED_SCOPE'};
+  }
+  if (previous && previous.releaseStage === '即将发售' && rec.releaseStage === '已发售') {
+    return {eligible: true, reason: 'STAGE_CHANGED'};
+  }
+  if (currentBucket >= 0 && previousBucket >= 0 && currentBucket > previousBucket) {
+    return {eligible: true, reason: 'RANK_RISING'};
+  }
+  if (qualificationRecheckDue_(decision, ctx.now) ||
+      String(state && state.lastStatus || '').trim() === 'INCOMPLETE' ||
+      String(state && state.currentStage || '').trim() === '1B等待历史') {
+    return {eligible: true, reason: 'RECHECK'};
+  }
+  return {eligible: false, reason: 'UNCHANGED_SKIP'};
+}
+
+function readLatestRawObservationIndex_(ss) {
+  const result = new Map();
+  const sheet = ss && ss.getSheetByName ? ss.getSheetByName(HOTWORD_V2.sheets.snapshot) : null;
+  if (!sheet || sheet.getLastRow() < 2) return result;
+  const width = Math.max(sheet.getLastColumn(), HOTWORD_V2.snapshotHeaders.length);
+  const headers = sheet.getRange(1, 1, 1, width).getDisplayValues()[0];
+  const col = name => headers.indexOf(name);
+  const appIdCol = col('Steam App ID');
+  if (appIdCol < 0) return result;
+  const stageCol = col('发布阶段');
+  const daysCol = col('距发售天数');
+  sheet.getRange(2, 1, sheet.getLastRow() - 1, width).getValues().forEach(row => {
+    const appId = String(row[appIdCol] || '').trim();
+    if (!appId) return;
+    result.set(appId, {
+      releaseStage: stageCol >= 0 ? String(row[stageCol] || '').trim() : '',
+      daysToRelease: daysCol >= 0 ? row[daysCol] : null
+    });
+  });
+  return result;
+}
+
+function readQualificationStateIndex_(ss) {
+  const result = new Map();
+  const sheet = ss && ss.getSheetByName ? ss.getSheetByName(HOTWORD_V2.sheets.master) : null;
+  if (!sheet || sheet.getLastRow() < 2) return result;
+  const width = Math.max(sheet.getLastColumn(), HOTWORD_V2.masterHeaders.length);
+  const headers = sheet.getRange(1, 1, 1, width).getDisplayValues()[0];
+  const index = name => headers.indexOf(name);
+  const appIdCol = index('Steam App ID');
+  if (appIdCol < 0) return result;
+  sheet.getRange(2, 1, sheet.getLastRow() - 1, width).getValues().forEach(row => {
+    const appId = String(row[appIdCol] || '').trim();
+    if (!appId) return;
+    const value = name => { const i = index(name); return i >= 0 ? row[i] : ''; };
+    result.set(appId, {
+      lastTime: value('上次Qualification时间'),
+      lastRank: qualificationRankValue_(value('上次Qualification排名')),
+      lastStatus: String(value('Qualification状态') || '').trim(),
+      currentStage: String(value('当前筛选阶段') || '').trim()
+    });
+  });
+  return result;
+}
 
 // ============================================================================
 // 0：Games Popularity + Steam Reviews 数据补全
@@ -4316,21 +5572,22 @@ function isSiteIdContractValue_(value) {
   return !!siteId && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(siteId);
 }
 
-function siteIdFromGameName_(name) {
+function discoveryIdentifierFromGameName_(name) {
   return String(name || '').toLowerCase().normalize('NFKD')
     .replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '').replace(/-+/g, '-') || '';
 }
 
 /**
- * Steam Candidate Opportunity identity.
- * The game_id deliberately reuses the existing Site ID/canonical slug logic;
+ * Steam Candidate discovery/opportunity identifier.
+ * This is not a canonical site identity and must not be used as site_id,
+ * repoPath, githubRepo, or projectSlug downstream.
  * Steam App ID is the runtime key that decides whether this value is created
  * or reused. The fixed 001 sequence is not a run counter.
  */
 function opportunityIdFromSteamCandidate_(gameName, appId) {
   const normalizedAppId = String(appId || '').trim();
-  const gameId = siteIdFromGameName_(gameName);
+  const gameId = discoveryIdentifierFromGameName_(gameName);
   if (!normalizedAppId || !gameId) return '';
   return 'opp-' + gameId + '-steam-candidate-001';
 }
@@ -4364,9 +5621,14 @@ function logSitePoolIdentityIssue_(message) {
 
 function upsertSitePoolRecord_(ss, gameName, appId, buildDate, siteFacts) {
   const sheet = ensureSitePoolSchema_(ss);
-  const siteId = siteIdFromGameName_(gameName);
-  const normalizedAppId = String(appId || '').trim();
+  // Site Pool rows are runtime references; the canonical site_id is supplied
+  // by the identity handoff or retained from the existing Steam App ID row.
   const facts = siteFacts || {};
+  const suppliedSiteId = typeof facts === 'object' ? String(facts.siteId || facts.site_id || '').trim() : '';
+  const normalizedAppId = String(appId || '').trim();
+  const values = sheet.getLastRow() < 2 ? [] : sheet.getRange(2, 1, sheet.getLastRow() - 1, HOTWORD_V2.sitePoolHeaders.length).getValues();
+  const existingByAppId = values.find(row => String(row[2] || '').trim() === normalizedAppId);
+  const siteId = suppliedSiteId || String(existingByAppId?.[0] || '').trim();
   const opportunityId = typeof facts === 'string' ? facts.trim() : String(facts.opportunityId || '').trim();
   const experimentType = typeof facts === 'string' ? '' : ['PROBE', 'FORMAL'].indexOf(String(facts.experimentType || '').trim().toUpperCase()) >= 0
     ? String(facts.experimentType).trim().toUpperCase() : '';
@@ -4376,7 +5638,6 @@ function upsertSitePoolRecord_(ss, gameName, appId, buildDate, siteFacts) {
     logSitePoolIdentityIssue_('Site Pool upsert skipped: Site ID and Steam App ID are required.');
     return null;
   }
-  const values = sheet.getLastRow() < 2 ? [] : sheet.getRange(2, 1, sheet.getLastRow() - 1, HOTWORD_V2.sitePoolHeaders.length).getValues();
   const appIdIndex = values.findIndex(row => String(row[2] || '').trim() === normalizedAppId);
   const siteIdIndex = values.findIndex(row => String(row[0] || '').trim() === siteId);
   let index = appIdIndex;
@@ -5604,6 +6865,21 @@ function upsertMaster_(ss, records, runTime, runId, stats) {
       manualNote = sheet.getRange(existingRow, 32).getValue() || '';
     }
 
+    // UNCHANGED_SKIP updates only the lightweight eligibility audit fields on
+    // an existing master row; it never rewrites qualification/enrichment.
+    if (rec.qualificationEligible === false && rec.eligibilityReason && existingRow) {
+      const headers = sheet.getRange(1, 1, 1, HOTWORD_V2.masterHeaders.length).getDisplayValues()[0];
+      const fields = {
+        'Eligibility原因': rec.eligibilityReason || 'UNCHANGED_SKIP',
+        'Qualification状态': rec.qualificationStatus || 'SKIPPED'
+      };
+      Object.keys(fields).forEach(name => {
+        const column = headers.indexOf(name);
+        if (column >= 0) sheet.getRange(existingRow, column + 1).setValues([[fields[name]]]);
+      });
+      continue;
+    }
+
     const row = masterRow_(rec, runTime, firstSeen, runId, manualNote);
 
     // A failed GP request is not a new observation and must not erase a
@@ -5669,7 +6945,11 @@ function masterRow_(rec, runTime, firstSeen, runId, manualNote) {
     firstSeen,
     runTime,
     runId,
-    manualNote
+    manualNote,
+    rec.qualificationEligible ? runTime : '',
+    rec.qualificationEligible ? (qualificationRankValue_(rec.sourceRank) || '') : '',
+    rec.eligibilityReason || '',
+    rec.qualificationStatus || ''
   ];
 }
 
@@ -5704,6 +6984,79 @@ function appendSnapshots_(ss, records, runTime, runId) {
     uniqueAppIds: uniqueRecords.length,
     bySourcePage: Object.keys(bySourcePage).sort().map(key => key + '=' + bySourcePage[key]).join(','),
     rowByAppId: rowByAppId
+  };
+}
+
+function isDailyCandidateSnapshotRecord_(rec) {
+  const priority = String(rec && rec.priority || '').trim();
+  return rec && rec.continueNext === '是' && (priority.indexOf('P1') === 0 || priority.indexOf('P2') === 0);
+}
+
+function dailyCandidateSnapshotDateKey_(value, ss) {
+  const text = String(value == null ? '' : value).trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(text)) return text;
+  return todayActionDateText_(value, ss);
+}
+
+function dailyCandidateSnapshotRow_(rec, dateKey, runId) {
+  return [
+    dateKey,
+    runId,
+    rec.name || '',
+    rec.appId || '',
+    rec.priority || '',
+    rec.firstRoundType || '',
+    rec.followers,
+    rec.gain7d,
+    rec.growthRate,
+    rec.releaseStage || '',
+    rec.releaseDate || '',
+    rec.daysToRelease,
+    rec.firstRoundReason || ''
+  ];
+}
+
+/**
+ * Persist the first completed P1/P2 candidate set for a business day.
+ * Existing date + App ID rows are immutable, so later research, decisions,
+ * and Today Action refreshes cannot alter this historical view.
+ */
+function writeDailyCandidateSnapshot_(ss, records, runTime, runId) {
+  const sheet = ss && ss.getSheetByName ? ss.getSheetByName(HOTWORD_V2.sheets.candidateSnapshot) : null;
+  if (!sheet) return {persisted: 0, skipped: 0, error: 'candidate_snapshot_sheet_missing'};
+  const dateKey = dailyCandidateSnapshotDateKey_(runTime, ss);
+  if (!dateKey) return {persisted: 0, skipped: 0, error: 'candidate_snapshot_date_missing'};
+  const width = HOTWORD_V2.candidateSnapshotHeaders.length;
+  const headers = sheet.getRange(1, 1, 1, width).getDisplayValues()[0];
+  const dateColumn = headers.indexOf('日期');
+  const appIdColumn = headers.indexOf('Steam App ID');
+  if (dateColumn < 0 || appIdColumn < 0) return {persisted: 0, skipped: 0, error: 'candidate_snapshot_schema_invalid'};
+
+  const existing = new Set();
+  if (sheet.getLastRow() >= 2) {
+    sheet.getRange(2, 1, sheet.getLastRow() - 1, width).getDisplayValues().forEach(row => {
+      const appId = String(row[appIdColumn] || '').trim();
+      const rowDate = String(row[dateColumn] || '').trim();
+      if (appId && rowDate) existing.add(rowDate + '|' + appId);
+    });
+  }
+
+  const unique = new Map();
+  (records || []).forEach(rec => {
+    if (!isDailyCandidateSnapshotRecord_(rec)) return;
+    const appId = String(rec.appId || '').trim();
+    if (!appId || existing.has(dateKey + '|' + appId) || unique.has(appId)) return;
+    unique.set(appId, rec);
+  });
+  const rows = Array.from(unique.values()).map(rec => dailyCandidateSnapshotRow_(rec, dateKey, runId));
+  if (!rows.length) return {persisted: 0, skipped: (records || []).filter(isDailyCandidateSnapshotRecord_).length};
+
+  // Put the newest business day first without rewriting any historical row.
+  if (sheet.insertRowsAfter) sheet.insertRowsAfter(1, rows.length);
+  sheet.getRange(2, 1, rows.length, width).setValues(rows);
+  return {
+    persisted: rows.length,
+    skipped: (records || []).filter(isDailyCandidateSnapshotRecord_).length - rows.length
   };
 }
 
@@ -6181,6 +7534,7 @@ function applyBasicFormatting_(ss) {
 
   [
     HOTWORD_V2.sheets.master,
+    HOTWORD_V2.sheets.candidateSnapshot,
     HOTWORD_V2.sheets.snapshot,
     HOTWORD_V2.sheets.rules,
     HOTWORD_V2.sheets.anomalies,
@@ -6220,6 +7574,17 @@ function applyBasicFormatting_(ss) {
     snap.getRange('I:I').setNumberFormat('yyyy-mm-dd');
     snap.getRange('N:N').setNumberFormat('0.0%');
     snap.getRange('R:R').setNumberFormat('0.0%');
+  }
+
+  const candidateSnap = ss.getSheetByName(HOTWORD_V2.sheets.candidateSnapshot);
+  if (candidateSnap) {
+    candidateSnap.getRange('A:A').setNumberFormat('yyyy-mm-dd');
+    candidateSnap.getRange('G:G').setNumberFormat('0');
+    candidateSnap.getRange('H:H').setNumberFormat('0');
+    candidateSnap.getRange('I:I').setNumberFormat('0.0%');
+    candidateSnap.getRange('K:K').setNumberFormat('yyyy-mm-dd');
+    candidateSnap.setFrozenRows(1);
+    candidateSnap.setFrozenColumns(4);
   }
 
   const rules = ss.getSheetByName(HOTWORD_V2.sheets.rules);
