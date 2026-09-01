@@ -68,6 +68,26 @@ const HOTWORD_V2 = {
     }
   },
 
+  // Canonical append-only raw history.  The ID is stored once in Script
+  // Properties after first creation; the business Sheet remains a compatible
+  // operational snapshot, not the sole long-term raw-data owner.
+  historicalRawLedger: {
+    spreadsheetName: 'Steam Historical Raw Ledger V1',
+    // Known production identity; never silently create a second history file.
+    spreadsheetId: '1iRJCrgmUBbjvWkKkRjrOPVkoWr0LH8RQq4HH9yA_b6E',
+    propertyKey: 'STEAM_HISTORICAL_RAW_LEDGER_V1_SPREADSHEET_ID',
+    sheetName: 'Raw Observations',
+    schemaVersion: 'steam_historical_raw_ledger_v1',
+    headers: [
+      'Observation ID', 'Observed At', 'Run ID', 'Run Date', 'Steam App ID',
+      '游戏名称', 'Steam URL', 'Source', 'Source Page', 'Source Rank',
+      'Release Date', 'Release Date Raw', 'Release Stage', 'Days To Release',
+      'Followers', 'Followers Baseline', 'Followers 7d Gain', 'Follower Growth Rate',
+      'Review Count', 'Positive Reviews', 'Rating', 'Data Status',
+      'Raw Observation Status', 'Provider', 'Provider Provenance', 'Schema Version'
+    ]
+  },
+
   /**
    * 旧 V1 兼容层：保留数据与兼容代码，不删除。
    * 「使用说明」已升级为 V2 正式入口，不再列入此列表。
@@ -266,6 +286,7 @@ const HOTWORD_V2 = {
 };
 
 const STEAM_CANDIDATE_RESEARCH_JOB_TYPE = 'STEAM_CANDIDATE_RESEARCH';
+const UNIFIED_CANDIDATE_UPSERT_JOB_TYPE = 'UNIFIED_CANDIDATE_UPSERT';
 const STEAM_CANDIDATE_RESEARCH_PENDING = 'PENDING';
 const STEAM_CANDIDATE_RESEARCH_CHECKS = ['GAME_WIDE_SOCIAL', 'GOOGLE_ORGANIC_SERP'];
 const STEAM_CANDIDATE_RESEARCH_WRITE_TOKEN_PROP = 'STEAM_CANDIDATE_RESEARCH_WRITE_TOKEN';
@@ -294,18 +315,36 @@ const STEAM_CANDIDATE_RECOMMENDATIONS = {
 };
 const STEAM_CANDIDATE_RESEARCH_CONFIDENCES = { HIGH: true, MEDIUM: true, LOW: true };
 const QUALIFICATION_ELIGIBILITY_PRODUCTION_SHEET_ID = '1WVg2p_Vero3MB2JN4yxmtHkLQRgkWO2mz95X4ms9nLE';
-// G010 discovery has no business page/count cap.  The only bound is the
-// Apps Script execution window; an interrupted source resumes from its next
-// page on the following run.
+// G010 daily discovery: each Steam source is hard-capped at 5 pages (~250 unique
+// after merge). Continuation is same-run/same-day only; scheduled daily runs
+// always start a fresh Run ID at page 1.
 const STEAM_DISCOVERY_RUNTIME_BUDGET_MS = 4 * 60 * 1000;
-const G010_EXECUTION_BUDGET_MS = 4 * 60 * 1000;
+const G010_DISCOVERY_MAX_PAGES = 5;
+const G010_DISCOVERY_TARGET_UNIQUE = 250;
+const G010_PAGE_RECOVERY_MAX_ATTEMPTS = 3;
+const G010_PAGE_RECOVERY_WINDOW_MS = 30 * 60 * 1000;
+const G010_ENRICHMENT_CHUNK_SIZE = 35;
+const G010_EXECUTION_BUDGET_MS = 330000;
 const G010_STATE_KEYS = {
   runId: 'G010_RUN_ID', phase: 'G010_PHASE', source: 'G010_SOURCE',
-  nextPage: 'G010_NEXT_PAGE', enrichmentCursor: 'G010_ENRICHMENT_CURSOR'
+  nextPage: 'G010_NEXT_PAGE', enrichmentCursor: 'G010_ENRICHMENT_CURSOR',
+  controlCursor: 'G010_CONTROL_CURSOR',
+  controlData: 'G010_CONTROL_DATA',
+  runDate: 'G010_RUN_DATE', updatedAt: 'G010_UPDATED_AT',
+  consecutiveNoNew: 'G010_CONSECUTIVE_NO_NEW', runStartedAt: 'G010_RUN_STARTED_AT',
+  discoveryAudit: 'G010_DISCOVERY_AUDIT', discoveryComplete: 'G010_DISCOVERY_COMPLETE',
+  runStats: 'G010_RUN_STATS', segmentCount: 'G010_SEGMENT_COUNT',
+  pageRetryCount: 'G010_PAGE_RETRY_COUNT', pageRetryStartedAt: 'G010_PAGE_RETRY_STARTED_AT',
+  nextRetryAt: 'G010_NEXT_RETRY_AT', ledgerWriteFailures: 'G010_RAW_LEDGER_WRITE_FAILURES',
+  ledgerAppended: 'G010_RAW_LEDGER_APPENDED', ledgerDuplicates: 'G010_RAW_LEDGER_DUPLICATES'
 };
 const G010_CONTINUATION_HANDLER = 'runG010Continuation_';
+const G010_DAILY_HANDLER = 'runSteamHotwordDaily_';
 const G010_403_CONTINUATION_DELAY_MS = 3 * 60 * 1000;
+const G010_ENRICHMENT_CONTINUATION_DELAY_MS = 45 * 1000;
 const G010_CONTINUATION_STALE_MS = 10 * 60 * 1000;
+const G010_CONTINUATION_TTL_MS = 12 * 60 * 60 * 1000;
+const G010_ABANDON_RUN_IDS = ['20260831-084334'];
 
 
 // ============================================================================
@@ -313,6 +352,7 @@ const G010_CONTINUATION_STALE_MS = 10 * 60 * 1000;
 // ============================================================================
 
 function onOpen() {
+  try { g010MaybeKickPartialRun_(); } catch (kickErr) { /* non-blocking */ }
   SpreadsheetApp.getUi()
     .createMenu('Steam 0→1B')
     .addItem('立即运行 0→1B', 'runSteamHotword01B')
@@ -325,9 +365,33 @@ function onOpen() {
     .addToUi();
 }
 
-/** Read-only Steam Candidate Research queue endpoint. */
+/** Web App POST: accepts only the Steam Candidate Research callback contract. */
 function doGet(e) {
   const action = e && e.parameter ? String(e.parameter.action || '').trim() : '';
+  if (action === 'g010StartNewDailyRun') {
+    return ContentService.createTextOutput(JSON.stringify(runSteamHotwordDaily_()))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+  if (action === 'g010KickContinuation') {
+    return ContentService.createTextOutput(JSON.stringify(g010MaybeKickPartialRun_()))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+  if (action === 'g010ContinueSegment') {
+    return ContentService.createTextOutput(JSON.stringify(g010ContinueActiveRunOnce_()))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+  if (action === 'g022Readback') {
+    return ContentService.createTextOutput(JSON.stringify(g022Readback_(e.parameter.runId || '')))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+  if (action === 'g022RepairRunLedger') {
+    const requestedRunId = String(e.parameter.runId || '');
+    const repairResult = requestedRunId === 'all'
+      ? ['20260901-134739', '20260901-141358'].map(g022RepairRunLedgerEnrichmentStats_)
+      : g022RepairRunLedgerEnrichmentStats_(requestedRunId);
+    return ContentService.createTextOutput(JSON.stringify(repairResult))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
   if (action === 'pendingSteamCandidateResearchJobs') {
     return ContentService
       .createTextOutput(JSON.stringify({ jobs: loadPendingSteamCandidateResearchJobs_() }))
@@ -338,7 +402,7 @@ function doGet(e) {
     .setMimeType(ContentService.MimeType.JSON);
 }
 
-/** Web App POST: accepts only the Steam Candidate Research callback contract. */
+/** Web App POST: Steam Candidate Research and unified-candidate upsert callbacks. */
 function doPost(e) {
   try {
     const body = steamCandidateResearchParsePostJson_(e);
@@ -346,7 +410,11 @@ function doPost(e) {
     if (!checkSteamCandidateResearchWriteToken_(e, body)) {
       return steamCandidateResearchJsonOutput_({ok: false, error: 'unauthorized'});
     }
-    if (String(body.job_type || '').trim().toUpperCase() !== STEAM_CANDIDATE_RESEARCH_JOB_TYPE) {
+    const jobType = String(body.job_type || '').trim().toUpperCase();
+    if (jobType === UNIFIED_CANDIDATE_UPSERT_JOB_TYPE) {
+      return steamCandidateResearchJsonOutput_(handleUnifiedCandidateUpsertCallback_(body));
+    }
+    if (jobType !== STEAM_CANDIDATE_RESEARCH_JOB_TYPE) {
       return steamCandidateResearchJsonOutput_({ok: false, error: 'unsupported_job_type'});
     }
     return steamCandidateResearchJsonOutput_(handleSteamCandidateResearchCallback_(body));
@@ -509,6 +577,63 @@ function validateSteamCandidateResearchCallback_(body) {
     return !text || /^https?:\/\//i.test(text);
   })) return {ok: false, error: 'invalid_top_topics'};
   return {ok: true, executionStatus: executionStatus};
+}
+
+function validateUnifiedCandidateUpsertCallback_(body) {
+  if (!body || Object.prototype.toString.call(body) !== '[object Object]') {
+    return {ok: false, error: 'invalid_callback_body'};
+  }
+  if (steamCandidateResearchCallbackString_(body.job_type).toUpperCase() !== UNIFIED_CANDIDATE_UPSERT_JOB_TYPE) {
+    return {ok: false, error: 'unsupported_job_type'};
+  }
+  const required = ['run_id', 'observed_at', 'execution_status'];
+  for (let i = 0; i < required.length; i++) {
+    if (!steamCandidateResearchCallbackString_(body[required[i]])) {
+      return {ok: false, error: 'missing_' + required[i]};
+    }
+  }
+  const executionStatus = steamCandidateResearchCallbackString_(body.execution_status).toUpperCase();
+  if (executionStatus !== STEAM_CANDIDATE_RESEARCH_EXEC_COMPLETED &&
+      executionStatus !== STEAM_CANDIDATE_RESEARCH_EXEC_FAILED) {
+    return {ok: false, error: 'invalid_execution_status'};
+  }
+  if (executionStatus === STEAM_CANDIDATE_RESEARCH_EXEC_FAILED) {
+    if (!steamCandidateResearchCallbackString_(body.error)) return {ok: false, error: 'missing_error'};
+    return {ok: true, executionStatus: executionStatus};
+  }
+  if (Object.prototype.toString.call(body.candidates) !== '[object Array]') {
+    return {ok: false, error: 'invalid_candidates'};
+  }
+  if (body.candidate_count != null) {
+    const countCheck = steamCandidateResearchCallbackNonNegativeNumber_(body.candidate_count, 'candidate_count');
+    if (!countCheck.ok) return countCheck;
+    if (countCheck.value !== body.candidates.length) return {ok: false, error: 'candidate_count_mismatch'};
+  }
+  if (Object.prototype.hasOwnProperty.call(body, 'evidence') ||
+      Object.prototype.hasOwnProperty.call(body, 'results') ||
+      Object.prototype.hasOwnProperty.call(body, 'organic_results')) {
+    return {ok: false, error: 'raw_evidence_not_allowed'};
+  }
+  return {ok: true, executionStatus: executionStatus};
+}
+
+function handleUnifiedCandidateUpsertCallback_(body) {
+  const validation = validateUnifiedCandidateUpsertCallback_(body);
+  if (!validation.ok) return validation;
+  if (validation.executionStatus === STEAM_CANDIDATE_RESEARCH_EXEC_FAILED) {
+    return {
+      ok: true,
+      run_id: steamCandidateResearchCallbackString_(body.run_id),
+      execution_status: validation.executionStatus,
+      error: steamCandidateResearchCallbackString_(body.error)
+    };
+  }
+  const result = upsertUnifiedCandidates_(SpreadsheetApp.getActiveSpreadsheet(), body.candidates);
+  return Object.assign({
+    ok: true,
+    run_id: steamCandidateResearchCallbackString_(body.run_id),
+    execution_status: validation.executionStatus
+  }, result);
 }
 
 function steamCandidateResearchNameKey_(value) {
@@ -1260,6 +1385,17 @@ function migrateCandidateDecisionHistoricalSchema() {
 
 function setupSteamHotwordV2() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
+  return setupSteamHotwordV2On_(ss, {fullSetup: true});
+}
+
+/** G010 production runs use minimal setup; full UI repair only on explicit init. */
+function ensureSteamHotwordV2ForRun_(ss, options) {
+  return setupSteamHotwordV2On_(ss, Object.assign({fullSetup: false}, options || {}));
+}
+
+function setupSteamHotwordV2On_(ss, options) {
+  options = options || {};
+  if (!ss) throw new Error('setupSteamHotwordV2On_: spreadsheet required');
 
   ensureSheetWithHeaders_(ss, HOTWORD_V2.sheets.master, HOTWORD_V2.masterHeaders);
   ensureSheetWithHeaders_(ss, HOTWORD_V2.sheets.candidateSnapshot, HOTWORD_V2.candidateSnapshotHeaders);
@@ -1267,6 +1403,8 @@ function setupSteamHotwordV2() {
   ensureSheetWithHeaders_(ss, HOTWORD_V2.sheets.anomalies, HOTWORD_V2.anomalyHeaders);
   ensureSheetWithHeaders_(ss, HOTWORD_V2.sheets.log, HOTWORD_V2.logHeaders);
   ensureSheetWithHeaders_(ss, HOTWORD_V2.sheets.externalDataAttempts, HOTWORD_V2.externalDataAttemptHeaders);
+  if (!options.fullSetup) return {ok: true, minimal: true};
+
   ensureSheetWithHeaders_(ss, HOTWORD_V2.sheets.history, ['Steam App ID', '游戏名称', 'Steam URL', '当前阶段', '备注']);
   ensureCandidateDecisionSchema_(ss);
   ensureSitePoolSchema_(ss);
@@ -1616,7 +1754,7 @@ function setupRulesSheet_(ss) {
     ['RECHECK_GAIN_GROWTH_MIN', 0.30, '比例', 'WATCH候选重新进入今日行动所需的7d Gain增长', '候选人工复查 V1'],
     ['WATCH_RECHECK_DAYS_STRONG', 3, '天', '强信号 WATCH 的默认复查间隔', '候选人工复查 V1'],
     ['WATCH_RECHECK_DAYS_NORMAL', 7, '天', '普通 WATCH 的默认复查间隔', '候选人工复查 V1'],
-    ['DISCOVERY_PAGES', 'AUTO', '自动分页', '每个Steam来源持续抓取，直到空页、重复页、来源耗尽或保存续抓', 'G010：仅用于显示语义；不限制页数或候选数量'],
+    ['DISCOVERY_PAGES', '5', '页/来源', '每个Steam来源最多抓取5页；空页、连续2页无新App ID可提前停止', 'G010：双来源合并目标约250 unique App ID'],
     ['DAILY_HOUR', 8, '小时', '自动触发器运行小时', '表格/脚本时区下08:00–09:00窗口']
   ];
 
@@ -2369,26 +2507,660 @@ function g010StateProperties_() {
   return PropertiesService.getScriptProperties();
 }
 
+function g010RunDateKey_(date, tz) {
+  return Utilities.formatDate(date instanceof Date ? date : new Date(date), tz, 'yyyyMMdd');
+}
+
 function g010ReadState_() {
   const props = g010StateProperties_();
   const runId = String(props.getProperty(G010_STATE_KEYS.runId) || '').trim();
   if (!runId) return null;
+  let discoveryAudit = {};
+  try {
+    discoveryAudit = JSON.parse(String(props.getProperty(G010_STATE_KEYS.discoveryAudit) || '{}'));
+  } catch (auditErr) {
+    discoveryAudit = {};
+  }
+  let controlData = {};
+  try { controlData = JSON.parse(String(props.getProperty(G010_STATE_KEYS.controlData) || '{}')); } catch (err) {}
   return {
     runId: runId,
     phase: String(props.getProperty(G010_STATE_KEYS.phase) || 'DISCOVERY').trim(),
     source: String(props.getProperty(G010_STATE_KEYS.source) || HOTWORD_V2.sources[0].name).trim(),
     nextPage: Math.max(1, Number(props.getProperty(G010_STATE_KEYS.nextPage) || 1)),
-    enrichmentCursor: Math.max(0, Number(props.getProperty(G010_STATE_KEYS.enrichmentCursor) || 0))
+    enrichmentCursor: Math.max(0, Number(props.getProperty(G010_STATE_KEYS.enrichmentCursor) || 0)),
+    controlCursor: Math.max(0, Number(props.getProperty(G010_STATE_KEYS.controlCursor) || 0)),
+    controlData: controlData,
+    runDate: String(props.getProperty(G010_STATE_KEYS.runDate) || '').trim(),
+    updatedAt: Math.max(0, Number(props.getProperty(G010_STATE_KEYS.updatedAt) || 0)),
+    consecutiveNoNew: Math.max(0, Number(props.getProperty(G010_STATE_KEYS.consecutiveNoNew) || 0)),
+    runStartedAt: Math.max(0, Number(props.getProperty(G010_STATE_KEYS.runStartedAt) || 0)),
+    discoveryComplete: String(props.getProperty(G010_STATE_KEYS.discoveryComplete) || '') === 'true',
+    discoveryAudit: discoveryAudit,
+    segmentCount: Math.max(0, Number(props.getProperty(G010_STATE_KEYS.segmentCount) || 0)),
+    pageRetryCount: Math.max(0, Number(props.getProperty(G010_STATE_KEYS.pageRetryCount) || 0)),
+    pageRetryStartedAt: Math.max(0, Number(props.getProperty(G010_STATE_KEYS.pageRetryStartedAt) || 0)),
+    nextRetryAt: Math.max(0, Number(props.getProperty(G010_STATE_KEYS.nextRetryAt) || 0)),
+    ledgerWriteFailures: Math.max(0, Number(props.getProperty(G010_STATE_KEYS.ledgerWriteFailures) || 0)),
+    ledgerAppended: Math.max(0, Number(props.getProperty(G010_STATE_KEYS.ledgerAppended) || 0)),
+    ledgerDuplicates: Math.max(0, Number(props.getProperty(G010_STATE_KEYS.ledgerDuplicates) || 0))
   };
 }
 
 function g010WriteState_(state) {
   const props = g010StateProperties_();
+  const updatedAt = Math.max(0, Number(state.updatedAt || Date.now()));
   props.setProperty(G010_STATE_KEYS.runId, String(state.runId));
   props.setProperty(G010_STATE_KEYS.phase, String(state.phase));
   props.setProperty(G010_STATE_KEYS.source, String(state.source || ''));
   props.setProperty(G010_STATE_KEYS.nextPage, String(Math.max(1, Number(state.nextPage || 1))));
   props.setProperty(G010_STATE_KEYS.enrichmentCursor, String(Math.max(0, Number(state.enrichmentCursor || 0))));
+  props.setProperty(G010_STATE_KEYS.controlCursor, String(Math.max(0, Number(state.controlCursor || 0))));
+  props.setProperty(G010_STATE_KEYS.controlData, JSON.stringify(state.controlData || {}));
+  props.setProperty(G010_STATE_KEYS.runDate, String(state.runDate || ''));
+  props.setProperty(G010_STATE_KEYS.updatedAt, String(updatedAt));
+  props.setProperty(G010_STATE_KEYS.consecutiveNoNew, String(Math.max(0, Number(state.consecutiveNoNew || 0))));
+  props.setProperty(G010_STATE_KEYS.runStartedAt, String(Math.max(0, Number(state.runStartedAt || 0))));
+  props.setProperty(G010_STATE_KEYS.discoveryComplete, state.discoveryComplete ? 'true' : 'false');
+  props.setProperty(G010_STATE_KEYS.discoveryAudit, JSON.stringify(state.discoveryAudit || {}));
+  props.setProperty(G010_STATE_KEYS.segmentCount, String(Math.max(0, Number(state.segmentCount || 0))));
+  props.setProperty(G010_STATE_KEYS.pageRetryCount, String(Math.max(0, Number(state.pageRetryCount || 0))));
+  props.setProperty(G010_STATE_KEYS.pageRetryStartedAt, String(Math.max(0, Number(state.pageRetryStartedAt || 0))));
+  props.setProperty(G010_STATE_KEYS.nextRetryAt, String(Math.max(0, Number(state.nextRetryAt || 0))));
+  props.setProperty(G010_STATE_KEYS.ledgerWriteFailures, String(Math.max(0, Number(state.ledgerWriteFailures || 0))));
+  props.setProperty(G010_STATE_KEYS.ledgerAppended, String(Math.max(0, Number(state.ledgerAppended || 0))));
+  props.setProperty(G010_STATE_KEYS.ledgerDuplicates, String(Math.max(0, Number(state.ledgerDuplicates || 0))));
+  state.updatedAt = updatedAt;
+}
+
+function g010NewRunState_(startedAt, tz) {
+  const ts = startedAt.getTime();
+  return {
+    runId: Utilities.formatDate(startedAt, tz, 'yyyyMMdd-HHmmss'),
+    phase: 'DISCOVERY',
+    source: HOTWORD_V2.sources[0].name,
+    nextPage: 1,
+    enrichmentCursor: 0,
+    controlCursor: 0,
+    controlData: {},
+    runDate: g010RunDateKey_(startedAt, tz),
+    updatedAt: ts,
+    runStartedAt: ts,
+    consecutiveNoNew: 0,
+    discoveryComplete: false,
+    discoveryAudit: {sources: {}},
+    segmentCount: 0,
+    pageRetryCount: 0,
+    pageRetryStartedAt: 0,
+    nextRetryAt: 0,
+    ledgerWriteFailures: 0,
+    ledgerAppended: 0,
+    ledgerDuplicates: 0
+  };
+}
+
+function g010InitDiscoveryAudit_(state) {
+  if (!state.discoveryAudit || typeof state.discoveryAudit !== 'object') {
+    state.discoveryAudit = {sources: {}};
+  }
+  if (!state.discoveryAudit.sources) state.discoveryAudit.sources = {};
+  return state.discoveryAudit;
+}
+
+function g010RecordDiscoveryPage_(state, sourceName, page, itemsCount, newCount) {
+  const audit = g010InitDiscoveryAudit_(state);
+  if (!audit.sources[sourceName]) {
+    audit.sources[sourceName] = {pages: [], pagesFetched: 0, itemsTotal: 0, newAppIds: 0, stopReason: ''};
+  }
+  const entry = audit.sources[sourceName];
+  entry.pages.push({page: page, items: itemsCount, newAppIds: newCount});
+  entry.pagesFetched = entry.pages.length;
+  entry.itemsTotal += Math.max(0, Number(itemsCount || 0));
+  entry.newAppIds += Math.max(0, Number(newCount || 0));
+}
+
+function g010FinishDiscoverySource_(state, sourceName, stopReason) {
+  const audit = g010InitDiscoveryAudit_(state);
+  if (!audit.sources[sourceName]) {
+    audit.sources[sourceName] = {pages: [], pagesFetched: 0, itemsTotal: 0, newAppIds: 0, stopReason: stopReason || 'unknown'};
+  } else {
+    audit.sources[sourceName].stopReason = stopReason || audit.sources[sourceName].stopReason || 'unknown';
+  }
+}
+
+function g010FormatDiscoveryAudit_(state) {
+  const audit = state && state.discoveryAudit ? state.discoveryAudit : {sources: {}};
+  const parts = [];
+  HOTWORD_V2.sources.forEach(source => {
+    const entry = audit.sources && audit.sources[source.name];
+    if (!entry) {
+      parts.push(source.name + '=pending');
+      return;
+    }
+    parts.push(source.name + ':pages=' + entry.pagesFetched + '/5 items=' + entry.itemsTotal +
+      ' new=' + entry.newAppIds + ' stop=' + (entry.stopReason || ''));
+  });
+  return parts.join('; ');
+}
+
+function g010LoadRunStats_() {
+  try {
+    const raw = g010StateProperties_().getProperty(G010_STATE_KEYS.runStats);
+    if (!raw) return g010EmptyRunStats_();
+    return Object.assign(g010EmptyRunStats_(), JSON.parse(raw));
+  } catch (err) {
+    return g010EmptyRunStats_();
+  }
+}
+
+function g010SaveRunStats_(stats) {
+  g010StateProperties_().setProperty(G010_STATE_KEYS.runStats, JSON.stringify(stats || g010EmptyRunStats_()));
+}
+
+function g010ComputeFinalStatsFromMaster_(ss, runId) {
+  const stats = g010EmptyRunStats_();
+  const sheet = ss.getSheetByName(HOTWORD_V2.sheets.master);
+  if (!sheet || sheet.getLastRow() < 2) return stats;
+  const width = Math.max(sheet.getLastColumn(), HOTWORD_V2.masterHeaders.length);
+  const headers = sheet.getRange(1, 1, 1, width).getDisplayValues()[0];
+  const index = name => headers.indexOf(name);
+  const runCol = index('最近Run ID');
+  if (runCol < 0) return stats;
+  sheet.getRange(2, 1, sheet.getLastRow() - 1, width).getValues().forEach(row => {
+    if (String(row[runCol] || '').trim() !== String(runId)) return;
+    const rec = {
+      result1A: row[index('1A结果')] || '',
+      firstRoundType: row[index('第一轮类型')] || '',
+      continueNext: row[index('进入下一步')] || '',
+      priority: row[index('第一轮优先级')] || '',
+      followers: row[index('Steam Followers')],
+      gain7d: row[index('Steam 7d Gain')],
+      growthRate: row[index('近似增长率')],
+      releaseStage: row[index('发布阶段')] || '',
+      releaseDate: row[index('Steam 发布日期')] || '',
+      daysToRelease: row[index('距发售天数')],
+      firstRoundReason: row[index('第一轮判定依据')] || ''
+    };
+    if (rec.firstRoundType === '⏳ 等待历史') stats.historyInsufficient += 1;
+    g010AccumulateChunkStats_(stats, [rec]);
+  });
+  const snap = ss.getSheetByName(HOTWORD_V2.sheets.candidateSnapshot);
+  if (snap && snap.getLastRow() >= 2) {
+    const snapWidth = Math.max(snap.getLastColumn(), HOTWORD_V2.candidateSnapshotHeaders.length);
+    const snapHeaders = snap.getRange(1, 1, 1, snapWidth).getDisplayValues()[0];
+    const snapRunCol = snapHeaders.indexOf('Run ID');
+    if (snapRunCol >= 0) {
+      let candidates = 0;
+      snap.getRange(2, 1, snap.getLastRow() - 1, snapWidth).getValues().forEach(row => {
+        if (String(row[snapRunCol] || '').trim() === String(runId)) candidates += 1;
+      });
+      stats.candidates = candidates;
+    }
+  }
+  return stats;
+}
+
+function g010EvaluateRunCompletion_(state, runContext, discoveryPartial) {
+  const issues = [];
+  const eligibleTotal = runContext ? runContext.eligible.length : 0;
+  const controlTotal = runContext && runContext.controls ? runContext.controls.length : 0;
+  const enrichmentDone = Number(state.enrichmentCursor || 0) >= eligibleTotal;
+  const controlDone = Number(state.controlCursor || 0) >= controlTotal;
+  if (!state.discoveryComplete) issues.push('discovery-incomplete');
+  if (discoveryPartial) issues.push('discovery-fetch-partial');
+  if (Number(state.ledgerWriteFailures || 0) > 0) issues.push('RAW_LEDGER_WRITE_FAILED');
+  if (!enrichmentDone) issues.push('enrichment-incomplete');
+  if (!controlDone) issues.push('control-enrichment-incomplete');
+  HOTWORD_V2.sources.forEach(source => {
+    const entry = state.discoveryAudit && state.discoveryAudit.sources
+      ? state.discoveryAudit.sources[source.name] : null;
+    if (!entry || !entry.stopReason) {
+      issues.push('source-audit-missing:' + source.name);
+      return;
+    }
+    if (entry.stopReason === 'fetch-failure' || entry.stopReason === 'fetch-failure-exhausted') return;
+    if (entry.pagesFetched < G010_DISCOVERY_MAX_PAGES &&
+        entry.stopReason !== 'empty-page' && entry.stopReason !== 'empty-page-1') {
+      issues.push('source-pages-incomplete:' + source.name + ':' + entry.stopReason);
+    }
+  });
+  return {ok: !issues.length, status: issues.length ? 'PARTIAL' : 'SUCCESS', issues: issues};
+}
+
+function g010ContinuationDelayMs_(phase) {
+  if (String(phase || '').toUpperCase() === 'ENRICHMENT') return G010_ENRICHMENT_CONTINUATION_DELAY_MS;
+  if (String(phase || '').toUpperCase() === 'DISCOVERY') return G010_403_CONTINUATION_DELAY_MS;
+  return 60 * 1000;
+}
+
+function g010DiscoveryFetchErrorRetryable_(err) {
+  const httpStatus = err && err.httpStatus;
+  const message = String(err && err.message || err || '');
+  return isSteamRetryableHttpStatus_(httpStatus) || /HTTP\s+(403|429|5\d\d)/i.test(message) ||
+    /网络错误|NETWORK|ECONNRESET|ETIMEDOUT|timeout/i.test(message);
+}
+
+function g010DiscoveryRetryDelayMs_(retryCount, err) {
+  const base = err && Number(err.httpStatus) === 429 ? G010_403_CONTINUATION_DELAY_MS : 90 * 1000;
+  return Math.min(5 * 60 * 1000, base * Math.max(1, Number(retryCount || 1)));
+}
+
+function g010ClearPageRetryState_(state) {
+  state.pageRetryCount = 0;
+  state.pageRetryStartedAt = 0;
+  state.nextRetryAt = 0;
+}
+
+function g010DiscoveryFetchRecovery_(state, now, err) {
+  const page = Math.max(1, Number(state.nextPage || 1));
+  if (page > G010_DISCOVERY_MAX_PAGES) return {action: 'PARTIAL', state: state};
+  const retryCount = Math.max(0, Number(state.pageRetryCount || 0)) + 1;
+  const startedAt = Number(state.pageRetryStartedAt || now.getTime());
+  const windowExpired = now.getTime() - startedAt > G010_PAGE_RECOVERY_WINDOW_MS;
+  if (retryCount > G010_PAGE_RECOVERY_MAX_ATTEMPTS || windowExpired) {
+    return {
+      action: 'PARTIAL',
+      state: Object.assign({}, state, {pageRetryCount: retryCount, pageRetryStartedAt: startedAt}),
+      reason: windowExpired ? 'recovery-window-expired' : 'recovery-attempts-exhausted'
+    };
+  }
+  const delayMs = g010DiscoveryRetryDelayMs_(retryCount, err);
+  return {
+    action: 'YIELD',
+    delayMs: delayMs,
+    state: Object.assign({}, state, {
+      pageRetryCount: retryCount,
+      pageRetryStartedAt: startedAt,
+      nextRetryAt: now.getTime() + delayMs
+    })
+  };
+}
+
+function g010LoadCachedDiscoveryPage_(sourceName, page, nowMs) {
+  const cached = loadSteamSourceCache_(sourceName);
+  if (!cached || !cached.items || !cached.items.length) return null;
+  if (!isSteamSourceCacheFresh_(cached, nowMs, HOTWORD_V2.steamHttp.cacheMaxAgeMs)) return null;
+  const pageItems = cached.items.filter(item => Number(item._sourcePage || item.sourcePage || 0) === Number(page));
+  if (!pageItems.length) return null;
+  return {items: pageItems, cacheAgeMs: nowMs - Number(cached.savedAtMs || 0)};
+}
+
+function g010RearmContinuationForState_(state) {
+  const phase = state && state.phase;
+  let delayMs = g010ContinuationDelayMs_(phase);
+  if (state && state.phase === 'DISCOVERY' && Number(state.nextRetryAt || 0) > Date.now()) {
+    delayMs = Math.max(30 * 1000, Number(state.nextRetryAt) - Date.now());
+  }
+  g010RearmContinuation_(delayMs);
+}
+
+function g010BumpSegmentCount_(state, options) {
+  if (options.forceNewRun) {
+    state.segmentCount = 1;
+    return state;
+  }
+  state.segmentCount = Math.max(0, Number(state.segmentCount || 0)) + 1;
+  return state;
+}
+
+function g010EmptyRunStats_() {
+  return {
+    pass1A: 0, excluded1A: 0, trend: 0, early: 0, control: 0, low: 0, anomaly: 0,
+    enriched: 0, candidates: 0, p2Trend: 0, p2Early: 0, historyInsufficient: 0,
+    cacheHits: 0, realtimeRequests: 0, realtimeSuccess: 0, rateLimited: 0, failuresKept: 0
+  };
+}
+
+function g010BuildRunContext_(ss, state, startedAt, tz) {
+  const rawRecords = g010RawRecordsForRun_(ss, state.runId);
+  const previous = g010PreviousRawIndex_(ss, state.runId);
+  const qualification = readQualificationStateIndex_(ss);
+  const decisions = readCandidateDecisions_(ss);
+  const history = buildHistoryIndex_(ss);
+  const rules = loadRules_(ss);
+  const gpCache = readDailyGamesPopularityCache_(ss, startedAt);
+  const eligible = [];
+  const rejected = [];
+  let historyExcluded = 0;
+  rawRecords.forEach(rec => {
+    if (isInHistoryIndex_(rec, history)) {
+      historyExcluded += 1;
+      return;
+    }
+    const eligibility = evaluateQualificationEligibility_(rec, {
+      previousRaw: previous.get(rec.appId), qualification: qualification.get(rec.appId),
+      decision: decisions.get(rec.appId), now: startedAt, rules: rules
+    });
+    if (g010EnrichmentEligible_(eligibility)) eligible.push(rec);
+    else rejected.push(rec);
+  });
+  const controls = g010SelectRejectedControls_(rejected, state.runId);
+  controls.forEach(rec => { if (state.controlData && state.controlData[String(rec.appId)]) Object.assign(rec, state.controlData[String(rec.appId)]); });
+  return {
+    runId: state.runId,
+    rawRecords: rawRecords,
+    previousRaw: previous,
+    qualification: qualification,
+    decisions: decisions,
+    history: history,
+    rules: rules,
+    gpCache: gpCache,
+    eligible: eligible,
+    controls: controls,
+    historyExcluded: historyExcluded,
+    stats: g010LoadRunStats_()
+  };
+}
+
+// Small, reproducible stratified sample. Hash order is stable for Run ID + App ID;
+// round-robin over source/rank/stage groups gives coverage without a model.
+function g010ControlHash_(value) {
+  let hash = 2166136261;
+  String(value || '').split('').forEach(ch => { hash ^= ch.charCodeAt(0); hash = Math.imul(hash, 16777619); });
+  return hash >>> 0;
+}
+
+function g010ControlGroup_(rec) {
+  const source = String(rec.source || '').trim() || 'UNKNOWN_SOURCE';
+  const rank = Number(rec.sourceRank);
+  const rankGroup = isFinite(rank) ? 'R' + (Math.floor((rank - 1) / 50) + 1) : 'R_UNKNOWN';
+  const stage = String(rec.releaseStage || '').trim() || 'UNKNOWN_STAGE';
+  return source + '|' + rankGroup + '|' + stage;
+}
+
+function g010SelectRejectedControls_(rejected, runId) {
+  const groups = {};
+  (rejected || []).forEach(rec => {
+    const group = g010ControlGroup_(rec);
+    if (!groups[group]) groups[group] = [];
+    rec._controlSampleGroup = group;
+    groups[group].push(rec);
+  });
+  Object.keys(groups).forEach(group => groups[group].sort((a, b) =>
+    g010ControlHash_(runId + '|' + a.appId) - g010ControlHash_(runId + '|' + b.appId)));
+  const selected = [];
+  const keys = Object.keys(groups).sort();
+  let index = 0;
+  while (selected.length < 20) {
+    let added = false;
+    keys.forEach(group => {
+      if (selected.length >= 20 || !groups[group][index]) return;
+      selected.push(groups[group][index]); added = true;
+    });
+    if (!added) break;
+    index += 1;
+  }
+  selected.forEach(rec => {
+    rec.controlSampleGroup = rec._controlSampleGroup;
+    rec.controlSampleReason = 'REJECTED_RANDOM_SAMPLE';
+    rec.controlSampleFlag = true;
+    delete rec._controlSampleGroup;
+  });
+  return selected;
+}
+
+function g010EnrichControlChunk_(ss, records, runId, runTime, warnings, runContext) {
+  if (!records || !records.length) return;
+  const gpKey = getGamesPopularityApiKey_();
+  const gpStats = runContext.stats;
+  const cache = runContext.gpCache || readDailyGamesPopularityCache_(ss, runTime);
+  const partition = partitionDailyGamesPopularityCache_(records, cache);
+  partition.hits.forEach(rec => { rec._gpDailyCache = cache.get(String(rec.appId)); });
+  gpStats.cacheHits = Number(gpStats.cacheHits || 0) + partition.hits.length;
+  const context = {ss: ss, runId: runId, runTime: runTime, refreshReason: 'POLICY_MISS', attemptBuffer: []};
+  const latestMap = fetchGamesPopularityLatestBatch_(partition.misses, gpKey, warnings, gpStats, context);
+  records.forEach(rec => {
+    if (rec._gpDailyCache) Object.assign(rec, rec._gpDailyCache);
+    else {
+      const latest = latestMap.get(rec.appId);
+      if (latest && latest.followers && isFiniteNumber_(latest.followers.followers)) {
+        rec.followers = Number(latest.followers.followers);
+        rec._gpLatestFresh = true;
+      }
+    }
+  });
+  const history = fetchGamesPopularityFollowersBatch_(partition.misses, gpKey, warnings, gpStats, context);
+  records.forEach(rec => {
+    if (rec._gpDailyCache && isFiniteNumber_(rec.gain7d) && isFiniteNumber_(rec.growthRate)) {
+      rec._gpEnrichmentFresh = true;
+      return;
+    }
+    const growth = computeFollowerGrowth_(history.get(rec.appId), rec.followers, runTime, runContext.rules.FOLLOWER_HISTORY_MIN_DAYS);
+    if (growth.ok) {
+      rec.baselineFollowers = growth.baselineFollowers; rec.gain7d = growth.gain;
+      rec.growthRate = growth.growthRate; rec.coverageDays = growth.coverageDays;
+      rec._gpEnrichmentFresh = true;
+    } else rec._gpEnrichmentFailed = true;
+  });
+  flushGamesPopularityAttempts_(context);
+  records.filter(rec => rec._gpEnrichmentFresh && !rec._gpDailyCache).forEach(rec => cache.set(String(rec.appId), {
+    observedAt: runTime, followers: rec.followers, baselineFollowers: rec.baselineFollowers,
+    gain7d: rec.gain7d, growthRate: rec.growthRate, coverageDays: rec.coverageDays
+  }));
+  runContext.gpCache = cache;
+}
+
+function g010AccumulateChunkStats_(stats, records) {
+  (records || []).forEach(rec => {
+    if (rec._gpEnrichmentFresh) stats.enriched += 1;
+    if (rec.result1A === '✅ 通过（主池）' || rec.result1A === '✅ 通过（对照预留）') stats.pass1A += 1;
+    else if (rec.result1A === '❌ 排除') stats.excluded1A += 1;
+    else if (rec.result1A === '⚠ 数据异常') stats.anomaly += 1;
+    const type = String(rec.firstRoundType || '');
+    if (type.indexOf('🔥') >= 0) stats.trend += 1;
+    else if (type === '🟡 Trend Watch') stats.p2Trend += 1;
+    else if (type === '🟢 Early Watch') stats.p2Early += 1;
+    else if (type.indexOf('🌱') >= 0 || type.indexOf('Early') >= 0) stats.early += 1;
+    else if (type.indexOf('🏢') >= 0 || type.indexOf('对照') >= 0) stats.control += 1;
+    else if (type.indexOf('⚪') >= 0 || type.indexOf('低优先级') >= 0) stats.low += 1;
+    if (isDailyCandidateSnapshotRecord_(rec)) stats.candidates += 1;
+  });
+  return stats;
+}
+
+function g010RunMetrics_(state, runContext, startedAt, runStartedAt) {
+  const stats = runContext && runContext.stats ? runContext.stats : g010LoadRunStats_();
+  const rawTotal = runContext ? runContext.rawRecords.length : 0;
+  const eligibleTotal = runContext ? runContext.eligible.length : 0;
+  const processed = Math.max(0, Number(state.enrichmentCursor || 0));
+  const runStart = Number(runStartedAt || state.runStartedAt || startedAt.getTime());
+  return {
+    rawTotal: rawTotal,
+    rawPersisted: rawTotal,
+    ledgerAppended: Math.max(0, Number(state.ledgerAppended || 0)),
+    ledgerDuplicates: Math.max(0, Number(state.ledgerDuplicates || 0)),
+    ledgerWriteFailures: Math.max(0, Number(state.ledgerWriteFailures || 0)),
+    historyExcluded: runContext ? runContext.historyExcluded : 0,
+    eligibleTotal: eligibleTotal,
+    enrichmentProcessed: processed,
+    enrichmentTotal: eligibleTotal,
+    controlSampleRequested: runContext && runContext.controls ? runContext.controls.length : 0,
+    controlSampleComplete: runContext && runContext.controls ? runContext.controls.filter(rec => rec._gpEnrichmentFresh).length : 0,
+    controlSampleFailed: runContext && runContext.controls ? runContext.controls.filter(rec => rec._gpEnrichmentFailed && !rec._gpEnrichmentFresh).length : 0,
+    pass1A: stats.pass1A,
+    excluded1A: stats.excluded1A,
+    trend: stats.trend,
+    early: stats.early,
+    control: stats.control,
+    low: stats.low,
+    anomaly: stats.anomaly,
+    candidates: stats.candidates,
+    p2Trend: stats.p2Trend,
+    p2Early: stats.p2Early,
+    historyInsufficient: stats.historyInsufficient,
+    gpCacheHits: stats.cacheHits,
+    gpRealtimeRequests: stats.realtimeRequests,
+    gpRealtimeSuccess: stats.realtimeSuccess,
+    gpRateLimited: stats.rateLimited,
+    gpFailuresKept: stats.failuresKept,
+    elapsedSec: Math.max(0, Math.round((Date.now() - runStart) / 1000)),
+    phase: state.phase,
+    cursor: processed,
+    discoveryComplete: !!state.discoveryComplete,
+    segmentCount: Math.max(1, Number(state.segmentCount || 1))
+  };
+}
+
+function g010FormatCheckpointDetail_(state, metrics) {
+  return [
+    'G010 checkpoint',
+    'runId=' + (state.runId || ''),
+    'phase=' + (state.phase || ''),
+    'runDate=' + (state.runDate || ''),
+    'discovery=' + (metrics.discoveryComplete ? 'complete' : 'in-progress'),
+    g010FormatDiscoveryAudit_(state),
+    'raw=' + metrics.rawTotal,
+    'ledgerAppended=' + metrics.ledgerAppended,
+    'ledgerDuplicates=' + metrics.ledgerDuplicates,
+    'ledgerWriteFailures=' + metrics.ledgerWriteFailures,
+    'eligible=' + metrics.eligibleTotal,
+    'enrichment=' + metrics.enrichmentProcessed + '/' + metrics.enrichmentTotal,
+    'control=' + metrics.controlSampleComplete + '/' + metrics.controlSampleRequested + ' failed=' + metrics.controlSampleFailed,
+    'cursor=' + metrics.cursor,
+    'candidates=' + metrics.candidates,
+    '1A=' + metrics.pass1A,
+    'seg=' + metrics.segmentCount,
+    'wallSec=' + metrics.elapsedSec
+  ].join(' | ');
+}
+
+function g010FormatSuccessDetail_(state, metrics, completion) {
+  return [
+    completion && completion.status === 'SUCCESS' ? 'G010 DONE' : 'G010 INCOMPLETE',
+    'runId=' + (state.runId || ''),
+    g010FormatDiscoveryAudit_(state),
+    'raw=' + metrics.rawTotal,
+    'ledgerAppended=' + metrics.ledgerAppended,
+    'ledgerDuplicates=' + metrics.ledgerDuplicates,
+    'ledgerWriteFailures=' + metrics.ledgerWriteFailures,
+    'eligible=' + metrics.eligibleTotal,
+    'enriched=' + metrics.enrichmentProcessed + '/' + metrics.enrichmentTotal,
+    '1A=' + metrics.pass1A,
+    'excluded1A=' + metrics.excluded1A,
+    'trend=' + metrics.trend,
+    'early=' + metrics.early,
+    'control=' + metrics.control,
+    'low=' + metrics.low,
+    'p2Trend=' + metrics.p2Trend,
+    'p2Early=' + metrics.p2Early,
+    'candidates=' + metrics.candidates,
+    'seg=' + metrics.segmentCount,
+    'wallSec=' + metrics.elapsedSec,
+    completion && completion.issues && completion.issues.length
+      ? 'issues=' + completion.issues.join(',') : ''
+  ].filter(Boolean).join(' | ');
+}
+
+function g010FinalizeRun_(ss, state, runContext, startedAt, discoveryPartial) {
+  const completion = g010EvaluateRunCompletion_(state, runContext, discoveryPartial);
+  const finalStats = g010ComputeFinalStatsFromMaster_(ss, state.runId);
+  const metrics = g010RunMetrics_(state, runContext, startedAt, state.runStartedAt);
+  Object.assign(metrics, finalStats);
+  metrics.enrichmentProcessed = Math.max(metrics.enrichmentProcessed, metrics.eligibleTotal);
+  const snapshotResult = g010WriteFinalCandidateSnapshotFromMaster_(ss, state.runId, startedAt);
+  refreshTodayActionsFromCandidateDecisions_(ss, startedAt, state.runId, {});
+  metrics.candidates = Math.max(finalStats.candidates, Number(snapshotResult && snapshotResult.persisted || 0));
+  const historical = g022FinalizeHistoricalRun_(ss, state, runContext, metrics, completion, new Date(), {});
+  if (!historical.ok) {
+    completion.issues.push('HISTORICAL_FEATURE_WRITE_FAILED');
+    completion.status = 'PARTIAL';
+    g010WriteState_(state);
+    g010RearmContinuationForPhase_('ENRICHMENT');
+  }
+  const finalStatus = completion.status;
+  g010UpsertAuditRow_(ss, state, finalStatus, g010FormatSuccessDetail_(state, metrics, completion), metrics);
+  const driveExport = saveSteamMonitoringRaw_(state.runId, startedAt, ss.getId());
+  if (driveExport && (driveExport.skipped || driveExport.error)) {
+    metrics.driveExportWarning = String(driveExport.reason || driveExport.error || 'drive_export_skipped');
+  }
+  if (historical.ok) g010ClearState_();
+  return {status: finalStatus, runId: state.runId, metrics: metrics, completion: completion,
+    historical: historical, driveExport: driveExport};
+}
+
+function g010WriteFinalCandidateSnapshotFromMaster_(ss, runId, runTime) {
+  const sheet = ss.getSheetByName(HOTWORD_V2.sheets.master);
+  if (!sheet || sheet.getLastRow() < 2) return {persisted: 0};
+  const width = Math.max(sheet.getLastColumn(), HOTWORD_V2.masterHeaders.length);
+  const headers = sheet.getRange(1, 1, 1, width).getDisplayValues()[0];
+  const index = name => headers.indexOf(name);
+  const runCol = index('最近Run ID');
+  if (runCol < 0) return {persisted: 0};
+  const records = [];
+  sheet.getRange(2, 1, sheet.getLastRow() - 1, width).getValues().forEach(row => {
+    if (String(row[runCol] || '').trim() !== String(runId)) return;
+    const rec = {
+      appId: String(row[index('Steam App ID')] || '').trim(),
+      name: row[index('游戏名称')] || '',
+      priority: row[index('第一轮优先级')] || '',
+      firstRoundType: row[index('第一轮类型')] || '',
+      continueNext: row[index('进入下一步')] || '',
+      followers: row[index('Steam Followers')],
+      gain7d: row[index('Steam 7d Gain')],
+      growthRate: row[index('近似增长率')],
+      releaseStage: row[index('发布阶段')] || '',
+      releaseDate: row[index('Steam 发布日期')] || '',
+      daysToRelease: row[index('距发售天数')],
+      firstRoundReason: row[index('第一轮判定依据')] || ''
+    };
+    if (isDailyCandidateSnapshotRecord_(rec)) records.push(rec);
+  });
+  return writeDailyCandidateSnapshot_(ss, records, runTime, runId, {idempotency: 'run'});
+}
+
+function g010IsContinuationValid_(state, now, tz) {
+  if (!state || !state.runId) return false;
+  if (G010_ABANDON_RUN_IDS.indexOf(state.runId) >= 0) return false;
+  if (String(state.phase || '').toUpperCase() === 'DONE') return false;
+  if (state.phase === 'DISCOVERY' && Number(state.nextPage || 1) > G010_DISCOVERY_MAX_PAGES) return false;
+  const todayKey = g010RunDateKey_(now, tz);
+  if (state.runDate && state.runDate !== todayKey) return false;
+  const updatedAt = Number(state.updatedAt || 0);
+  if (updatedAt > 0 && now.getTime() - updatedAt > G010_CONTINUATION_TTL_MS) return false;
+  return true;
+}
+
+function g010ContinuationOwnsActiveRun_(state) {
+  const active = g010ReadState_();
+  return !!(state && state.runId && active && active.runId === state.runId);
+}
+
+function g010AbandonState_(ss, state, reason) {
+  if (!state) return;
+  try {
+    g010UpsertAuditRow_(ss, state, 'ABANDONED',
+      'G010 continuation abandoned; reason=' + reason +
+      ' | runDate=' + (state.runDate || '') +
+      ' | source=' + (state.source || '') +
+      ' | nextPage=' + state.nextPage);
+  } catch (auditErr) {
+    // Abandon must still clear stale ScriptProperties even if audit write fails.
+  }
+  g010ClearState_();
+}
+
+function g010ClearLegacySourceContinuations_() {
+  const props = PropertiesService.getScriptProperties();
+  props.getKeys().forEach(key => {
+    if (/^STEAM_SOURCE_CONTINUATION_V1_/i.test(String(key))) props.deleteProperty(key);
+  });
+}
+
+function g010ClearStaleContinuation_(ss, tz, now) {
+  g010ClearLegacySourceContinuations_();
+  const state = g010ReadState_();
+  if (!state) return null;
+  const reasons = [];
+  if (G010_ABANDON_RUN_IDS.indexOf(state.runId) >= 0) reasons.push('explicit-abandon-list');
+  if (state.runDate && state.runDate !== g010RunDateKey_(now, tz)) reasons.push('cross-day');
+  if (state.phase === 'DISCOVERY' && Number(state.nextPage || 1) > G010_DISCOVERY_MAX_PAGES) {
+    reasons.push('deep-pagination-nextPage=' + state.nextPage);
+  }
+  const updatedAt = Number(state.updatedAt || 0);
+  if (updatedAt > 0 && now.getTime() - updatedAt > G010_CONTINUATION_TTL_MS) reasons.push('ttl-expired');
+  if (!reasons.length) return state;
+  g010AbandonState_(ss, state, reasons.join(';'));
+  return null;
 }
 
 function g010ClearState_() {
@@ -2408,7 +3180,7 @@ function g010ScheduleContinuation_(delayMs) {
   triggers.slice(1).forEach(trigger => ScriptApp.deleteTrigger(trigger));
   if (!triggers.length) {
     ScriptApp.newTrigger(G010_CONTINUATION_HANDLER).timeBased()
-      .after(Math.max(60 * 1000, Number(delayMs || 0))).create();
+      .after(Math.max(30 * 1000, Number(delayMs || 0))).create();
   }
 }
 
@@ -2419,18 +3191,22 @@ function g010RearmContinuation_(delayMs) {
   // Create first. If Apps Script rejects creation, the old trigger remains
   // available and the PARTIAL run is still recoverable.
   ScriptApp.newTrigger(G010_CONTINUATION_HANDLER).timeBased()
-    .after(Math.max(60 * 1000, Number(delayMs || 0))).create();
+      .after(Math.max(30 * 1000, Number(delayMs || 0))).create();
   oldTriggers.forEach(trigger => ScriptApp.deleteTrigger(trigger));
   return true;
 }
 
-function g010EnsureContinuationTrigger_() {
+function g010EnsureContinuationTrigger_(phase) {
   const triggers = ScriptApp.getProjectTriggers().filter(trigger =>
     trigger.getHandlerFunction() === G010_CONTINUATION_HANDLER
   );
-  const action = g010ContinuationTriggerAction_(g010ReadState_() && g010ReadState_().phase, triggers.length);
-  if (action === 'CREATE') g010ScheduleContinuation_(60 * 1000);
+  const action = g010ContinuationTriggerAction_(phase || (g010ReadState_() && g010ReadState_().phase), triggers.length);
+  if (action === 'CREATE') g010ScheduleContinuation_(g010ContinuationDelayMs_(phase));
   else if (action === 'REMOVE_DUPLICATES') triggers.slice(1).forEach(trigger => ScriptApp.deleteTrigger(trigger));
+}
+
+function g010RearmContinuationForPhase_(phase) {
+  g010RearmContinuation_(g010ContinuationDelayMs_(phase));
 }
 
 function g010ContinuationTriggerAction_(phase, triggerCount) {
@@ -2499,9 +3275,9 @@ function restoreG010CurrentRun() {
   return {ok: true, runId: targetRunId, rawCount: rawRecords.length, source: targetSource, nextPage: targetPage};
 }
 
-/** Temporary operator action: stop only the confirmed G010 production Run. */
+/** Temporary operator action: stop only the confirmed stale G010 production Run. */
 function stopG010CurrentRun() {
-  const targetRunId = '20260830-142107';
+  const targetRunId = '20260831-084334';
   const state = g010ReadState_();
   if (!state || state.runId !== targetRunId) {
     const message = '未停止：当前 G010 state 不匹配目标 Run ' + targetRunId;
@@ -2517,7 +3293,7 @@ function stopG010CurrentRun() {
   g010ClearState_();
   SpreadsheetApp.getUi().alert(
     'G010 当前 Run 已停止\nRun ID: ' + targetRunId +
-    '\n状态: STOPPED / PARTIAL_VALIDATED\nRaw Observation 已保留，未继续抓取 page57。'
+    '\n状态: STOPPED\nStale continuation 已清除；Raw Observation 已保留。'
   );
   return {ok: true, runId: targetRunId, status: 'STOPPED', validation: 'PARTIAL_VALIDATED'};
 }
@@ -2563,13 +3339,44 @@ function inspectOrRestoreG010Continuation() {
     health: health.health, repaired: repaired};
 }
 
-function g010UpsertAuditRow_(ss, state, status, detail) {
+function g010UpsertAuditRow_(ss, state, status, detail, metrics) {
   const sheet = ss.getSheetByName(HOTWORD_V2.sheets.log);
   if (!sheet) return;
   const width = Math.max(sheet.getLastColumn(), HOTWORD_V2.logHeaders.length);
   const headers = sheet.getRange(1, 1, 1, width).getDisplayValues()[0];
   const runCol = headers.indexOf('Run ID');
   if (runCol < 0) return;
+  const m = metrics || {};
+  const rowValues = Array(HOTWORD_V2.logHeaders.length).fill('');
+  rowValues[0] = new Date();
+  rowValues[1] = state.runId;
+  rowValues[2] = status;
+  rowValues[3] = m.rawTotal != null ? m.rawTotal : '';
+  rowValues[4] = m.historyExcluded != null ? m.historyExcluded : '';
+  rowValues[5] = m.enrichmentProcessed != null ? m.enrichmentProcessed : '';
+  rowValues[6] = m.pass1A != null ? m.pass1A : '';
+  rowValues[7] = m.excluded1A != null ? m.excluded1A : '';
+  rowValues[8] = m.trend != null ? m.trend : '';
+  rowValues[9] = m.early != null ? m.early : '';
+  rowValues[10] = m.control != null ? m.control : '';
+  rowValues[11] = m.low != null ? m.low : '';
+  rowValues[12] = m.anomaly != null ? m.anomaly : '';
+  rowValues[13] = m.actionCount != null ? m.actionCount : '';
+  rowValues[14] = m.elapsedSec != null ? m.elapsedSec : '';
+  rowValues[15] = detail || '';
+  rowValues[16] = m.rawTotal != null ? m.rawTotal : '';
+  rowValues[17] = m.rawPersisted != null ? m.rawPersisted : (m.rawTotal != null ? m.rawTotal : '');
+  rowValues[18] = m.eligibleTotal != null ? m.eligibleTotal : '';
+  rowValues[19] = 'G010 resumable; phase=' + (state.phase || '') + '; cursor=' + (state.enrichmentCursor || 0);
+  rowValues[20] = m.p2Trend != null ? m.p2Trend : '';
+  rowValues[21] = m.p2Early != null ? m.p2Early : '';
+  rowValues[22] = m.historyInsufficient != null ? m.historyInsufficient : '';
+  rowValues[23] = m.gpCacheHits != null ? m.gpCacheHits : '';
+  rowValues[24] = m.gpRealtimeRequests != null ? m.gpRealtimeRequests : '';
+  rowValues[25] = m.gpRealtimeSuccess != null ? m.gpRealtimeSuccess : '';
+  rowValues[26] = m.gpRateLimited != null ? m.gpRateLimited : '';
+  rowValues[27] = m.gpFailuresKept != null ? m.gpFailuresKept : '';
+
   let rowNumber = 0;
   if (sheet.getLastRow() >= 2) {
     const rows = sheet.getRange(2, runCol + 1, sheet.getLastRow() - 1, 1).getDisplayValues();
@@ -2580,15 +3387,10 @@ function g010UpsertAuditRow_(ss, state, status, detail) {
     });
   }
   if (!rowNumber) {
-    const row = Array(HOTWORD_V2.logHeaders.length).fill(0);
-    row[0] = new Date(); row[1] = state.runId; row[2] = status;
-    row[15] = detail || ''; row[19] = 'resumable';
-    sheet.appendRow(row);
+    sheet.appendRow(rowValues);
     return;
   }
-  sheet.getRange(rowNumber, 1).setValue(new Date());
-  sheet.getRange(rowNumber, 3).setValue(status);
-  sheet.getRange(rowNumber, 16).setValue(detail || '');
+  sheet.getRange(rowNumber, 1, 1, rowValues.length).setValues([rowValues]);
 }
 
 function g010ShouldYield_(startedAtMs, nowMs) {
@@ -2601,6 +3403,8 @@ function g010ContinuationState_(state) {
 
 function g010NextDiscoveryState_(state, sourceIndex, sourceCount) {
   const next = Object.assign({}, state);
+  next.consecutiveNoNew = 0;
+  next.updatedAt = Date.now();
   if (sourceIndex + 1 < sourceCount) {
     next.source = HOTWORD_V2.sources[sourceIndex + 1].name;
     next.nextPage = 1;
@@ -2609,6 +3413,7 @@ function g010NextDiscoveryState_(state, sourceIndex, sourceCount) {
     next.source = '';
     next.nextPage = 1;
     next.enrichmentCursor = 0;
+    next.discoveryComplete = true;
   }
   return next;
 }
@@ -2633,8 +3438,29 @@ function g010DiscoveryFailureRecovery_(state, error) {
   };
 }
 
+/** Scheduled/menu entry: resume an unfinished run; otherwise start one. */
+function runSteamHotwordDaily_() {
+  return runSteamHotword01B({scheduledDaily: true});
+}
+
 function runG010Continuation_() {
-  return runSteamHotword01B();
+  return runSteamHotword01B({fromContinuation: true});
+}
+
+/** Resume the active G010 run once (continuation segment). */
+function g010ContinueActiveRunOnce_() {
+  return runG010Continuation_();
+}
+
+function g010MaybeKickPartialRun_() {
+  const state = g010ReadState_();
+  if (!state || String(state.phase || '').toUpperCase() !== 'ENRICHMENT') return {kicked: false};
+  const triggers = ScriptApp.getProjectTriggers().filter(trigger =>
+    trigger.getHandlerFunction() === G010_CONTINUATION_HANDLER
+  );
+  if (triggers.length) return {kicked: false, triggerCount: triggers.length};
+  g010RearmContinuationForPhase_(state.phase);
+  return {kicked: true, runId: state.runId, enrichmentCursor: state.enrichmentCursor};
 }
 
 function g010RawRecordsForRun_(ss, runId) {
@@ -2698,6 +3524,119 @@ function g010PreviousRawIndex_(ss, runId) {
   return result;
 }
 
+/** Stable raw-observation identity: one Steam source observation per Run + App ID. */
+function g010HistoricalRawObservationId_(runId, appId, source) {
+  return ['steam', String(runId || '').trim(), String(appId || '').trim(), String(source || '').trim()]
+    .join('|');
+}
+
+function g010HistoricalRawSourcePage_(rec, source) {
+  if (rec && rec.sourcePage != null && rec.sourcePage !== '') {
+    const direct = String(rec.sourcePage);
+    if (isFinite(Number(direct))) return Number(direct);
+    const matched = direct.split(' + ').find(value => String(value).indexOf(String(source || '') + '#') === 0);
+    if (matched) return Number(String(matched).slice(String(source || '').length + 1));
+  }
+  const prefix = String(source || '') + '#';
+  const sourcePages = rec && rec.sourcePages ? rec.sourcePages : [];
+  for (let i = 0; i < sourcePages.length; i += 1) {
+    const value = String(sourcePages[i] || '');
+    if (value.indexOf(prefix) === 0) return Number(value.slice(prefix.length));
+  }
+  return '';
+}
+
+function g010HistoricalRawSourceRank_(rec, source) {
+  if (rec && rec.sourceRank != null && rec.sourceRank !== '') {
+    const direct = String(rec.sourceRank);
+    if (isFinite(Number(direct))) return Number(direct);
+    const matched = direct.split(' + ').find(value => String(value).indexOf(String(source || '') + '#') === 0);
+    if (matched) return Number(String(matched).slice(String(source || '').length + 1));
+  }
+  const prefix = String(source || '') + '#';
+  const ranks = rec && rec.ranks ? rec.ranks : [];
+  for (let i = 0; i < ranks.length; i += 1) {
+    const value = String(ranks[i] || '');
+    if (value.indexOf(prefix) === 0) return Number(value.slice(prefix.length));
+  }
+  return '';
+}
+
+function g010EnsureHistoricalRawLedger_() {
+  const config = HOTWORD_V2.historicalRawLedger;
+  const props = PropertiesService.getScriptProperties();
+  let id = String(props.getProperty(config.propertyKey) || config.spreadsheetId || '').trim();
+  let ledger;
+  if (id) {
+    ledger = SpreadsheetApp.openById(id);
+  } else {
+    ledger = SpreadsheetApp.create(config.spreadsheetName);
+    id = ledger.getId();
+    props.setProperty(config.propertyKey, id);
+  }
+  const sheet = ensureSheetWithHeaders_(ledger, config.sheetName, config.headers);
+  const actual = sheet.getRange(1, 1, 1, config.headers.length).getDisplayValues()[0];
+  config.headers.forEach((header, index) => {
+    if (String(actual[index] || '').trim() !== header) {
+      throw new Error('Historical Raw Ledger schema mismatch at column ' + (index + 1) + ': expected ' + header);
+    }
+  });
+  sheet.setFrozenRows(1);
+  return {spreadsheet: ledger, sheet: sheet, id: id, url: ledger.getUrl()};
+}
+
+function g010HistoricalRawLedgerRow_(rec, runTime, runId, source) {
+  const config = HOTWORD_V2.historicalRawLedger;
+  const sourceRank = g010HistoricalRawSourceRank_(rec, source);
+  const provenance = [
+    'provider=Steam Store Search',
+    'source=' + String(source || ''),
+    'page=' + String(g010HistoricalRawSourcePage_(rec, source) || ''),
+    'rank=' + String(sourceRank || ''),
+    'source_url=' + String(rec && rec.url || '')
+  ].join('; ');
+  return [
+    g010HistoricalRawObservationId_(runId, rec.appId, source), runTime,
+    runId, String(runId || '').slice(0, 8), String(rec.appId || ''), rec.name || '', rec.url || '',
+    source || '', g010HistoricalRawSourcePage_(rec, source), sourceRank,
+    rec.releaseDate || '', rec.releaseRaw || '', rec.releaseStage || '', rec.daysToRelease,
+    rec.followers, rec.baselineFollowers, rec.gain7d, rec.growthRate,
+    rec.reviews, rec.positiveReviews, rec.rating, rec.dataStatus || 'RAW_CAPTURED',
+    rec.rawStatus || 'RAW_ONLY', 'Steam Store Search', provenance, config.schemaVersion
+  ];
+}
+
+/** Append-only batch writer. It only examines identities from the current Run. */
+function g010AppendHistoricalRawLedger_(records, runTime, runId) {
+  const ledger = g010EnsureHistoricalRawLedger_();
+  const headers = HOTWORD_V2.historicalRawLedger.headers;
+  const idColumn = headers.indexOf('Observation ID');
+  const runColumn = headers.indexOf('Run ID');
+  const existing = new Set();
+  const sheet = ledger.sheet;
+  if (sheet.getLastRow() >= 2) {
+    const rowCount = sheet.getLastRow() - 1;
+    const values = sheet.getRange(2, 1, rowCount, Math.max(idColumn, runColumn) + 1).getDisplayValues();
+    values.forEach(row => {
+      if (String(row[runColumn] || '').trim() === String(runId)) existing.add(String(row[idColumn] || '').trim());
+    });
+  }
+  const rows = [];
+  let duplicates = 0;
+  (records || []).forEach(rec => {
+    const source = String(rec.source || (rec.sources && rec.sources[0]) || '').trim();
+    const observationId = g010HistoricalRawObservationId_(runId, rec.appId, source);
+    if (!rec.appId || !source || existing.has(observationId)) {
+      duplicates += 1;
+      return;
+    }
+    existing.add(observationId);
+    rows.push(g010HistoricalRawLedgerRow_(rec, runTime, runId, source));
+  });
+  if (rows.length) sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, headers.length).setValues(rows);
+  return {appended: rows.length, duplicates: duplicates, spreadsheetId: ledger.id, spreadsheetUrl: ledger.url};
+}
+
 function g010AppendRawPage_(ss, records, runTime, runId) {
   const sheet = ss.getSheetByName(HOTWORD_V2.sheets.snapshot);
   const width = Math.max(sheet.getLastColumn(), HOTWORD_V2.snapshotHeaders.length);
@@ -2725,15 +3664,16 @@ function g010AppendRawPage_(ss, records, runTime, runId) {
   return {persisted: unique.length, rowByAppId: rowByAppId};
 }
 
-function g010EnrichChunk_(ss, records, runId, runTime, warnings) {
+function g010EnrichChunk_(ss, records, runId, runTime, warnings, runContext) {
   if (!records.length) return;
-  const rules = loadRules_(ss);
+  const rules = runContext && runContext.rules ? runContext.rules : loadRules_(ss);
   const gpKey = getGamesPopularityApiKey_();
-  const gpStats = {cacheHits: 0, realtimeRequests: 0, realtimeSuccess: 0, rateLimited: 0, failuresKept: 0};
-  const cache = readDailyGamesPopularityCache_(ss, runTime);
+  const gpStats = runContext && runContext.stats ? runContext.stats : g010EmptyRunStats_();
+  const cache = runContext && runContext.gpCache ? runContext.gpCache : readDailyGamesPopularityCache_(ss, runTime);
   const partition = partitionDailyGamesPopularityCache_(records, cache);
   partition.hits.forEach(rec => { rec._gpDailyCache = cache.get(String(rec.appId)); });
-  const context = {ss: ss, runId: runId, runTime: runTime, refreshReason: 'POLICY_MISS'};
+  gpStats.cacheHits = Number(gpStats.cacheHits || 0) + partition.hits.length;
+  const context = {ss: ss, runId: runId, runTime: runTime, refreshReason: 'POLICY_MISS', attemptBuffer: []};
   const latestMap = fetchGamesPopularityLatestBatch_(partition.misses, gpKey, warnings, gpStats, context);
   records.forEach(rec => {
     if (rec._gpDailyCache) {
@@ -2764,6 +3704,7 @@ function g010EnrichChunk_(ss, records, runId, runTime, warnings) {
     rec.rating = summary.totalReviews > 0 ? summary.totalPositive / summary.totalReviews : null;
   });
   const history = fetchGamesPopularityFollowersBatch_(partition.misses, gpKey, warnings, gpStats, context);
+  flushGamesPopularityAttempts_(context);
   const pass1A = [];
   records.forEach(rec => {
     const result = classify1A_(rec, rules);
@@ -2799,18 +3740,35 @@ function g010EnrichChunk_(ss, records, runId, runTime, warnings) {
   });
   upsertMaster_(ss, records, runTime, runId, gpStats);
   const refs = {}; records.forEach(rec => { refs[rec.appId] = rec._g010RawRowNumber; });
-  updateSnapshots_(ss, records.filter(rec => rec._gpEnrichmentFresh), runTime, runId, refs);
-  writeDailyCandidateSnapshot_(ss, records, runTime, runId);
+  updateSnapshots_(ss, records.filter(rec => rec._gpEnrichmentFresh), runTime, runId, refs, true);
+  if (runContext) {
+    runContext.stats = gpStats;
+    g010AccumulateChunkStats_(runContext.stats, records);
+    partition.hits.forEach(rec => {
+      if (rec._gpEnrichmentFresh && rec.appId) {
+        cache.set(String(rec.appId), {
+          observedAt: runTime,
+          followers: rec.followers,
+          baselineFollowers: rec.baselineFollowers,
+          gain7d: rec.gain7d,
+          growthRate: rec.growthRate,
+          coverageDays: rec.coverageDays
+        });
+      }
+    });
+    runContext.gpCache = cache;
+  }
 }
 
-function runSteamHotword01B() {
+function runSteamHotword01B(options) {
+  options = options || {};
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(5000)) {
     const lockedState = g010ReadState_();
     if (lockedState) {
       try {
         const lockedSheet = SpreadsheetApp.openById(QUALIFICATION_ELIGIBILITY_PRODUCTION_SHEET_ID);
-        g010EnsureContinuationTrigger_();
+        g010EnsureContinuationTrigger_(lockedState.phase);
         g010UpsertAuditRow_(lockedSheet, lockedState, 'PARTIAL', 'G010 lock busy; continuation rechecked');
       } catch (lockErr) {
         // The owner execution remains responsible for its PARTIAL audit.
@@ -2826,32 +3784,146 @@ function runSteamHotword01B() {
   const ss = SpreadsheetApp.openById(QUALIFICATION_ELIGIBILITY_PRODUCTION_SHEET_ID);
   const tz = ss.getSpreadsheetTimeZone();
   const warnings = [];
-  let state = g010ReadState_();
-  if (!state) {
-    state = {runId: Utilities.formatDate(startedAt, tz, 'yyyyMMdd-HHmmss'), phase: 'DISCOVERY',
-      source: HOTWORD_V2.sources[0].name, nextPage: 1, enrichmentCursor: 0};
-    g010WriteState_(state);
-  }
+  let discoveryPartial = false;
+  let state = null;
+  let runContext = null;
+  let auditMetrics = function () {
+    return {rawTotal: 0, eligibleTotal: 0, enrichmentProcessed: 0, enrichmentTotal: 0, candidates: 0, elapsedSec: 0, cursor: 0, phase: ''};
+  };
   try {
-    setupSteamHotwordV2();
-    g010UpsertAuditRow_(ss, state, state.enrichmentCursor || state.nextPage > 1 ? 'PARTIAL' : 'RUNNING',
-      'G010 phase=' + state.phase + ' source=' + state.source + ' nextPage=' + state.nextPage +
-      ' enrichmentCursor=' + state.enrichmentCursor);
+    if (options.forceNewRun) {
+      const stale = g010ReadState_();
+      if (stale) g010AbandonState_(ss, stale, options.scheduledDaily ? 'scheduled-daily-new-run' : 'forced-new-run');
+      g010ClearLegacySourceContinuations_();
+    } else if (options.fromContinuation) {
+      state = g010ReadState_();
+      if (state && !g010IsContinuationValid_(state, startedAt, tz)) {
+        g010AbandonState_(ss, state, 'continuation-invalid-on-resume');
+        state = null;
+      }
+    } else {
+      state = g010ClearStaleContinuation_(ss, tz, startedAt);
+      if (!state) state = g010ReadState_();
+      if (state && !g010IsContinuationValid_(state, startedAt, tz)) {
+        g010AbandonState_(ss, state, 'stale-on-manual-run');
+        state = null;
+      }
+    }
+    if (!state) {
+      state = g010NewRunState_(startedAt, tz);
+      state = g010BumpSegmentCount_(state, {forceNewRun: true});
+      g010WriteState_(state);
+      g010SaveRunStats_(g010EmptyRunStats_());
+    } else {
+      state = g010BumpSegmentCount_(state, options);
+      if (!state.runStartedAt) state.runStartedAt = startedAt.getTime();
+      g010WriteState_(state);
+    }
+    ensureSteamHotwordV2ForRun_(ss, {fullSetup: false});
+    if (state && !options.forceNewRun && (state.phase === 'ENRICHMENT' || Number(state.enrichmentCursor) > 0)) {
+      const pendingTriggers = ScriptApp.getProjectTriggers().filter(trigger =>
+        trigger.getHandlerFunction() === G010_CONTINUATION_HANDLER
+      );
+      if (!pendingTriggers.length) g010RearmContinuationForPhase_(state.phase);
+    }
+    auditMetrics = function () {
+      if (!runContext && (state.phase === 'ENRICHMENT' || state.enrichmentCursor > 0 || state.controlCursor > 0 || state.phase === 'ELIGIBILITY')) {
+        runContext = g010BuildRunContext_(ss, state, startedAt, tz);
+      } else if (!runContext && state.phase === 'DISCOVERY' && state.nextPage > 1) {
+        const rawOnly = g010RawRecordsForRun_(ss, state.runId);
+        return g010RunMetrics_(state, {
+          rawRecords: rawOnly, eligible: [], historyExcluded: 0, stats: g010EmptyRunStats_()
+        }, startedAt, state.runStartedAt);
+      }
+      return g010RunMetrics_(state, runContext, startedAt, state.runStartedAt);
+    };
+    const checkpointStatus = state.enrichmentCursor || state.nextPage > 1 || state.phase !== 'DISCOVERY' ? 'PARTIAL' : 'RUNNING';
+    g010UpsertAuditRow_(ss, state, checkpointStatus, g010FormatCheckpointDetail_(state, auditMetrics()), auditMetrics());
     while (!g010ShouldYield_(startedAt.getTime(), Date.now()) && Date.now() < deadline) {
+      if (options.fromContinuation && !g010ContinuationOwnsActiveRun_(state)) {
+        return {status: 'SKIPPED', runId: state.runId, reason: 'stale-continuation-not-active-run'};
+      }
       if (state.phase === 'DISCOVERY') {
         const sourceIndex = HOTWORD_V2.sources.findIndex(source => source.name === state.source);
         if (sourceIndex < 0) throw new Error('Unknown G010 source: ' + state.source);
         const source = HOTWORD_V2.sources[sourceIndex];
-        const fetched = fetchSteamSearchPageReliable_(source.name,
-          state.nextPage === 1 ? source.url : source.url + '&page=' + state.nextPage,
-          state.nextPage, warnings);
-        const items = parseSteamSearchResults_(fetched.body);
-        if (!items.length) {
-          if (sourceIndex + 1 < HOTWORD_V2.sources.length) {
-            state = g010NextDiscoveryState_(state, sourceIndex, HOTWORD_V2.sources.length); g010WriteState_(state); continue;
-          }
-          state = g010NextDiscoveryState_(state, sourceIndex, HOTWORD_V2.sources.length); g010WriteState_(state); continue;
+        if (state.nextPage > G010_DISCOVERY_MAX_PAGES) {
+          g010FinishDiscoverySource_(state, state.source, 'max-pages');
+          g010ClearPageRetryState_(state);
+          state = g010NextDiscoveryState_(state, sourceIndex, HOTWORD_V2.sources.length);
+          g010WriteState_(state);
+          continue;
         }
+        if (Number(state.nextRetryAt || 0) > Date.now()) break;
+        const url = state.nextPage === 1
+          ? source.url
+          : source.url + (source.url.indexOf('?') >= 0 ? '&' : '?') + 'page=' + state.nextPage;
+        let fetched;
+        if (options.fromContinuation && !g010ContinuationOwnsActiveRun_(state)) {
+          return {status: 'SKIPPED', runId: state.runId, reason: 'stale-continuation-before-fetch'};
+        }
+        let usedCacheFallback = false;
+        let ledgerErrorMessage = '';
+        try {
+          fetched = fetchSteamSearchPageReliable_(source.name, url, state.nextPage, warnings);
+        } catch (err) {
+          const message = String(err && err.message || err || '');
+          if (g010DiscoveryFetchErrorRetryable_(err)) {
+            const cachedPage = g010LoadCachedDiscoveryPage_(source.name, state.nextPage, Date.now());
+            if (cachedPage && cachedPage.items.length) {
+              fetched = {body: '', cachedItems: cachedPage.items, fromCache: true};
+              usedCacheFallback = true;
+              discoveryPartial = true;
+              warnings.push('G010 discovery cache fallback; source=' + state.source +
+                ' page=' + state.nextPage + ' cacheAgeMs=' + cachedPage.cacheAgeMs);
+            } else {
+              const recovery = g010DiscoveryFetchRecovery_(state, startedAt, err);
+              state = recovery.state;
+              g010WriteState_(state);
+              if (recovery.action === 'YIELD') {
+                g010UpsertAuditRow_(ss, state, 'PARTIAL',
+                  'G010 discovery page retry scheduled; source=' + state.source +
+                  ' page=' + state.nextPage + ' attempt=' + state.pageRetryCount +
+                  ' | ' + message + ' | ' + g010FormatDiscoveryAudit_(state));
+                break;
+              }
+              discoveryPartial = true;
+              g010FinishDiscoverySource_(state, state.source, 'fetch-failure-exhausted');
+              g010ClearPageRetryState_(state);
+              g010UpsertAuditRow_(ss, state, 'PARTIAL',
+                'G010 discovery fetch recovery exhausted; source=' + state.source +
+                ' page=' + state.nextPage + ' reason=' + (recovery.reason || 'exhausted') +
+                ' | ' + message + ' | ' + g010FormatDiscoveryAudit_(state));
+              state = g010NextDiscoveryState_(state, sourceIndex, HOTWORD_V2.sources.length);
+              g010WriteState_(state);
+              continue;
+            }
+          } else {
+            discoveryPartial = true;
+            g010FinishDiscoverySource_(state, state.source, 'fetch-failure');
+            g010ClearPageRetryState_(state);
+            g010UpsertAuditRow_(ss, state, 'PARTIAL',
+              'G010 discovery non-retryable fetch failure; source=' + state.source +
+              ' page=' + state.nextPage + ' | ' + message + ' | ' + g010FormatDiscoveryAudit_(state));
+            state = g010NextDiscoveryState_(state, sourceIndex, HOTWORD_V2.sources.length);
+            g010WriteState_(state);
+            continue;
+          }
+        }
+        const items = usedCacheFallback && fetched.cachedItems
+          ? fetched.cachedItems
+          : parseSteamSearchResults_(fetched.body);
+        if (options.fromContinuation && !g010ContinuationOwnsActiveRun_(state)) {
+          return {status: 'SKIPPED', runId: state.runId, reason: 'stale-continuation-after-fetch'};
+        }
+        if (!items.length) {
+          g010FinishDiscoverySource_(state, state.source, state.nextPage === 1 ? 'empty-page-1' : 'empty-page');
+          g010ClearPageRetryState_(state);
+          state = g010NextDiscoveryState_(state, sourceIndex, HOTWORD_V2.sources.length);
+          g010WriteState_(state);
+          continue;
+        }
+        const seenAppIds = new Set(g010RawRecordsForRun_(ss, state.runId).map(rec => String(rec.appId)));
         const records = items.map((item, idx) => {
           item._sourceRank = (state.nextPage - 1) * 50 + idx + 1; item._sourcePage = state.nextPage;
           const rec = createCandidateRecord_({appId: String(item.appId), name: item.name, url: item.url,
@@ -2860,55 +3932,121 @@ function runSteamHotword01B() {
             reviewCount: item.reviewCount, reviewRating: item.reviewRating});
           fillReleaseStage_(rec, startedAt, tz); return rec;
         });
+        let newCount = 0;
+        records.forEach(rec => {
+          if (!seenAppIds.has(String(rec.appId))) newCount += 1;
+        });
+        // Canonical raw-history ownership is written before the compatible
+        // business snapshot.  If this external write fails, still persist the
+        // fetched page locally, advance the cursor, and make the failure
+        // authoritative in the run log rather than re-fetching discovery.
+        try {
+          if (options.fromContinuation && !g010ContinuationOwnsActiveRun_(state)) {
+            return {status: 'SKIPPED', runId: state.runId, reason: 'stale-continuation-before-raw-write'};
+          }
+          const ledgerResult = g010AppendHistoricalRawLedger_(records, startedAt, state.runId);
+          state.ledgerAppended = Math.max(0, Number(state.ledgerAppended || 0)) + ledgerResult.appended;
+          state.ledgerDuplicates = Math.max(0, Number(state.ledgerDuplicates || 0)) + ledgerResult.duplicates;
+        } catch (ledgerErr) {
+          state.ledgerWriteFailures = Math.max(0, Number(state.ledgerWriteFailures || 0)) + 1;
+          ledgerErrorMessage = String(ledgerErr && ledgerErr.message || ledgerErr || 'unknown');
+          warnings.push('RAW_LEDGER_WRITE_FAILED source=' + state.source +
+            ' page=' + state.nextPage + ' error=' + ledgerErrorMessage);
+        }
+        if (options.fromContinuation && !g010ContinuationOwnsActiveRun_(state)) {
+          return {status: 'SKIPPED', runId: state.runId, reason: 'stale-continuation-before-snapshot-write'};
+        }
         g010AppendRawPage_(ss, records, startedAt, state.runId);
-        state.nextPage += 1; g010WriteState_(state);
+        if (ledgerErrorMessage) {
+          const rawAfterFailure = g010RawRecordsForRun_(ss, state.runId);
+          g010UpsertAuditRow_(ss, state, 'PARTIAL',
+            'RAW_LEDGER_WRITE_FAILED source=' + state.source + ' page=' + state.nextPage +
+            ' (business raw persisted; discovery will not be repeated) | ' + ledgerErrorMessage,
+            g010RunMetrics_(state, {
+              rawRecords: rawAfterFailure, eligible: [], historyExcluded: 0, stats: g010EmptyRunStats_()
+            }, startedAt, state.runStartedAt));
+        }
+        g010RecordDiscoveryPage_(state, source.name, state.nextPage, items.length, newCount);
+        if (usedCacheFallback) {
+          const audit = g010InitDiscoveryAudit_(state);
+          if (audit.sources[source.name]) {
+            audit.sources[source.name].stopReason = 'cache-fallback-page-' + state.nextPage;
+          }
+        }
+        g010ClearPageRetryState_(state);
+        if (newCount === 0) {
+          state.consecutiveNoNew = Math.max(0, Number(state.consecutiveNoNew || 0)) + 1;
+        } else {
+          state.consecutiveNoNew = 0;
+        }
+        state.nextPage += 1;
+        state.updatedAt = Date.now();
+        g010WriteState_(state);
         continue;
       }
       if (state.phase === 'ELIGIBILITY') {
         state.phase = 'ENRICHMENT';
         state.enrichmentCursor = 0;
+        state.controlCursor = 0;
+        state.updatedAt = Date.now();
         g010WriteState_(state);
         continue;
       }
       if (state.phase === 'ENRICHMENT') {
-        const all = g010RawRecordsForRun_(ss, state.runId);
-        const previous = g010PreviousRawIndex_(ss, state.runId);
-        const qualification = readQualificationStateIndex_(ss);
-        const decisions = readCandidateDecisions_(ss);
-        const history = buildHistoryIndex_(ss);
-        const eligible = all.filter(rec => !isInHistoryIndex_(rec, history) && g010EnrichmentEligible_(evaluateQualificationEligibility_(rec, {
-          previousRaw: previous.get(rec.appId), qualification: qualification.get(rec.appId),
-          decision: decisions.get(rec.appId), now: startedAt, rules: loadRules_(ss)
-        })));
-        if (state.enrichmentCursor >= eligible.length) {
-          refreshTodayActionsFromCandidateDecisions_(ss, startedAt, state.runId, {});
-          g010UpsertAuditRow_(ss, state, 'SUCCESS', 'G010 DONE; rows=' + all.length + '; eligible=' + eligible.length);
-          saveSteamMonitoringRaw_(state.runId, startedAt);
-          g010ClearState_();
-          return {status: 'SUCCESS', runId: state.runId, eligible: eligible.length};
+        if (!runContext) runContext = g010BuildRunContext_(ss, state, startedAt, tz);
+        const eligible = runContext.eligible;
+        const controls = runContext.controls;
+        if (state.enrichmentCursor >= eligible.length && state.controlCursor >= controls.length) {
+          if (options.fromContinuation && !g010ContinuationOwnsActiveRun_(state)) {
+            return {status: 'SKIPPED', runId: state.runId, reason: 'stale-continuation-before-finalization'};
+          }
+          const result = g010FinalizeRun_(ss, state, runContext, startedAt, discoveryPartial);
+          return Object.assign({eligible: eligible.length, rawUnique: runContext.rawRecords.length, discoveryPartial: discoveryPartial}, result);
         }
-        const chunk = eligible.slice(state.enrichmentCursor, state.enrichmentCursor + 20);
-        g010EnrichChunk_(ss, chunk, state.runId, startedAt, warnings);
-        state.enrichmentCursor += chunk.length; g010WriteState_(state);
+        if (state.enrichmentCursor < eligible.length) {
+          const chunk = eligible.slice(state.enrichmentCursor, state.enrichmentCursor + G010_ENRICHMENT_CHUNK_SIZE);
+          g010EnrichChunk_(ss, chunk, state.runId, startedAt, warnings, runContext);
+          state.enrichmentCursor += chunk.length;
+        } else {
+          const chunk = controls.slice(state.controlCursor, state.controlCursor + G010_ENRICHMENT_CHUNK_SIZE);
+          g010EnrichControlChunk_(ss, chunk, state.runId, startedAt, warnings, runContext);
+          state.controlCursor += chunk.length;
+          state.controlData = state.controlData || {};
+          chunk.forEach(rec => { state.controlData[String(rec.appId)] = {
+            followers: rec.followers, baselineFollowers: rec.baselineFollowers, gain7d: rec.gain7d,
+            growthRate: rec.growthRate, coverageDays: rec.coverageDays,
+            _gpEnrichmentFresh: rec._gpEnrichmentFresh, _gpEnrichmentFailed: rec._gpEnrichmentFailed
+          }; });
+        }
+        state.updatedAt = Date.now();
+        g010WriteState_(state);
+        g010SaveRunStats_(runContext.stats);
+        g010UpsertAuditRow_(ss, state, 'PARTIAL', g010FormatCheckpointDetail_(state, g010RunMetrics_(state, runContext, startedAt, state.runStartedAt)),
+          g010RunMetrics_(state, runContext, startedAt, state.runStartedAt));
         continue;
       }
       throw new Error('Unknown G010 phase: ' + state.phase);
     }
     state = g010ContinuationState_(state);
-    g010WriteState_(state); g010EnsureContinuationTrigger_();
-    g010UpsertAuditRow_(ss, state, 'PARTIAL', 'G010 continuation phase=' + state.phase + ' source=' + state.source +
-      ' nextPage=' + state.nextPage + ' enrichmentCursor=' + state.enrichmentCursor);
+    state.updatedAt = Date.now();
+    g010WriteState_(state);
+    g010RearmContinuationForState_(state);
+    const yieldMetrics = auditMetrics();
+    g010UpsertAuditRow_(ss, state, 'PARTIAL', g010FormatCheckpointDetail_(state, yieldMetrics), yieldMetrics);
     return {status: 'PARTIAL', runId: state.runId, phase: state.phase, source: state.source, nextPage: state.nextPage, enrichmentCursor: state.enrichmentCursor};
   } catch (err) {
-    const recovery = g010DiscoveryFailureRecovery_(state, err);
-    const message = recovery.message;
-    g010WriteState_(recovery.state);
-    g010UpsertAuditRow_(ss, recovery.state, 'PARTIAL', 'G010 paused: ' + message + ' | phase=' + recovery.state.phase +
-      ' source=' + recovery.state.source + ' nextPage=' + recovery.state.nextPage);
-    if (recovery.retryable) {
-      g010ScheduleContinuation_(recovery.continuationDelayMs);
-      return {status: 'PARTIAL', runId: recovery.state.runId, phase: recovery.state.phase, source: recovery.state.source,
-        nextPage: recovery.state.nextPage, enrichmentCursor: recovery.state.enrichmentCursor, continuationDelayMs: recovery.continuationDelayMs};
+    const message = String(err && err.message || err || '');
+    if (state) {
+      state.updatedAt = Date.now();
+      g010WriteState_(state);
+      const metrics = auditMetrics();
+      g010UpsertAuditRow_(ss, state, 'PARTIAL',
+        'G010 paused: ' + message + ' | ' + g010FormatCheckpointDetail_(state, metrics), metrics);
+      if (g010IsContinuationValid_(state, startedAt, tz)) {
+        g010RearmContinuationForState_(state);
+        return {status: 'PARTIAL', runId: state.runId, phase: state.phase, source: state.source,
+          nextPage: state.nextPage, enrichmentCursor: state.enrichmentCursor, error: message};
+      }
     }
     throw err;
   } finally {
@@ -3562,8 +4700,28 @@ function fetchSteamSourcePagesLive_(source, fetchLogs) {
   const logs = Array.isArray(fetchLogs) ? fetchLogs : [];
   const props = PropertiesService.getScriptProperties();
   const continuationKey = steamSourceContinuationPropertyKey_(source.name);
-  const saved = Number(props.getProperty(continuationKey) || 1);
-  let page = Number.isFinite(saved) && saved > 0 ? Math.floor(saved) : 1;
+  const metaKey = continuationKey + '_META';
+  const metaRaw = props.getProperty(metaKey);
+  let page = 1;
+  if (metaRaw) {
+    try {
+      const meta = JSON.parse(metaRaw);
+      const todayKey = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyyMMdd');
+      if (meta && meta.runDate === todayKey && Number(meta.page) > 0 && Number(meta.page) <= G010_DISCOVERY_MAX_PAGES) {
+        page = Math.floor(Number(meta.page));
+      } else {
+        props.deleteProperty(continuationKey);
+        props.deleteProperty(metaKey);
+      }
+    } catch (metaErr) {
+      props.deleteProperty(continuationKey);
+      props.deleteProperty(metaKey);
+    }
+  } else {
+    const saved = Number(props.getProperty(continuationKey) || 1);
+    page = Number.isFinite(saved) && saved > 0 ? Math.floor(saved) : 1;
+    if (page > G010_DISCOVERY_MAX_PAGES) page = 1;
+  }
   const seenPageSignatures = new Set();
   const seenAppIds = new Set();
   const startedAtMs = Date.now();
@@ -3573,10 +4731,21 @@ function fetchSteamSourcePagesLive_(source, fetchLogs) {
   let consecutiveNoNewPages = 0;
 
   while (true) {
+    if (page > G010_DISCOVERY_MAX_PAGES) {
+      stopReason = 'max-pages';
+      props.deleteProperty(continuationKey);
+      props.deleteProperty(metaKey);
+      break;
+    }
     if (Date.now() - startedAtMs >= STEAM_DISCOVERY_RUNTIME_BUDGET_MS) {
       stopReason = 'runtime-budget';
       continuation = true;
       props.setProperty(continuationKey, String(page));
+      props.setProperty(metaKey, JSON.stringify({
+        runDate: Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyyMMdd'),
+        page: page,
+        savedAtMs: Date.now()
+      }));
       break;
     }
     // The base URL is used for page 1; later pages use the explicit cursor.
@@ -3592,8 +4761,8 @@ function fetchSteamSourcePagesLive_(source, fetchLogs) {
         /HTTP\s+(403|429|5\d\d)/i.test(String(err && err.message || err));
       if (!retryable) throw err;
       stopReason = 'temporary-fetch-failure:' + (err && err.httpStatus ? err.httpStatus : 'error');
-      continuation = true;
-      props.setProperty(continuationKey, String(page));
+      props.deleteProperty(continuationKey);
+      props.deleteProperty(metaKey);
       break;
     }
     const items = parseSteamSearchResults_(fetched.body);
@@ -3602,6 +4771,7 @@ function fetchSteamSourcePagesLive_(source, fetchLogs) {
       stopReason = page === 1 ? 'empty-page-1' : 'empty-page';
       if (page === 1) throw new Error(source.name + ' 第1页解析结果为0');
       props.deleteProperty(continuationKey);
+      props.deleteProperty(metaKey);
       break;
     }
 
@@ -3624,6 +4794,7 @@ function fetchSteamSourcePagesLive_(source, fetchLogs) {
       if (consecutiveNoNewPages >= 2) {
         stopReason = duplicatePage ? 'duplicate-page-2-pages' : 'no-new-appids-2-pages';
         props.deleteProperty(continuationKey);
+        props.deleteProperty(metaKey);
         break;
       }
     } else {
@@ -4445,14 +5616,29 @@ function fetchGamesPopularityFollowersBatch_(records, apiKey, warnings, stats, a
 }
 
 function appendGamesPopularityAttempt_(context, rec, endpoint, code, result, errorSummary) {
-  if (!context || !context.ss || !context.runId) return;
-  const sheet = context.ss.getSheetByName(HOTWORD_V2.sheets.externalDataAttempts);
-  if (!sheet) return;
-  sheet.appendRow([
+  if (!context || !context.runId) return;
+  const row = [
     context.runTime || new Date(), context.runId, 'Games Popularity', endpoint,
     String(rec && rec.appId || ''), String(rec && rec.name || ''),
     context.refreshReason || 'POLICY_MISS', Number(code || 0), result, errorSummary || ''
-  ]);
+  ];
+  if (context.attemptBuffer) {
+    context.attemptBuffer.push(row);
+    return;
+  }
+  if (!context.ss) return;
+  const sheet = context.ss.getSheetByName(HOTWORD_V2.sheets.externalDataAttempts);
+  if (!sheet) return;
+  sheet.appendRow(row);
+}
+
+function flushGamesPopularityAttempts_(context) {
+  if (!context || !context.ss || !context.attemptBuffer || !context.attemptBuffer.length) return 0;
+  const sheet = context.ss.getSheetByName(HOTWORD_V2.sheets.externalDataAttempts);
+  if (!sheet) return 0;
+  const rows = context.attemptBuffer.splice(0, context.attemptBuffer.length);
+  sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, rows[0].length).setValues(rows);
+  return rows.length;
 }
 
 function fetchSteamReviewSummaryBatch_(records, warnings) {
@@ -6285,7 +7471,8 @@ function calculateSeoStage(snapshot, previous) {
  */
 function syncProjectPoolGsc() {
   const emptyResult = {updated: 0, validZero: 0, noMatch: 0, ambiguous: 0, sourceError: 0, skipped: 0};
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ss = SpreadsheetApp.getActiveSpreadsheet() ||
+    SpreadsheetApp.openById(QUALIFICATION_ELIGIBILITY_PRODUCTION_SHEET_ID);
   const bindingSheet = ss && ss.getSheetByName(HOTWORD_V2.sheets.gscBinding);
   const poolSheet = ss && ensureSitePoolSchema_(ss);
   if (!bindingSheet || !poolSheet || bindingSheet.getLastRow() < 2 || poolSheet.getLastRow() < 2) {
@@ -6362,6 +7549,40 @@ function syncProjectPoolGsc() {
     result.updated++;
   });
   return result;
+}
+
+/** Read-only helper for remote verification of site-pool GSC sync fields. */
+function inspectSitePoolGsc(siteId) {
+  siteId = String(siteId || '').trim();
+  if (!siteId) throw new Error('inspectSitePoolGsc: siteId required');
+  const ss = SpreadsheetApp.getActiveSpreadsheet() ||
+    SpreadsheetApp.openById(QUALIFICATION_ELIGIBILITY_PRODUCTION_SHEET_ID);
+  const poolSheet = ss && ensureSitePoolSchema_(ss);
+  if (!poolSheet || poolSheet.getLastRow() < 2) {
+    return { siteId: siteId, found: false };
+  }
+  const poolHeaders = poolSheet.getRange(1, 1, 1, HOTWORD_V2.sitePoolHeaders.length).getDisplayValues()[0];
+  const poolColumn = name => poolHeaders.indexOf(name);
+  const siteColumn = poolColumn('Site ID');
+  const launchPageColumn = poolColumn('LaunchPageCount');
+  if (siteColumn < 0 || launchPageColumn < 0) {
+    return { siteId: siteId, found: false, error: 'site_pool_columns_missing' };
+  }
+  const poolRows = poolSheet.getRange(2, 1, poolSheet.getLastRow() - 1, HOTWORD_V2.sitePoolHeaders.length).getValues();
+  for (let i = 0; i < poolRows.length; i++) {
+    if (String(poolRows[i][siteColumn] || '').trim() !== siteId) continue;
+    const snapshot = loadGscSnapshot(siteId);
+    return {
+      siteId: siteId,
+      found: true,
+      launchPageCount: numberOrZero_(poolRows[i][launchPageColumn]),
+      sitemapUrlCount: numberOrZero_(snapshot && snapshot.sitemapUrlCount),
+      gscLastSync: poolRows[i][poolColumn('GSC Last Sync')] || '',
+      clicks: numberOrZero_(poolRows[i][poolColumn('Clicks')]),
+      impressions: numberOrZero_(poolRows[i][poolColumn('Impressions')])
+    };
+  }
+  return { siteId: siteId, found: false };
 }
 
 function readCandidateDecisions_(ss) {
@@ -7193,6 +8414,137 @@ function upsertMaster_(ss, records, runTime, runId, stats) {
   }
 }
 
+// G018 P3: additive fields on the existing 候选主表.  These are intentionally
+// separate from masterHeaders so legacy Steam row construction keeps its
+// established width and qualification semantics unchanged.
+const UNIFIED_CANDIDATE_HEADERS = [
+  'Candidate ID', '候选来源', 'Twitch Game ID', 'IGDB ID',
+  'Twitch排名', 'Twitch观察时间', 'Twitch来源'
+];
+
+function ensureUnifiedCandidateSchema_(sheet) {
+  const width = Math.max(sheet.getLastColumn(), 1);
+  const headers = sheet.getRange(1, 1, 1, width).getDisplayValues()[0];
+  let lastColumn = width;
+  const appended = [];
+  UNIFIED_CANDIDATE_HEADERS.forEach(name => {
+    if (headers.indexOf(name) >= 0) return;
+    lastColumn += 1;
+    if (sheet.getMaxColumns && lastColumn > sheet.getMaxColumns() && sheet.insertColumnsAfter) {
+      sheet.insertColumnsAfter(sheet.getMaxColumns(), 1);
+    }
+    sheet.getRange(1, lastColumn).setValue(name);
+    headers.push(name);
+    appended.push(name);
+  });
+  return {headers: headers, width: lastColumn, appended: appended};
+}
+
+function unifiedCandidateSource_(candidate) {
+  const hasSteam = !!(candidate && (candidate.has_steam ||
+    (Array.isArray(candidate.steam_app_ids) && candidate.steam_app_ids.some(Boolean))));
+  const hasTwitch = !!(candidate && candidate.has_twitch) ||
+    (Array.isArray(candidate && candidate.platform_listings) && candidate.platform_listings.some(item =>
+      String(item && item.platform || '').toUpperCase() === 'TWITCH'));
+  return hasSteam && hasTwitch ? 'STEAM+TWITCH' : hasSteam ? 'STEAM' : hasTwitch ? 'TWITCH' : '';
+}
+
+function unifiedCandidateTwitchFields_(candidate) {
+  const listings = Array.isArray(candidate && candidate.platform_listings) ? candidate.platform_listings : [];
+  const twitchListing = listings.find(item => String(item && item.platform || '').toUpperCase() === 'TWITCH') || {};
+  const signals = Array.isArray(candidate && candidate.signals) ? candidate.signals : [];
+  const twitchSignal = signals.find(item => String(item && item.source || '').toUpperCase().indexOf('TWITCH') >= 0) || {};
+  const metadata = twitchSignal.metadata && typeof twitchSignal.metadata === 'object' ? twitchSignal.metadata : {};
+  return {
+    twitchId: String(twitchListing.platform_game_id || metadata.twitch_game_id || '').trim(),
+    igdbId: String(metadata.igdb_id || '').trim(),
+    rank: twitchSignal.raw_value === null || twitchSignal.raw_value === undefined ? '' : twitchSignal.raw_value,
+    observedAt: twitchSignal.observed_at || '',
+    provenance: signals.filter(item => String(item && item.source || '').toUpperCase().indexOf('TWITCH') >= 0)
+      .map(item => ({signal_id: item.signal_id || '', source: item.source || '', observed_at: item.observed_at || '', metadata: item.metadata || {}}))
+  };
+}
+
+/**
+ * Upsert P2 UnifiedCandidate payloads into the existing 候选主表.
+ * Existing rows are matched by Candidate ID, Steam App ID, or exact normalized
+ * game name. Only additive identity/source fields and empty legacy identity
+ * cells are written; manual decision and 1A/1B fields are never overwritten.
+ */
+function upsertUnifiedCandidates_(ss, candidates) {
+  ss = ss || SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) throw new Error('Spreadsheet is required');
+  const sheet = ss.getSheetByName(HOTWORD_V2.sheets.master);
+  if (!sheet) throw new Error('候选主表不存在');
+  const schema = ensureUnifiedCandidateSchema_(sheet);
+  const col = name => schema.headers.indexOf(name);
+  const rows = sheet.getLastRow() >= 2 ? sheet.getRange(2, 1, sheet.getLastRow() - 1, schema.width).getValues() : [];
+  const candidateColumn = col('Candidate ID');
+  const appColumn = col('Steam App ID');
+  const nameColumn = col('游戏名称');
+  const index = new Map();
+  rows.forEach((row, i) => {
+    const id = String(row[candidateColumn] || '').trim();
+    const app = String(row[appColumn] || '').trim();
+    const name = normalizeGameName_(row[nameColumn] || '');
+    if (id) index.set('id:' + id, i);
+    if (app) index.set('app:' + app, i);
+    if (name) index.set('name:' + name, i);
+  });
+  let inserted = 0;
+  let updated = 0;
+  const items = Array.isArray(candidates) ? candidates : [];
+  items.forEach(candidate => {
+    if (!candidate || typeof candidate !== 'object') return;
+    const candidateId = String(candidate.candidate_id || candidate.game_entity_id || '').trim();
+    const name = String(candidate.canonical_name || '').trim();
+    if (!candidateId || !name) return;
+    const appIds = Array.isArray(candidate.steam_app_ids) ? candidate.steam_app_ids.map(String).filter(Boolean) : [];
+    const keyCandidates = ['id:' + candidateId].concat(appIds.map(app => 'app:' + app), ['name:' + normalizeGameName_(name)]);
+    let rowIndex = -1;
+    for (const key of keyCandidates) {
+      if (index.has(key)) { rowIndex = index.get(key); break; }
+    }
+    const row = rowIndex >= 0 ? rows[rowIndex].slice() : new Array(schema.width).fill('');
+    const setIfEmpty = (field, value) => {
+      const position = col(field);
+      if (position >= 0 && (row[position] === '' || row[position] === null || row[position] === undefined) && value !== '') row[position] = value;
+    };
+    setIfEmpty('Candidate ID', candidateId);
+    setIfEmpty('游戏名称', name);
+    setIfEmpty('Steam App ID', appIds[0] || '');
+    const steamListing = (candidate.platform_listings || []).find(item => String(item && item.platform || '').toUpperCase() === 'STEAM');
+    setIfEmpty('Steam URL', steamListing && steamListing.store_url || '');
+    const twitch = unifiedCandidateTwitchFields_(candidate);
+    const fields = {
+      '候选来源': unifiedCandidateSource_(candidate),
+      'Twitch Game ID': twitch.twitchId,
+      'IGDB ID': twitch.igdbId,
+      'Twitch排名': twitch.rank,
+      'Twitch观察时间': twitch.observedAt,
+      'Twitch来源': twitch.provenance.length ? JSON.stringify(twitch.provenance) : ''
+    };
+    Object.keys(fields).forEach(field => {
+      const position = col(field);
+      if (position >= 0 && fields[field] !== '') row[position] = fields[field];
+    });
+    if (rowIndex >= 0) {
+      sheet.getRange(rowIndex + 2, 1, 1, schema.width).setValues([row]);
+      rows[rowIndex] = row;
+      updated += 1;
+    } else {
+      sheet.getRange(sheet.getLastRow() + 1, 1, 1, schema.width).setValues([row]);
+      rows.push(row);
+      inserted += 1;
+      rowIndex = rows.length - 1;
+    }
+    index.set('id:' + candidateId, rowIndex);
+    if (appIds[0]) index.set('app:' + appIds[0], rowIndex);
+    index.set('name:' + normalizeGameName_(name), rowIndex);
+  });
+  return {ok: true, inserted: inserted, updated: updated, schemaAppended: schema.appended};
+}
+
 function masterRow_(rec, runTime, firstSeen, runId, manualNote) {
   return [
     runTime,
@@ -7302,7 +8654,8 @@ function dailyCandidateSnapshotRow_(rec, dateKey, runId) {
  * Existing date + App ID rows are immutable, so later research, decisions,
  * and Today Action refreshes cannot alter this historical view.
  */
-function writeDailyCandidateSnapshot_(ss, records, runTime, runId) {
+function writeDailyCandidateSnapshot_(ss, records, runTime, runId, options) {
+  options = options || {};
   const sheet = ss && ss.getSheetByName ? ss.getSheetByName(HOTWORD_V2.sheets.candidateSnapshot) : null;
   if (!sheet) return {persisted: 0, skipped: 0, error: 'candidate_snapshot_sheet_missing'};
   const dateKey = dailyCandidateSnapshotDateKey_(runTime, ss);
@@ -7311,14 +8664,22 @@ function writeDailyCandidateSnapshot_(ss, records, runTime, runId) {
   const headers = sheet.getRange(1, 1, 1, width).getDisplayValues()[0];
   const dateColumn = headers.indexOf('日期');
   const appIdColumn = headers.indexOf('Steam App ID');
+  const runIdColumn = headers.indexOf('Run ID');
   if (dateColumn < 0 || appIdColumn < 0) return {persisted: 0, skipped: 0, error: 'candidate_snapshot_schema_invalid'};
+  const useRunIdempotency = options.idempotency === 'run' && runIdColumn >= 0 && String(runId || '').trim();
 
   const existing = new Set();
   if (sheet.getLastRow() >= 2) {
     sheet.getRange(2, 1, sheet.getLastRow() - 1, width).getDisplayValues().forEach(row => {
       const appId = String(row[appIdColumn] || '').trim();
       const rowDate = String(row[dateColumn] || '').trim();
-      if (appId && rowDate) existing.add(rowDate + '|' + appId);
+      const rowRunId = runIdColumn >= 0 ? String(row[runIdColumn] || '').trim() : '';
+      if (!appId) return;
+      if (useRunIdempotency) {
+        if (rowRunId && rowRunId === String(runId).trim()) existing.add(rowRunId + '|' + appId);
+      } else if (rowDate) {
+        existing.add(rowDate + '|' + appId);
+      }
     });
   }
 
@@ -7326,7 +8687,9 @@ function writeDailyCandidateSnapshot_(ss, records, runTime, runId) {
   (records || []).forEach(rec => {
     if (!isDailyCandidateSnapshotRecord_(rec)) return;
     const appId = String(rec.appId || '').trim();
-    if (!appId || existing.has(dateKey + '|' + appId) || unique.has(appId)) return;
+    if (!appId) return;
+    const idemKey = useRunIdempotency ? (String(runId).trim() + '|' + appId) : (dateKey + '|' + appId);
+    if (existing.has(idemKey) || unique.has(appId)) return;
     unique.set(appId, rec);
   });
   const rows = Array.from(unique.values()).map(rec => dailyCandidateSnapshotRow_(rec, dateKey, runId));
@@ -7374,11 +8737,12 @@ function snapshotRow_(rec, runTime, runId) {
   ];
 }
 
-function updateSnapshots_(ss, records, runTime, runId, rowByAppId) {
+function updateSnapshots_(ss, records, runTime, runId, rowByAppId, skipIdentityCheck) {
   const sheet = ss.getSheetByName(HOTWORD_V2.sheets.snapshot);
   const updated = [];
   const skipped = [];
   const refs = rowByAppId || {};
+  const width = HOTWORD_V2.snapshotHeaders.length;
 
   records.forEach(rec => {
     const rowNumber = Number(refs[String(rec.appId)] || 0);
@@ -7386,14 +8750,15 @@ function updateSnapshots_(ss, records, runTime, runId, rowByAppId) {
       skipped.push(String(rec.appId));
       return;
     }
-    const identity = sheet.getRange(rowNumber, 2, 1, 2).getDisplayValues()[0];
-    if (String(identity[0] || '').trim() !== String(runId) ||
-        String(identity[1] || '').trim() !== String(rec.appId)) {
-      skipped.push(String(rec.appId));
-      return;
+    if (!skipIdentityCheck) {
+      const identity = sheet.getRange(rowNumber, 2, 1, 2).getDisplayValues()[0];
+      if (String(identity[0] || '').trim() !== String(runId) ||
+          String(identity[1] || '').trim() !== String(rec.appId)) {
+        skipped.push(String(rec.appId));
+        return;
+      }
     }
-    sheet.getRange(rowNumber, 1, 1, HOTWORD_V2.snapshotHeaders.length)
-      .setValues([snapshotRow_(rec, runTime, runId)]);
+    sheet.getRange(rowNumber, 1, 1, width).setValues([snapshotRow_(rec, runTime, runId)]);
     updated.push(String(rec.appId));
   });
 
@@ -7863,7 +9228,7 @@ function installDailyHotwordTrigger() {
 
   removeDailyHotwordTriggers();
 
-  ScriptApp.newTrigger('runSteamHotword01B')
+  ScriptApp.newTrigger(G010_DAILY_HANDLER)
     .timeBased()
     .everyDays(1)
     .atHour(Math.max(0, Math.min(23, Math.floor(Number(rules.DAILY_HOUR || 8)))))
@@ -7873,7 +9238,7 @@ function installDailyHotwordTrigger() {
 }
 
 function removeDailyHotwordTriggers() {
-  const handlers = new Set(['runSteamHotword01B', 'runSteamCandidateScan']);
+  const handlers = new Set(['runSteamHotword01B', 'runSteamHotwordDaily_', 'runSteamCandidateScan']);
   let removed = 0;
 
   ScriptApp.getProjectTriggers().forEach(trigger => {
