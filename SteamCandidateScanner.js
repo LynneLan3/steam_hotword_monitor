@@ -221,7 +221,7 @@ const HOTWORD_V2 = {
     '行动类型', '优先级', '游戏名称', 'Steam App ID', '第一轮类型',
     'Steam Followers', 'Steam 7d Gain', '近似增长率',
     '发布阶段', 'Steam发布日期', '距发售天数', '评论数', 'Steam评分',
-    'Google Trends链接', 'Trends结果', 'Social结果', 'SERP竞争', '关键词机会', 'Decision', '人工备注',
+    '搜索别名', 'Google Trends链接', 'Trends结果', 'Social结果', 'SERP竞争', '关键词机会', 'Decision', '人工备注',
     '当前阶段', '研究状态', '研究完成度', '人工动作', '触发原因', '上次人工检查日',
     'Steam URL', '判定依据', '机器决定', '推荐域名', '首年价', '注册商', '购买域名'
   ],
@@ -1665,7 +1665,9 @@ function setupTodayActionUi_(ss) {
   const decisionCol = col('Decision');
   // V3.3 列重排迁移：旧列（例如 W 列）的验证规则不能继续作用于新列。
   // 先清空今日行动数据区的全部验证，再按当前表头重新绑定人工字段。
-  sheet.getRange(4, 1, Math.max(sheet.getMaxRows() - 3, 1), sheet.getMaxColumns()).clearDataValidations();
+  const validationRange = sheet.getRange(4, 1, Math.max(sheet.getMaxRows() - 3, 1), sheet.getMaxColumns());
+  if (validationRange.clearDataValidations) validationRange.clearDataValidations();
+  if (typeof SpreadsheetApp === 'undefined' || !SpreadsheetApp.newDataValidation) return;
   const editableOptions = {
     'Trends结果': ['强', '中', '弱', '无', '未检查'],
     'Social结果': ['强', '中', '弱', '无', '未检查'],
@@ -5389,23 +5391,32 @@ const TRENDS_FRANCHISE_ABBREV_RULES_ = [
 /**
  * 由 Steam 原始游戏名生成 Google Trends OR 查询词。
  * @param {string} gameName
+ * @param {string} [searchAlias] 玩家常用称呼发现结果；有值时 Trends 仅使用官方名 + 搜索别名。
  * @return {{query: string, status: string}}
  */
-function buildTrendsQuery_(gameName) {
+function buildTrendsQuery_(gameName, searchAlias) {
   const raw = String(gameName || '').trim();
   if (!raw) return {query: '', status: TRENDS_QUERY_STATUS_.AUTO};
 
   let working = stripTrendsNoise_(raw);
-  const hadVersionHint = TRENDS_VERSION_HINT_RE_.test(raw);
-
   TRENDS_STORE_EDITION_SUFFIX_RES_.forEach(re => {
     working = working.replace(re, '').trim();
   });
-
   working = working.replace(/\s*[-–—]\s*$/, '').trim();
+  let coreName = cleanTrendsDisplayName_(working);
+  if (!coreName) coreName = cleanTrendsDisplayName_(raw);
+
+  const alias = String(searchAlias || '').trim();
+  if (alias && normalizeTrendsTermKey_(alias) !== normalizeTrendsTermKey_(coreName)) {
+    return {
+      query: coreName + ' + ' + alias,
+      status: TRENDS_QUERY_STATUS_.AUTO
+    };
+  }
+
+  const hadVersionHint = TRENDS_VERSION_HINT_RE_.test(raw);
 
   const aliasCandidates = [];
-  let coreName = cleanTrendsDisplayName_(working);
   let needsReview = hadVersionHint || TRENDS_FRANCHISE_REVIEW_RE_.test(raw);
 
   const colonIdx = working.indexOf(':');
@@ -6480,8 +6491,10 @@ function buildTodayActionAlreadyHandled_(ss, decisions) {
       const column = researchHeaders.indexOf(name);
       return column >= 0 ? values[column] : '';
     };
-    const result = [value('研究结果'), value('Trends结论'), value('人工判定'), value('TrendVerdict')]
-      .some(item => hasCompletedManualResearchValue_(item));
+    const trendVerdict = String(value('TrendVerdict') || '').trim().toUpperCase();
+    const result = trendVerdict && trendVerdict !== 'ALIAS_DISCOVERY' &&
+      [value('研究结果'), value('Trends结论'), value('人工判定'), value('TrendVerdict')]
+        .some(item => hasCompletedManualResearchValue_(item));
     const status = String(value('状态') || '').trim().toUpperCase();
     const completedStatus = ['COMPLETED', 'COMPLETE', 'DONE', '已完成', '完成'].indexOf(status) >= 0;
     if (result || completedStatus) {
@@ -7051,7 +7064,7 @@ function onEdit(e) {
  * @return {Array<*>}
  */
 function actionRow_(rec) {
-  const trends = buildTrendsQuery_(rec.name);
+  const trends = buildTrendsQuery_(rec.name, rec.searchAlias);
   const trendsUrl = buildGoogleTrendsExploreUrl_(trends.query);
   const trendsLink = trendsUrl
     ? '=HYPERLINK("' + trendsUrl.replace(/"/g, '""') + '","打开 Trends")'
@@ -7079,6 +7092,7 @@ function actionRow_(rec) {
     rec.daysToRelease,
     rec.reviews,
     rec.rating,
+    rec.searchAlias || '',
     trendsLink,
     rec.todayAction.decision && rec.todayAction.decision.trendsResult || '',
     rec.todayAction.decision && rec.todayAction.decision.socialResult || '',
@@ -7562,6 +7576,9 @@ function refreshTodayActionsFromCandidateDecisions_(spreadsheet, runTime, runId,
     actions.push(rec);
   });
   const sampledActions = limitTodayActionSamples_(actions, rules);
+  if (typeof ensurePlayerSearchAliasesForTodayActions_ === 'function') {
+    ensurePlayerSearchAliasesForTodayActions_(ss, sampledActions);
+  }
   sampledActions.sort(compareActions_);
 
   const summaryCounts = Object.assign({
@@ -7773,6 +7790,9 @@ function refreshTodayAction_(ss, actions, runTime, runId, counts) {
   sheet.getRange('P2').setValue(counts.controlCount);
 
   sheet.getRange(3, 1, 1, HOTWORD_V2.actionHeaders.length).setValues([HOTWORD_V2.actionHeaders]);
+  // 表头变更（如新增「搜索别名」）后，旧列的数据验证会错位到 Google Trends 链接列；
+  // 写入 HYPERLINK 前必须按当前表头重绑人工字段验证。
+  setupTodayActionUi_(ss);
 
   if (actions.length) {
     const rows = actions.map(rec => actionRow_(rec));
@@ -8008,7 +8028,7 @@ function applyActionFormatting_(sheet, dataRows) {
     });
   }
 
-  const widths = [18, 12, 34, 14, 18, 16, 16, 14, 14, 15, 12, 12, 12, 24, 18, 18, 18, 18, 18, 36, 22, 16, 16, 22, 34, 16, 48, 55];
+  const widths = [18, 12, 34, 14, 18, 16, 16, 14, 14, 15, 12, 12, 12, 20, 24, 18, 18, 18, 18, 18, 36, 22, 16, 16, 22, 34, 16, 48, 55];
   widths.forEach((w, i) => sheet.setColumnWidth(i + 1, Math.min(420, w * 8)));
 }
 

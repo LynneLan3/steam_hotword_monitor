@@ -44,6 +44,9 @@ FakeRange.prototype.clearContent = function () {
   this.sheet.write(this.row, this.column, values);
   return this;
 };
+FakeRange.prototype.clearDataValidations = function () { return this; };
+FakeRange.prototype.setDataValidation = function () { return this; };
+FakeRange.prototype.setBackground = function () { return this; };
 
 function columnNumber(label) {
   var result = 0;
@@ -99,6 +102,7 @@ var sandbox = {
 vm.createContext(sandbox);
 vm.runInContext(source, sandbox);
 sandbox.applyActionFormatting_ = function () {};
+sandbox.setupTodayActionUi_ = function () {};
 
 function extractHeaders(name) {
   var match = source.match(new RegExp('\\n  ' + name + ': \\[([\\s\\S]*?)\\],\\n\\n'));
@@ -263,7 +267,7 @@ assert(digest(spreadsheet.getSheetByName('今日行动').rows) !== beforeActionH
 var actionSheet = spreadsheet.getSheetByName('今日行动');
 var actionRows = actionSheet.rows.slice(2).filter(function (candidate) { return String(candidate[actionHeaders.indexOf('Steam App ID')] || '').trim(); });
 function find(appId) { return actionRows.find(function (candidate) { return candidate[actionHeaders.indexOf('Steam App ID')] === appId; }); }
-assert(!find('1001'), 'BUILD is absent from 今日行动');
+assert(find('1001'), 'BUILD remains visible in 今日行动 for handoff context');
 assert(!find('1002'), 'REJECT is absent from 今日行动');
 assert(!find('1575990'), 'site-pool Twisted Tower is absent from 今日行动');
 assert(!find('4026250'), 'history-library Project P.I.T.T. is absent from 今日行动');
@@ -291,7 +295,8 @@ assert(find('1003')[actionHeaders.indexOf('人工备注')] === 'keep manual note
 assert(source.indexOf("today_action_refresh: refreshTodayActionsFromCandidateDecisions_()") >= 0, 'preflight callback refresh hook');
 assert(source.indexOf('function candidateDecisionEditAffectsTodayAction_') >= 0, 'candidate decision edit hook');
 assert(source.indexOf("refreshTodayActionsFromCandidateDecisions_(e.source)") >= 0, 'manual edit refresh hook');
-assert(source.indexOf(".addItem('刷新今日行动', 'refreshTodayActionsFromCandidateDecisions')") >= 0, 'menu uses public refresh wrapper');
+assert(source.indexOf('setupTodayActionUi_(ss)') >= 0 && source.indexOf('写入 HYPERLINK 前必须按当前表头重绑人工字段验证') >= 0,
+  'refreshTodayAction rebinds validations after header changes');
 var refreshStart = source.indexOf('function refreshTodayActionsFromCandidateDecisions_(spreadsheet');
 var refreshEnd = source.indexOf('function todayActionRefreshRunId_', refreshStart);
 var refreshBody = source.slice(refreshStart, refreshEnd);

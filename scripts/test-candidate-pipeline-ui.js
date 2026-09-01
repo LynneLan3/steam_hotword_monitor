@@ -64,7 +64,7 @@ assert(src.indexOf("row[2] || '').trim() === normalizedAppId") >= 0, 'App ID ded
 assert(src.indexOf('sheet.getRange(4, 1, Math.max(sheet.getMaxRows() - 3, 1), sheet.getMaxColumns()).clearDataValidations()') >= 0, 'old action validations cleared');
 assert(src.indexOf("const decisionCol = col('Decision')") >= 0, 'Decision validation follows header');
 // Simulate the reported V3.3 migration: a stale W4 rule is cleared before the current Decision rule is applied.
-var actionHeaders = ['行动类型', '优先级', '游戏名称', 'Steam App ID', '第一轮类型', 'Steam Followers', 'Steam 7d Gain', '近似增长率', '发布阶段', 'Steam发布日期', '距发售天数', '评论数', 'Steam评分', 'Google Trends链接', 'Trends结果', 'Social结果', 'SERP竞争', '关键词机会', 'Decision', '人工备注'];
+var actionHeaders = ['行动类型', '优先级', '游戏名称', 'Steam App ID', '第一轮类型', 'Steam Followers', 'Steam 7d Gain', '近似增长率', '发布阶段', 'Steam发布日期', '距发售天数', '评论数', 'Steam评分', '搜索别名', 'Google Trends链接', 'Trends结果', 'Social结果', 'SERP竞争', '关键词机会', 'Decision', '人工备注'];
 var validations = {23: ['BUILD', 'WATCH', 'REJECT']};
 function migrateValidations(headers, old) {
   var next = {};
@@ -75,7 +75,7 @@ function migrateValidations(headers, old) {
 }
 var migrated = migrateValidations(actionHeaders, validations);
 assert(migrated[23] === null, 'stale W4 validation removed');
-assert(migrated[19].join('|') === 'BUILD|WATCH|REJECT', 'Decision validation moved to current column');
+assert(migrated[20].join('|') === 'BUILD|WATCH|REJECT', 'Decision validation moved to current column');
 assert(src.indexOf('ensureSitePoolSchema_') >= 0, 'site pool schema migration');
 assert(src.indexOf("['Site ID', '游戏名称', 'Steam App ID', '当前状态', 'BUILD日期', 'Build状态', 'Repo URL', 'Vercel URL', '上线日期', '模板版本', 'GSC状态', 'GSC Site', 'GSC URL Prefix', 'GSC Last Sync', 'SEO阶段', 'Index状态', '首次曝光日期', 'Clicks', 'Impressions', 'CTR', 'Average Position', 'OpportunityID', 'ExperimentType', 'ActualLiveAt', 'LaunchPageCount']") >= 0, 'site pool final fields');
 var orderBlock = src.match(/sheetUiOrder:\s*\[([\s\S]*?)\]/)[1];

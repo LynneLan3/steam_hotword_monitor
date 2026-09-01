@@ -75,7 +75,7 @@ assertIncludes(url, 'geo=US', 'Trends URL geo param');
 
 var headerBlock = src.match(/actionHeaders:\s*\[([\s\S]*?)\]\s*,/);
 if (!headerBlock) throw new Error('actionHeaders block missing');
-['游戏名称', 'Google Trends链接', 'Steam App ID'].forEach(function (h) {
+['游戏名称', '搜索别名', 'Google Trends链接', 'Steam App ID'].forEach(function (h) {
   if (headerBlock[0].indexOf("'" + h + "'") < 0) throw new Error('actionHeaders missing ' + h);
 });
 
