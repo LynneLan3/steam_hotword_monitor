@@ -51,6 +51,22 @@ const HOTWORD_V2 = {
     retentionDays: 60,
     triggerHandler: 'runSteamRawArchiveMaintenance'
   },
+  diagnosticRetention: {
+    externalDataAttemptsDays: 14,
+    runLogDays: 30
+  },
+
+  monitoringHistory: {
+    spreadsheetName: 'Steam_监控回测历史库',
+    propertyKey: 'STEAM_MONITORING_HISTORY_SPREADSHEET_ID_V1',
+    tables: {
+      gameDaily: 'steam_game_daily',
+      candidateDecision: 'steam_candidate_decision_history',
+      build: 'steam_build_history',
+      evidence: 'steam_external_evidence',
+      runManifest: 'steam_run_manifest'
+    }
+  },
 
   /**
    * 旧 V1 兼容层：保留数据与兼容代码，不删除。
@@ -207,7 +223,7 @@ const HOTWORD_V2 = {
     '发布阶段', 'Steam发布日期', '距发售天数', '评论数', 'Steam评分',
     'Google Trends链接', 'Trends结果', 'Social结果', 'SERP竞争', '关键词机会', 'Decision', '人工备注',
     '当前阶段', '研究状态', '研究完成度', '人工动作', '触发原因', '上次人工检查日',
-    'Steam URL', '判定依据'
+    'Steam URL', '判定依据', '机器决定', '推荐域名', '首年价', '注册商', '购买域名'
   ],
 
   decisionHeaders: [
@@ -224,6 +240,11 @@ const HOTWORD_V2 = {
     // M7C：append-only callback recommendation fields；不覆盖人工字段。
     '自动Recommendation', '自动Recommendation置信度', '自动Recommendation理由',
     '自动缺失证据', '自动Recommendation结果路径', '自动研究错误',
+    '自动BUILD依据', '自动BUILD Thesis', 'DecisionID',
+    'MachineDecision', 'MachineDecisionReason', 'RecommendedDomain', 'DomainTLD',
+    'DomainFirstYearPrice', 'DomainRegistrar', 'DomainPurchaseURL', 'DomainCheckedAt',
+    'DomainAlternative1', 'DomainAlternative1Price', 'DomainAlternative1PurchaseURL',
+    'DomainAlternative2', 'DomainAlternative2Price', 'DomainAlternative2PurchaseURL',
     // Candidate External Signal Loop v1：append-only structured Trends summary.
     'TrendRelativeStrength', 'TrendVerdict', 'TrendLastChecked', 'ExternalSignal', 'FinalResearchStage',
     // Steam Candidate automatic preflight; append-only and human-readable.
@@ -265,7 +286,11 @@ const STEAM_CANDIDATE_1A_PASS_RESULTS = {
 const STEAM_CANDIDATE_RECOMMENDATIONS = {
   RECOMMEND_BUILD: true,
   RECOMMEND_WATCH: true,
-  RECOMMEND_REJECT: true
+  RECOMMEND_REJECT: true,
+  BUILD: true,
+  WATCH: true,
+  REJECT: true,
+  INSUFFICIENT_EVIDENCE: true
 };
 const STEAM_CANDIDATE_RESEARCH_CONFIDENCES = { HIGH: true, MEDIUM: true, LOW: true };
 const QUALIFICATION_ELIGIBILITY_PRODUCTION_SHEET_ID = '1WVg2p_Vero3MB2JN4yxmtHkLQRgkWO2mz95X4ms9nLE';
@@ -290,31 +315,13 @@ const G010_CONTINUATION_STALE_MS = 10 * 60 * 1000;
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('Steam 0→1B')
-    .addItem('① 初始化 V2', 'setupSteamHotwordV2')
-    .addItem('整理工作表视图', 'organizeSheetUi')
-    .addItem('② 设置 Games Popularity API Key', 'setGamesPopularityApiKey')
-    .addItem('③ 检查 API Key', 'checkGamesPopularityApiKey')
-    .addItem('强制刷新 Games Popularity（一次）', 'forceRefreshGamesPopularity')
-    .addItem('Steam 日期解析 Smoke Test', 'steamReleaseDateParserSmokeTest')
-    .addItem('检查/恢复 G010 Continuation', 'inspectOrRestoreG010Continuation')
-    .addItem('停止 G010 当前 Run', 'stopG010CurrentRun')
-    .addItem('恢复 G010 当前 Run', 'restoreG010CurrentRun')
-    .addItem('Eligibility V1 初始化 + Dry Run', 'runQualificationEligibilityV1InitAndDryRun')
-    .addItem('初始化 Qualification Eligibility V1', 'initializeQualificationEligibilityV1')
-    .addItem('Qualification Eligibility baseline', 'backfillQualificationEligibilityBaselineV1')
-    .addItem('Qualification Eligibility dry-run（只读）', 'dryRunQualificationEligibilityV1')
-    .addSeparator()
-    .addItem('Raw 归档状态', 'showSteamRawArchiveStatus')
-    .addItem('执行 Raw 月度归档', 'executeSteamRawMonthlyArchive')
-    .addItem('设置 Raw 归档每日触发器', 'setupSteamRawArchiveMaintenance')
-    .addSeparator()
-    .addItem('▶ 立即运行 0→1B', 'runSteamHotword01B')
+    .addItem('立即运行 0→1B', 'runSteamHotword01B')
     .addItem('刷新今日行动', 'refreshTodayActionsFromCandidateDecisions')
-    .addItem('M7A 安全恢复 Candidate Research', 'recoverSteamCandidateResearch')
-    .addItem('回测 1B 规则', 'runFirstRoundBacktest')
     .addSeparator()
-    .addItem('安装每日自动触发器', 'installDailyHotwordTrigger')
-    .addItem('删除每日自动触发器', 'removeDailyHotwordTriggers')
+    .addItem('系统状态', 'showSteamSystemStatus')
+    .addSeparator()
+    .addItem('管理员：API Key', 'checkGamesPopularityApiKey')
+    .addItem('管理员：重装自动触发器', 'installDailyHotwordTrigger')
     .addToUi();
 }
 
@@ -572,7 +579,10 @@ function handleSteamCandidateResearchCallback_(body) {
     steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动研究状态', status);
     steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动研究错误', steamCandidateResearchCallbackString_(body.error));
     ['自动Social摘要', '自动SERP摘要', '自动Recommendation', '自动Recommendation置信度',
-      '自动Recommendation理由', '自动缺失证据', '自动Recommendation结果路径'].forEach(function (field) {
+      '自动Recommendation理由', '自动缺失证据', '自动Recommendation结果路径', '自动BUILD依据', '自动BUILD Thesis',
+      'MachineDecision', 'MachineDecisionReason', 'RecommendedDomain', 'DomainTLD', 'DomainFirstYearPrice',
+      'DomainRegistrar', 'DomainPurchaseURL', 'DomainCheckedAt', 'DomainAlternative1', 'DomainAlternative1Price',
+      'DomainAlternative1PurchaseURL', 'DomainAlternative2', 'DomainAlternative2Price', 'DomainAlternative2PurchaseURL'].forEach(function (field) {
         steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, field, '');
       });
     return {
@@ -590,8 +600,17 @@ function handleSteamCandidateResearchCallback_(body) {
   steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动Recommendation置信度', body.confidence);
   steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动Recommendation理由', steamCandidateResearchJoin_(body.reasons));
   steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动缺失证据', steamCandidateResearchJoin_(body.missing_evidence));
+  steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动BUILD依据', JSON.stringify(body.decision_evidence || {}));
+  steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动BUILD Thesis', body.decision_evidence && body.decision_evidence.buildThesis || '');
   steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动Recommendation结果路径', body.recommendation_result_path);
   steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动研究错误', '');
+  steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, 'MachineDecision', body.MachineDecision || body.recommendation);
+  steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, 'MachineDecisionReason', body.MachineDecisionReason || steamCandidateResearchJoin_(body.reasons));
+  ['RecommendedDomain', 'DomainTLD', 'DomainFirstYearPrice', 'DomainRegistrar', 'DomainPurchaseURL', 'DomainCheckedAt',
+    'DomainAlternative1', 'DomainAlternative1Price', 'DomainAlternative1PurchaseURL', 'DomainAlternative2',
+    'DomainAlternative2Price', 'DomainAlternative2PurchaseURL'].forEach(function (field) {
+      steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, field, body[field] == null ? '' : body[field]);
+    });
   return {
     ok: true,
     job_id: body.job_id,
@@ -1013,14 +1032,14 @@ function candidateDecisionFieldValues_(decision) {
     '第一轮类型': decision.firstType,
     '当前Steam阶段': decision.currentStage,
     '研究状态': decision.researchStatus,
-    'Google Trends结果': decision.trendsResult,
-    'Social结果': decision.socialResult,
-    'SERP竞争': decision.serpCompetition,
-    '关键词机会': decision.keywordOpportunity,
+    'Google Trends结果': candidateDecisionEnumValue_('Google Trends结果', decision.trendsResult),
+    'Social结果': candidateDecisionEnumValue_('Social结果', decision.socialResult),
+    'SERP竞争': candidateDecisionEnumValue_('SERP竞争', decision.serpCompetition),
+    '关键词机会': candidateDecisionEnumValue_('关键词机会', decision.keywordOpportunity),
     '人工备注': decision.manualNote,
-    'Decision': decision.status,
+    'Decision': candidateDecisionEnumValue_('Decision', decision.status),
     'Decision日期': decision.decisionDate,
-    'Next Action': decision.nextAction,
+    'Next Action': candidateDecisionEnumValue_('Next Action', decision.nextAction),
     'OpportunityID': decision.opportunityId || '',
     'ResearchJobID': decision.researchJobId || '',
     '自动研究状态': decision.autoResearchStatus || '',
@@ -1034,6 +1053,23 @@ function candidateDecisionFieldValues_(decision) {
     '自动缺失证据': decision.autoMissingEvidence || '',
     '自动Recommendation结果路径': decision.autoRecommendationResultPath || '',
     '自动研究错误': decision.autoResearchError || '',
+    '自动BUILD依据': decision.autoBuildEvidence || '',
+    '自动BUILD Thesis': decision.autoBuildThesis || '',
+    'DecisionID': decision.decisionId || '',
+    'MachineDecision': decision.machineDecision || '',
+    'MachineDecisionReason': decision.machineDecisionReason || '',
+    'RecommendedDomain': decision.recommendedDomain || '',
+    'DomainTLD': decision.domainTld || '',
+    'DomainFirstYearPrice': decision.domainFirstYearPrice == null ? '' : decision.domainFirstYearPrice,
+    'DomainRegistrar': decision.domainRegistrar || '',
+    'DomainPurchaseURL': decision.domainPurchaseUrl || '',
+    'DomainCheckedAt': decision.domainCheckedAt || '',
+    'DomainAlternative1': decision.domainAlternative1 || '',
+    'DomainAlternative1Price': decision.domainAlternative1Price == null ? '' : decision.domainAlternative1Price,
+    'DomainAlternative1PurchaseURL': decision.domainAlternative1PurchaseUrl || '',
+    'DomainAlternative2': decision.domainAlternative2 || '',
+    'DomainAlternative2Price': decision.domainAlternative2Price == null ? '' : decision.domainAlternative2Price,
+    'DomainAlternative2PurchaseURL': decision.domainAlternative2PurchaseUrl || '',
     'TrendRelativeStrength': decision.trendRelativeStrength || '',
     'TrendVerdict': decision.trendVerdict || '',
     'TrendLastChecked': decision.trendLastChecked || '',
@@ -1066,6 +1102,51 @@ function candidateDecisionAllowedTrendVerdict_(value) {
     'SEARCH_CONFIRMED', 'SEARCH_WEAK', 'TREND_OVERRIDE', 'EXTERNAL_DISCOVERY',
     'AMBIGUOUS', 'INSUFFICIENT_DATA'
   ].indexOf(String(value || '').trim()) >= 0;
+}
+
+const CANDIDATE_DECISION_ENUMS_ = {
+  '研究状态': {allowed: ['待研究', '研究中', '已完成'], fallback: ''},
+  'Google Trends结果': {allowed: ['强', '中', '弱', '无', '未检查'], fallback: '未检查'},
+  'Social结果': {allowed: ['强', '中', '弱', '无', '未检查'], fallback: '未检查'},
+  'SERP竞争': {allowed: ['低', '中', '高', '未检查'], fallback: '未检查'},
+  '关键词机会': {allowed: ['有', '无', '未检查'], fallback: '未检查'},
+  'Decision': {allowed: ['BUILD', 'WATCH', 'REJECT'], fallback: ''},
+  'Next Action': {allowed: ['Google Trends', 'Social验证', 'SERP检查', 'Keyword Research', 'Site Build', 'Recheck', 'None', 'Automatic Preflight'], fallback: ''}
+};
+
+function candidateDecisionEnumValue_(field, value) {
+  const rule = CANDIDATE_DECISION_ENUMS_[field];
+  if (!rule) return value;
+  const text = String(value === null || value === undefined ? '' : value).trim();
+  if (!text) return '';
+  return rule.allowed.indexOf(text) >= 0 ? text : rule.fallback;
+}
+
+function repairCandidateDecisionEnumData_(ss) {
+  ss = ss || SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss && ss.getSheetByName ? ss.getSheetByName(HOTWORD_V2.sheets.decisions) : null;
+  const result = {ok: true, rowsScanned: 0, repaired: 0, repairs: []};
+  if (!sheet || sheet.getLastRow() < 2) return result;
+  const map = candidateDecisionColumnMap_(sheet);
+  const names = Object.keys(CANDIDATE_DECISION_ENUMS_);
+  const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, map.width).getValues();
+  rows.forEach((row, index) => {
+    result.rowsScanned += 1;
+    const appId = String(map.byName['Steam App ID'] ? row[map.byName['Steam App ID'] - 1] : '').trim();
+    names.forEach(field => {
+      const column = map.byName[field];
+      if (!column) return;
+      const current = row[column - 1];
+      const next = candidateDecisionEnumValue_(field, current);
+      const currentText = String(current === null || current === undefined ? '' : current).trim();
+      if (currentText === next) return;
+      candidateDecisionSetField_(sheet, index + 2, field, next, map);
+      row[column - 1] = next;
+      result.repaired += 1;
+      result.repairs.push({appId, field, from: currentText, to: next});
+    });
+  });
+  return result;
 }
 
 function candidateDecisionAllowedDate_(value) {
@@ -1125,6 +1206,58 @@ function repairCandidateDecisionSchemaData_(ss) {
   return result;
 }
 
+/** One-time repair for rows written with the former physical 44-column layout. */
+function migrateCandidateDecisionHistoricalSchema() {
+  const ss = SpreadsheetApp.openById(QUALIFICATION_ELIGIBILITY_PRODUCTION_SHEET_ID);
+  const sheet = ss.getSheetByName(HOTWORD_V2.sheets.decisions);
+  if (!sheet || sheet.getLastRow() < 2) return {ok: true, rowsMigrated: 0, cellsMigrated: 0};
+  const map = candidateDecisionColumnMap_(sheet);
+  const migrations = [
+    {from: 36, to: map.byName.TrendRelativeStrength || 53, target: 'TrendRelativeStrength'},
+    {from: 37, to: map.byName.TrendVerdict || 54, target: 'TrendVerdict'},
+    {from: 38, to: map.byName.TrendLastChecked || 55, target: 'TrendLastChecked'},
+    {from: 39, to: map.byName.ExternalSignal || 56, target: 'ExternalSignal'},
+    {from: 40, to: map.byName.FinalResearchStage || 57, target: 'FinalResearchStage'},
+    {from: 41, to: map.byName.PreflightVerdict || 58, target: 'PreflightVerdict'},
+    {from: 42, to: map.byName.PreflightCheckedAt || 59, target: 'PreflightCheckedAt'},
+    {from: 43, to: map.byName.PreflightReason || 60, target: 'PreflightReason'},
+    {from: 44, to: map.byName.DecisionID || 38, target: 'DecisionID'}
+  ];
+  const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, Math.max(sheet.getLastColumn(), 60)).getValues();
+  const validTarget = (target, value) => {
+    if (value === '' || value === null || value === undefined) return false;
+    if (target === 'TrendRelativeStrength') return isFiniteNumber_(Number(value));
+    if (target === 'TrendVerdict') return candidateDecisionAllowedTrendVerdict_(value);
+    if (target === 'TrendLastChecked' || target === 'PreflightCheckedAt') return candidateDecisionAllowedDate_(value);
+    if (target === 'ExternalSignal') return candidateDecisionAllowedExternalSignal_(value);
+    if (target === 'FinalResearchStage') return candidateDecisionAllowedFinalResearchStage_(value);
+    if (target === 'PreflightVerdict') return ['', 'PENDING', 'AUTO_REJECT', 'WATCH', 'MANUAL_REVIEW', 'PREFLIGHT_ERROR'].indexOf(String(value).trim()) >= 0;
+    if (target === 'DecisionID') return /^steam-decision-/i.test(String(value).trim());
+    return true;
+  };
+  let rowsMigrated = 0;
+  let cellsMigrated = 0;
+  rows.forEach((row, index) => {
+    let rowChanged = false;
+    migrations.forEach(item => {
+      const source = row[item.from - 1];
+      if (source === '' || source === null || source === undefined) return;
+      const existingTarget = row[item.to - 1];
+      if (!validTarget(item.target, existingTarget)) {
+        row[item.to - 1] = source;
+        cellsMigrated += 1;
+      }
+      // The old physical columns are no longer part of the canonical schema.
+      if (item.from !== item.to) row[item.from - 1] = '';
+      rowChanged = true;
+    });
+    if (rowChanged) rowsMigrated += 1;
+  });
+  if (rowsMigrated) sheet.getRange(2, 1, rows.length, Math.max(sheet.getLastColumn(), 60)).setValues(rows);
+  SpreadsheetApp.flush();
+  return {ok: true, rowsMigrated, cellsMigrated};
+}
+
 function setupSteamHotwordV2() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
 
@@ -1142,6 +1275,10 @@ function setupSteamHotwordV2() {
   setupGscBindingUi_(ss);
   ensureExternalSignalSheets_(ss);
   repairCandidateDecisionSchemaData_(ss);
+  const enumRepair = repairCandidateDecisionEnumData_(ss);
+  if (typeof Logger !== 'undefined' && Logger.log && enumRepair.repaired) {
+    Logger.log(JSON.stringify({candidateDecisionEnumRepair: enumRepair}));
+  }
   setupCandidateDecisionUi_(ss);
   setupCandidateDecisionBackendView_(ss);
 
@@ -1156,6 +1293,7 @@ function setupSteamHotwordV2() {
   organizeSheetUi_(ss);
 
   safeToast_('V2.5 表结构已初始化。下一步设置免费 Games Popularity API Key。', 'Steam 0→1B', 8);
+  return {ok: true, candidateDecisionEnumRepair: enumRepair};
 }
 
 // ============================================================================
@@ -1274,7 +1412,61 @@ function steamRawArchivePlan_(ss, now) {
     months[month].eligible = steamRawArchiveMonthEnd_(month, timezone).getTime() < cutoff.getTime();
   });
   const dates = values.map(row => steamRawArchiveDate_(row[schema.observation])).filter(Boolean).sort((a, b) => a - b);
+  Object.keys(months).forEach(month => {
+    months[month] = steamRawArchiveDedupeMonth_(ss, months[month], schema);
+  });
   return {sheet, schema, cutoff, earliest: dates.length ? dates[0] : null, latest: dates.length ? dates[dates.length - 1] : null, months: months};
+}
+
+/**
+ * Before archiving, remove only provable duplicate non-canonical runs:
+ * same local day + App ID, with a SUCCESS run available as the replacement.
+ * Unknown or non-success-only history is retained.
+ */
+function steamRawArchiveDedupeMonth_(ss, item, schema) {
+  const logSheet = ss.getSheetByName(HOTWORD_V2.sheets.log);
+  const runStatus = new Map();
+  if (logSheet && logSheet.getLastRow() >= 2) {
+    const logWidth = Math.max(logSheet.getLastColumn(), HOTWORD_V2.logHeaders.length);
+    const logHeaders = logSheet.getRange(1, 1, 1, logWidth).getDisplayValues()[0];
+    const runCol = logHeaders.indexOf('Run ID');
+    const statusCol = logHeaders.indexOf('运行状态');
+    if (runCol >= 0 && statusCol >= 0) {
+      logSheet.getRange(2, 1, logSheet.getLastRow() - 1, logWidth).getValues().forEach(row => {
+        const runId = String(row[runCol] || '').trim();
+        if (runId) runStatus.set(runId, String(row[statusCol] || '').trim().toUpperCase());
+      });
+    }
+  }
+
+  const groups = new Map();
+  item.rows.forEach((row, index) => {
+    const date = steamRawArchiveDate_(row[schema.observation]);
+    const dateKey = date ? steamRawArchiveMonthKey_(date, 'Asia/Shanghai') + '-' + String(date.getDate()).padStart(2, '0') : '';
+    const appId = String(row[schema.appId] || '').trim();
+    const key = dateKey + '|' + appId;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push({index, runId: String(row[schema.runId] || '').trim(), status: runStatus.get(String(row[schema.runId] || '').trim()) || ''});
+  });
+
+  const removed = new Set();
+  groups.forEach(group => {
+    if (group.length < 2 || !group.some(entry => entry.status === 'SUCCESS')) return;
+    group.forEach(entry => {
+      if (entry.status && entry.status !== 'SUCCESS') removed.add(entry.index);
+    });
+  });
+
+  return {
+    month: item.month,
+    rows: item.rows.filter((row, index) => !removed.has(index)),
+    displayRows: item.displayRows.filter((row, index) => !removed.has(index)),
+    // Delete the complete old group after the canonical replacement has been
+    // included in the archive; otherwise a discarded duplicate would stay hot.
+    rowNumbers: item.rowNumbers,
+    eligible: item.eligible,
+    dedupedRows: removed.size
+  };
 }
 
 function getSteamRawArchiveStatus_(ss, now) {
@@ -1314,22 +1506,59 @@ function executeSteamRawMonthlyArchive(now) {
       file = folder.createFile(fileName, csv, 'text/csv');
     }
     steamRawArchiveValidateCsv_(file.getBlob().getDataAsString(), plan.schema.headers, item.displayRows, keyRows);
-    item.rowNumbers.slice().sort((a, b) => b - a).forEach(rowNumber => plan.sheet['delete' + 'Rows'](rowNumber, 1));
-    results.push({month, rows: item.rows.length, fileName, deleted: item.rows.length});
+    const proof = steamRawArchiveProofDates_();
+    const canDelete = item.displayRows.every(row => proof.has(String(row[plan.schema.observation] || '').substring(0, 10)));
+    if (canDelete) item.rowNumbers.slice().sort((a, b) => b - a).forEach(rowNumber => plan.sheet.deleteRows(rowNumber, 1));
+    results.push({month, rows: item.rows.length, fileName, deleted: canDelete ? item.rows.length : 0, awaitingLocalRawProof: !canDelete});
   });
+  const diagnostics = steamCleanupDiagnosticRows_(ss, now || new Date());
   safeToast_('Steam Raw 月度归档完成：' + results.length + ' 个月份。', 'Steam Raw Archive', 7);
-  return {ok: true, results};
+  return {ok: true, results, diagnostics};
+}
+
+function steamRawArchiveProofDates_() {
+  if (typeof PropertiesService === 'undefined') return new Set();
+  const raw = PropertiesService.getScriptProperties().getProperty('STEAM_RAW_ARCHIVE_PROOF_DATES_V1');
+  try { return new Set(JSON.parse(raw || '[]')); } catch (e) { return new Set(); }
+}
+
+function markSteamRawArchiveProof(dates) {
+  const current = steamRawArchiveProofDates_();
+  (dates || []).forEach(date => { if (/^\d{4}-\d{2}-\d{2}$/.test(String(date))) current.add(String(date)); });
+  PropertiesService.getScriptProperties().setProperty('STEAM_RAW_ARCHIVE_PROOF_DATES_V1', JSON.stringify(Array.from(current).sort()));
+  return Array.from(current).sort();
+}
+
+function steamCleanupDiagnosticRows_(ss, now) {
+  const external = deleteSteamRowsOlderThan_(ss, HOTWORD_V2.sheets.externalDataAttempts, '尝试时间', now, HOTWORD_V2.diagnosticRetention.externalDataAttemptsDays);
+  const logs = deleteSteamRowsOlderThan_(ss, HOTWORD_V2.sheets.log, '运行时间', now, HOTWORD_V2.diagnosticRetention.runLogDays);
+  return {externalDataAttempts: external, runLog: logs};
+}
+
+function deleteSteamRowsOlderThan_(ss, sheetName, dateHeader, now, days) {
+  const sheet = ss.getSheetByName(sheetName);
+  if (!sheet || sheet.getLastRow() < 2) return 0;
+  const width = Math.max(sheet.getLastColumn(), 1);
+  const headers = sheet.getRange(1, 1, 1, width).getDisplayValues()[0];
+  const dateCol = headers.indexOf(dateHeader);
+  if (dateCol < 0) return 0;
+  const cutoff = new Date(new Date(now || new Date()).getTime() - Number(days) * 24 * 60 * 60 * 1000);
+  const values = sheet.getRange(2, 1, sheet.getLastRow() - 1, width).getValues();
+  const rows = [];
+  values.forEach((row, index) => {
+    const date = row[dateCol] instanceof Date ? row[dateCol] : new Date(row[dateCol]);
+    if (date instanceof Date && !isNaN(date.getTime()) && date < cutoff) rows.push(index + 2);
+  });
+  rows.reverse().forEach(rowNumber => sheet.deleteRow(rowNumber));
+  return rows.length;
 }
 
 function runSteamRawArchiveMaintenance() {
-  return executeSteamRawMonthlyArchive();
+  return {enabled: false, reason: 'retention_disabled'};
 }
 
 function setupSteamRawArchiveMaintenance() {
-  const triggers = ScriptApp.getProjectTriggers().filter(trigger => trigger.getHandlerFunction() === HOTWORD_V2.rawArchive.triggerHandler);
-  triggers.slice(1).forEach(trigger => ScriptApp.deleteTrigger(trigger));
-  if (!triggers.length) ScriptApp.newTrigger(HOTWORD_V2.rawArchive.triggerHandler).timeBased().everyDays(1).atHour(3).create();
-  return {existing: triggers.length, ensured: true};
+  return {enabled: false, reason: 'retention_disabled'};
 }
 
 function setupRulesSheet_(ss) {
@@ -2652,6 +2881,7 @@ function runSteamHotword01B() {
         if (state.enrichmentCursor >= eligible.length) {
           refreshTodayActionsFromCandidateDecisions_(ss, startedAt, state.runId, {});
           g010UpsertAuditRow_(ss, state, 'SUCCESS', 'G010 DONE; rows=' + all.length + '; eligible=' + eligible.length);
+          saveSteamMonitoringRaw_(state.runId, startedAt);
           g010ClearState_();
           return {status: 'SUCCESS', runId: state.runId, eligible: eligible.length};
         }
@@ -5890,13 +6120,16 @@ function mapGscSnapshotRow_(headers, row, requestedSiteId, matchedSite, matchedP
   const latestDataIndex = findGscSnapshotColumn_(headers, ['LatestGSCDataDate', 'GSC Last Sync', 'Last Sync', 'last_sync', '最近同步日期', '同步日期']);
   const runDateIndex = findGscSnapshotColumn_(headers, ['RunDate', 'run_date', '运行日期', 'Date', '日期']);
   const firstImpressionIndex = findGscSnapshotColumn_(headers, ['FirstImpressionDate', 'first_impression_date', '首次曝光日期']);
+  const sitemapCountIndex = findGscSnapshotColumn_(headers, ['SitemapURLCount', 'sitemap_url_count', 'Sitemap URL Count']);
   const lastSync = latestDataIndex >= 0 && row[latestDataIndex] ? row[latestDataIndex] : runDateIndex >= 0 ? row[runDateIndex] || '' : '';
   const clicks = clicksIndex >= 0 ? numberOrZero_(row[clicksIndex]) : 0;
   const impressions = impressionsIndex >= 0 ? numberOrZero_(row[impressionsIndex]) : 0;
   const ctr = ctrIndex >= 0 ? numberOrZero_(row[ctrIndex]) : 0;
   const averagePosition = positionIndex >= 0 ? numberOrZero_(row[positionIndex]) : 0;
+  const sitemapUrlCount = sitemapCountIndex >= 0 ? numberOrZero_(row[sitemapCountIndex]) : 0;
   return {
     siteId: String(requestedSiteId || ''), clicks, impressions, ctr, averagePosition, lastSync,
+    sitemapUrlCount,
     status: clicks || impressions || ctr || averagePosition ? 'ok' : 'valid_zero',
     matchedSite: matchedSite || (siteIndex >= 0 ? row[siteIndex] || '' : ''),
     matchedPropertyURL: matchedPropertyURL || (propertyIndex >= 0 ? row[propertyIndex] || '' : ''),
@@ -6054,7 +6287,7 @@ function syncProjectPoolGsc() {
 
   const poolHeaders = poolSheet.getRange(1, 1, 1, HOTWORD_V2.sitePoolHeaders.length).getDisplayValues()[0];
   const poolColumn = name => poolHeaders.indexOf(name);
-  const requiredColumns = ['Site ID', 'GSC Last Sync', 'Clicks', 'Impressions', 'CTR', 'Average Position', 'SEO阶段'];
+  const requiredColumns = ['Site ID', 'GSC Last Sync', 'Clicks', 'Impressions', 'CTR', 'Average Position', 'SEO阶段', 'LaunchPageCount'];
   if (requiredColumns.some(name => poolColumn(name) < 0)) return emptyResult;
 
   const bindings = bindingSheet.getRange(2, 1, bindingSheet.getLastRow() - 1, bindingHeaders.length).getValues();
@@ -6104,6 +6337,13 @@ function syncProjectPoolGsc() {
         poolSheet.getRange(rowNumber, poolColumn(name) + 1).setValue(value === undefined ? 0 : value);
       }
     });
+    const launchPageColumn = poolColumn('LaunchPageCount');
+    const currentLaunchPageCount = numberOrZero_(poolRows[poolIndex][launchPageColumn]);
+    const inventoryPageCount = numberOrZero_(snapshot.sitemapUrlCount);
+    if (inventoryPageCount > 0 && inventoryPageCount !== currentLaunchPageCount) {
+      poolSheet.getRange(rowNumber, launchPageColumn + 1).setValue(inventoryPageCount);
+      poolRows[poolIndex][launchPageColumn] = inventoryPageCount;
+    }
     const seoColumn = poolColumn('SEO阶段');
     if (String(previous.seoStage || '').trim() !== 'FAILED') {
       poolSheet.getRange(rowNumber, seoColumn + 1).setValue(calculateSeoStage(snapshot, previous));
@@ -6151,6 +6391,23 @@ function readCandidateDecisions_(ss) {
       autoMissingEvidence: String(at('自动缺失证据') || '').trim(),
       autoRecommendationResultPath: String(at('自动Recommendation结果路径') || '').trim(),
       autoResearchError: String(at('自动研究错误') || '').trim(),
+      autoBuildEvidence: String(at('自动BUILD依据') || '').trim(),
+      autoBuildThesis: String(at('自动BUILD Thesis') || '').trim(),
+      decisionId: String(at('DecisionID') || '').trim(),
+      machineDecision: String(at('MachineDecision') || '').trim(),
+      machineDecisionReason: String(at('MachineDecisionReason') || '').trim(),
+      recommendedDomain: String(at('RecommendedDomain') || '').trim(),
+      domainTld: String(at('DomainTLD') || '').trim(),
+      domainFirstYearPrice: at('DomainFirstYearPrice') === '' ? '' : at('DomainFirstYearPrice'),
+      domainRegistrar: String(at('DomainRegistrar') || '').trim(),
+      domainPurchaseUrl: String(at('DomainPurchaseURL') || '').trim(),
+      domainCheckedAt: at('DomainCheckedAt') || '',
+      domainAlternative1: String(at('DomainAlternative1') || '').trim(),
+      domainAlternative1Price: at('DomainAlternative1Price') === '' ? '' : at('DomainAlternative1Price'),
+      domainAlternative1PurchaseUrl: String(at('DomainAlternative1PurchaseURL') || '').trim(),
+      domainAlternative2: String(at('DomainAlternative2') || '').trim(),
+      domainAlternative2Price: at('DomainAlternative2Price') === '' ? '' : at('DomainAlternative2Price'),
+      domainAlternative2PurchaseUrl: String(at('DomainAlternative2PurchaseURL') || '').trim(),
       preflightVerdict: String(at('PreflightVerdict') || '').trim(),
       preflightCheckedAt: at('PreflightCheckedAt') || '',
       preflightReason: String(at('PreflightReason') || '').trim(),
@@ -6478,7 +6735,7 @@ function enqueueSteamCandidateResearchJobs_(ss, createdAt) {
     candidateDecisionSetField_(decisionSheet, rowNumber, '自动研究时间', now, decisionCol);
     ['自动Social摘要', '自动SERP摘要', '自动研究结果路径', '自动Recommendation',
       '自动Recommendation置信度', '自动Recommendation理由', '自动缺失证据',
-      '自动Recommendation结果路径', '自动研究错误', 'PreflightCheckedAt', 'PreflightReason']
+      '自动Recommendation结果路径', '自动研究错误', '自动BUILD依据', '自动BUILD Thesis', 'PreflightCheckedAt', 'PreflightReason']
       .forEach(field => candidateDecisionSetField_(decisionSheet, rowNumber, field, '', decisionCol));
     candidateDecisionSetField_(decisionSheet, rowNumber, 'PreflightVerdict', STEAM_PREFLIGHT_ENABLED ? 'PENDING' : '', decisionCol);
     createdJobIds.add(job.job_id);
@@ -6556,7 +6813,7 @@ function syncCandidateDecisions_(ss, records, runTime, rules) {
       decision = {appId, name: rec.name, status: '', lastCheckedDate: '', lastGain: '', lastType: '', nextRecheckDate: '', note: '', lastCheckedStatus: '',
         firstSeen: '', source: '', firstType: '', currentStage: '', researchStatus: '待研究', trendsResult: '', socialResult: '', serpCompetition: '未检查', keywordOpportunity: '未检查', manualNote: '', decisionDate: '', nextAction: '',
         researchJobId: '', autoResearchStatus: '', autoResearchTime: '', autoSocialSummary: '', autoSerpSummary: '', autoResearchResultPath: '',
-        autoRecommendation: '', autoRecommendationConfidence: '', autoRecommendationReasons: '', autoMissingEvidence: '', autoRecommendationResultPath: '', autoResearchError: '',
+        autoRecommendation: '', autoRecommendationConfidence: '', autoRecommendationReasons: '', autoMissingEvidence: '', autoRecommendationResultPath: '', autoResearchError: '', autoBuildEvidence: '', autoBuildThesis: '', decisionId: '',
         preflightVerdict: '', preflightCheckedAt: '', preflightReason: '',
         trendRelativeStrength: '', trendVerdict: '', trendLastChecked: '', externalSignal: '', finalResearchStage: ''};
       decisions.set(appId, decision);
@@ -6650,7 +6907,7 @@ function syncCandidateDecisionFromActionEdit_(e) {
     decision = {appId, name: at('游戏名称') || '', status: '', lastCheckedDate: '', lastGain: '', lastType: '', nextRecheckDate: '', note: '', lastCheckedStatus: '',
       firstSeen: '', source: '', firstType: '', currentStage: at('当前阶段') || '', researchStatus: '', trendsResult: '', socialResult: '', serpCompetition: '', keywordOpportunity: '', manualNote: '', decisionDate: '', nextAction: '', opportunityId: '',
       researchJobId: '', autoResearchStatus: '', autoResearchTime: '', autoSocialSummary: '', autoSerpSummary: '', autoResearchResultPath: '',
-      autoRecommendation: '', autoRecommendationConfidence: '', autoRecommendationReasons: '', autoMissingEvidence: '', autoRecommendationResultPath: '', autoResearchError: '',
+      autoRecommendation: '', autoRecommendationConfidence: '', autoRecommendationReasons: '', autoMissingEvidence: '', autoRecommendationResultPath: '', autoResearchError: '', autoBuildEvidence: '', autoBuildThesis: '', decisionId: '',
       preflightVerdict: '', preflightCheckedAt: '', preflightReason: '',
       trendRelativeStrength: '', trendVerdict: '', trendLastChecked: '', externalSignal: '', finalResearchStage: ''};
   }
@@ -6802,6 +7059,11 @@ function actionRow_(rec) {
   const humanAction = rec.todayAction && (rec.todayAction.isWaiting || rec.todayAction.isCompleted)
     ? rec.todayAction.humanAction
     : deriveHumanAction_({firstRoundType: rec.firstRoundType}, rec.todayAction && rec.todayAction.decision, false);
+  const decision = rec.todayAction && rec.todayAction.decision || {};
+  const purchaseUrl = String(decision.domainPurchaseUrl || '').trim();
+  const purchaseLink = purchaseUrl
+    ? '=HYPERLINK("' + purchaseUrl.replace(/"/g, '""') + '","购买域名")'
+    : '';
 
   return [
     rec.todayAction.type,
@@ -6832,6 +7094,11 @@ function actionRow_(rec) {
     rec.todayAction.lastCheckedDate || (rec.todayAction.decision && rec.todayAction.decision.lastCheckedDate) || '',
     rec.url,
     rec.firstRoundReason,
+    decision.machineDecision || '',
+    decision.recommendedDomain || '',
+    decision.domainFirstYearPrice == null ? '' : decision.domainFirstYearPrice,
+    decision.domainRegistrar || '',
+    purchaseLink,
   ];
 }
 
@@ -7207,9 +7474,8 @@ function todayActionDecisionProjection_(rec, decision) {
 
 function decideTodayActionProjection_(rec, decision, today, rules, ss) {
   const status = normalizeDecisionStatus_(decision && decision.status);
-  if (status === 'BUILD' || status === 'REJECT') {
-    return {include: false, reason: 'Decision=' + status + '，只保留在候选决策历史账本'};
-  }
+  if (status === 'REJECT') return {include: false, reason: 'Decision=REJECT，只保留在候选决策历史账本'};
+  if (status === 'BUILD') return {include: true, isCompleted: true, type: 'BUILD', humanAction: '进入 Site Creation', reason: 'Decision=BUILD，展示机器决定与推荐域名'};
   const action = decideTodayAction_(rec, decision, today, rules);
   if (action.include) return action;
 
@@ -7374,13 +7640,90 @@ function limitTodayActionSamples_(actions, rules) {
   pending.forEach(rec => {
     if (rec.firstRoundType === '🏢 大盘对照' && !selectedSet.has(rec)) selected.push(rec);
   });
-  return waiting.concat(selected);
+  // BUILD is a completed machine decision, but remains visible as a handoff
+  // reference so the domain recommendation is actionable from 今日行动.
+  return dedupeTodayActionByAppId_(waiting.concat(selected).concat(pending.filter(rec =>
+    rec.todayAction && rec.todayAction.type === 'BUILD')));
+}
+
+function dedupeTodayActionByAppId_(actions) {
+  const byAppId = new Map();
+  (actions || []).forEach(rec => {
+    const appId = String(rec && rec.appId || '').trim();
+    if (!appId) return;
+    const existing = byAppId.get(appId);
+    if (!existing || todayActionRecordPriority_(rec) > todayActionRecordPriority_(existing)) {
+      byAppId.set(appId, rec);
+    }
+  });
+  return Array.from(byAppId.values());
+}
+
+function todayActionRecordPriority_(rec) {
+  const action = rec && rec.todayAction || {};
+  const decision = action.decision || {};
+  const isBuild = action.type === 'BUILD' || normalizeDecisionStatus_(decision.status) === 'BUILD';
+  const hasDomain = String(decision.recommendedDomain || '').trim() !== '' ||
+    String(decision.domainPurchaseUrl || '').trim() !== '';
+  return (isBuild ? 4 : 0) + (hasDomain ? 2 : 0) + (action.isCompleted ? 1 : 0);
 }
 
 // Public Apps Script API wrapper; the implementation remains the single
 // underscore-suffixed entry used by the menu, callbacks, and onEdit.
 function refreshTodayActionsFromCandidateDecisions() {
   return refreshTodayActionsFromCandidateDecisions_();
+}
+
+/**
+ * Production-only projection refresh for already persisted BUILD/research data.
+ * This deliberately does not run discovery, enrichment, provider research, or
+ * any domain recommendation logic. Callback-written fields remain the source
+ * of truth; this entry only normalizes their persisted values back through the
+ * current 60-column map before rebuilding 今日行动.
+ */
+function runBuildDecisionDomainRefresh() {
+  const ss = SpreadsheetApp.openById(QUALIFICATION_ELIGIBILITY_PRODUCTION_SHEET_ID);
+  const sheet = ss.getSheetByName(HOTWORD_V2.sheets.decisions);
+  if (!sheet) return {status: 'FAILED', error: 'candidate_sheet_missing'};
+  const columnMap = candidateDecisionColumnMap_(sheet);
+  const decisions = readCandidateDecisions_(ss);
+  const persistedFields = [
+    'MachineDecision', 'MachineDecisionReason', 'RecommendedDomain', 'DomainTLD',
+    'DomainFirstYearPrice', 'DomainRegistrar', 'DomainPurchaseURL', 'DomainCheckedAt',
+    'DomainAlternative1', 'DomainAlternative1Price', 'DomainAlternative1PurchaseURL',
+    'DomainAlternative2', 'DomainAlternative2Price', 'DomainAlternative2PurchaseURL'
+  ];
+  let eligible = 0;
+  let synced = 0;
+  const firstPersistedColumn = columnMap.byName[persistedFields[0]];
+  const persistedWidth = persistedFields.length;
+  const persistedRows = sheet.getRange(2, firstPersistedColumn, Math.max(sheet.getLastRow() - 1, 0), persistedWidth).getValues();
+  decisions.forEach(function (decision) {
+    if (decision.status !== 'BUILD' && decision.autoResearchStatus !== 'COMPLETED') return;
+    eligible += 1;
+    const rowIndex = decision.rowNumber - 2;
+    if (rowIndex < 0 || rowIndex >= persistedRows.length) return;
+    const values = candidateDecisionFieldValues_(decision);
+    persistedFields.forEach(function (field) {
+      const column = columnMap.byName[field];
+      if (!column) return;
+      const value = values[field];
+      if (value !== null && value !== undefined && value !== '') {
+        persistedRows[rowIndex][column - firstPersistedColumn] = value;
+        synced += 1;
+      }
+    });
+  });
+  if (persistedRows.length) {
+    sheet.getRange(2, firstPersistedColumn, persistedRows.length, persistedWidth).setValues(persistedRows);
+  }
+  const actionRefresh = refreshTodayActionsFromCandidateDecisions_(ss, new Date(), 'BUILD-DOMAIN-REFRESH', {});
+  return {
+    status: actionRefresh.ok ? 'SUCCESS' : 'FAILED',
+    eligible,
+    synced,
+    today_action_refresh: actionRefresh
+  };
 }
 
 function todayActionRefreshRunId_(ss, runTime) {
@@ -7400,7 +7743,7 @@ function countTodayActionRows_(sheet) {
     if (!String(row[appIdColumn] || '').trim()) return;
     result.total += 1;
     if (typeColumn >= 0 && row[typeColumn] === 'WATCH_WAITING') result.waiting += 1;
-    else if (typeColumn < 0 || row[typeColumn] !== 'COMPLETED') result.pending += 1;
+    else if (typeColumn < 0 || (row[typeColumn] !== 'COMPLETED' && row[typeColumn] !== 'BUILD')) result.pending += 1;
   });
   return result;
 }
@@ -7650,6 +7993,7 @@ function applyActionFormatting_(sheet, dataRows) {
     setFormat('近似增长率', '0.0%');
     setFormat('评论数', '0');
     setFormat('Steam评分', '0.0');
+    setFormat('首年价', '$0.00');
 
     const typeColumn = headers.indexOf('第一轮类型') + 1;
     const typeRange = sheet.getRange(4, typeColumn, dataRows, 1);
