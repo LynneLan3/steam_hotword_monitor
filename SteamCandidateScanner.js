@@ -401,6 +401,34 @@ function doGet(e) {
       .createTextOutput(JSON.stringify({ jobs: loadPendingSteamCandidateResearchJobs_() }))
       .setMimeType(ContentService.MimeType.JSON);
   }
+  if (action === 'inspectSteamCandidateInboxProduction') {
+    return ContentService
+      .createTextOutput(JSON.stringify(inspectSteamCandidateInboxProduction_()))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+  if (action === 'refreshTodayActionsProduction') {
+    const ss = SpreadsheetApp.openById(QUALIFICATION_ELIGIBILITY_PRODUCTION_SHEET_ID);
+    return ContentService
+      .createTextOutput(JSON.stringify(refreshTodayActionsFromCandidateDecisions_(ss)))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+  if (action === 'recoverSteamCandidateResearchProduction') {
+    const ss = SpreadsheetApp.openById(QUALIFICATION_ELIGIBILITY_PRODUCTION_SHEET_ID);
+    const lock = LockService.getScriptLock();
+    if (!lock.tryLock(5000)) {
+      return ContentService.createTextOutput(JSON.stringify({ok: false, error: 'RECOVERY_LOCK_BUSY'}))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+    try {
+      const queue = enqueueSteamCandidateResearchJobs_(ss, new Date());
+      const refresh = refreshTodayActionsFromCandidateDecisions_(ss);
+      SpreadsheetApp.flush();
+      return ContentService.createTextOutput(JSON.stringify({ok: true, queue: queue, refresh: refresh}))
+        .setMimeType(ContentService.MimeType.JSON);
+    } finally {
+      lock.releaseLock();
+    }
+  }
   return ContentService
     .createTextOutput(JSON.stringify({ error: 'unknown_action', jobs: [] }))
     .setMimeType(ContentService.MimeType.JSON);
