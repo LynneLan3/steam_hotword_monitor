@@ -396,6 +396,11 @@ function doGet(e) {
     return ContentService.createTextOutput(JSON.stringify(repairResult))
       .setMimeType(ContentService.MimeType.JSON);
   }
+  if (action === 'g022RepairMissingRunLedger') {
+    const requestedRunId = String(e.parameter.runId || '20260902-084337');
+    return ContentService.createTextOutput(JSON.stringify(g022RepairMissingRunLedgerFromExisting_(requestedRunId)))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
   if (action === 'pendingSteamCandidateResearchJobs') {
     const ss = SpreadsheetApp.openById(QUALIFICATION_ELIGIBILITY_PRODUCTION_SHEET_ID);
     return ContentService
@@ -478,6 +483,9 @@ function doPost(e) {
     const jobType = String(body.job_type || '').trim().toUpperCase();
     if (jobType === UNIFIED_CANDIDATE_UPSERT_JOB_TYPE) {
       return steamCandidateResearchJsonOutput_(handleUnifiedCandidateUpsertCallback_(body));
+    }
+    if (jobType === 'TWITCH_HISTORICAL_RAW_LEDGER_APPEND') {
+      return steamCandidateResearchJsonOutput_(handleTwitchHistoricalLedgerCallback_(body));
     }
     if (jobType !== STEAM_CANDIDATE_RESEARCH_JOB_TYPE) {
       return steamCandidateResearchJsonOutput_({ok: false, error: 'unsupported_job_type'});
