@@ -420,14 +420,27 @@ function doGet(e) {
         .setMimeType(ContentService.MimeType.JSON);
     }
     try {
+      const masterRepair = repairMasterAppIdsFromSteamUrl_(ss);
+      const reasonBackfill = backfillMachineRecommendationReasons_(ss);
       const queue = enqueueSteamCandidateResearchJobs_(ss, new Date());
       const refresh = refreshTodayActionsFromCandidateDecisions_(ss);
       SpreadsheetApp.flush();
-      return ContentService.createTextOutput(JSON.stringify({ok: true, queue: queue, refresh: refresh}))
+      return ContentService.createTextOutput(JSON.stringify({
+        ok: true,
+        masterRepair: masterRepair,
+        reasonBackfill: reasonBackfill,
+        queue: queue,
+        refresh: refresh
+      }))
         .setMimeType(ContentService.MimeType.JSON);
     } finally {
       lock.releaseLock();
     }
+  }
+  if (action === 'verifyTrendsRecalcProduction') {
+    return ContentService
+      .createTextOutput(JSON.stringify(verifyTrendsRecalcProduction_(e && e.parameter || {})))
+      .setMimeType(ContentService.MimeType.JSON);
   }
   return ContentService
     .createTextOutput(JSON.stringify({ error: 'unknown_action', jobs: [] }))
@@ -835,10 +848,12 @@ function applySteamCandidateRecommendationToDecision_(decision, recommendation) 
   if (!decision || !recommendation) return decision;
   decision.autoRecommendation = recommendation.recommendation || '';
   decision.autoRecommendationConfidence = recommendation.confidence || '';
-  decision.autoRecommendationReasons = steamCandidateResearchJoin_(recommendation.reasons);
+  decision.autoRecommendationReasons = steamCandidateResearchJoin_(recommendation.reasons) ||
+    steamCandidateResearchJoin_(recommendation.blocking_reasons);
   decision.autoMissingEvidence = steamCandidateResearchJoin_(recommendation.missing_evidence);
   decision.machineDecision = normalizeMachineRecommendationDisplay_(recommendation.recommendation);
-  decision.machineDecisionReason = steamCandidateResearchJoin_(recommendation.reasons);
+  decision.machineDecisionReason = steamCandidateResearchJoin_(recommendation.reasons) ||
+    steamCandidateResearchJoin_(recommendation.blocking_reasons);
   return decision;
 }
 
@@ -932,7 +947,8 @@ function handleSteamCandidateResearchCallback_(body) {
   const machineRecommendation = normalizeMachineRecommendationDisplay_(body.machine_recommendation || body.recommendation);
   steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动Recommendation', body.recommendation);
   steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动Recommendation置信度', body.confidence);
-  steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动Recommendation理由', steamCandidateResearchJoin_(body.reasons));
+  steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动Recommendation理由',
+    steamCandidateResearchJoin_(body.reasons) || steamCandidateResearchJoin_(body.blocking_reasons));
   steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动缺失证据', steamCandidateResearchJoin_(body.missing_evidence));
   steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动BUILD依据', JSON.stringify({
     recalc_evidence: body.recalc_evidence || {},
@@ -942,7 +958,10 @@ function handleSteamCandidateResearchCallback_(body) {
   steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动Recommendation结果路径', body.recommendation_result_path);
   steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动研究错误', '');
   steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, 'MachineDecision', machineRecommendation || body.MachineDecision || body.recommendation);
-  steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, 'MachineDecisionReason', body.MachineDecisionReason || steamCandidateResearchJoin_(body.reasons));
+  steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, 'MachineDecisionReason',
+    body.MachineDecisionReason ||
+    steamCandidateResearchJoin_(body.reasons) ||
+    steamCandidateResearchJoin_(body.blocking_reasons));
   ['RecommendedDomain', 'DomainTLD', 'DomainFirstYearPrice', 'DomainRegistrar', 'DomainPurchaseURL', 'DomainCheckedAt',
     'DomainAlternative1', 'DomainAlternative1Price', 'DomainAlternative1PurchaseURL', 'DomainAlternative2',
     'DomainAlternative2Price', 'DomainAlternative2PurchaseURL'].forEach(function (field) {
@@ -2132,17 +2151,21 @@ function inspectSteamCandidateInboxProduction_(gameNames) {
   };
   names.forEach(gameName => {
     const actionRow = rows.find(row => String(row[col('游戏名称')] || '').trim() === gameName);
-    const decision = Array.from(decisions.values()).find(item => String(item.name || '').trim() === gameName);
+    const decision = Array.from(decisions.values()).find(item => String(item.name || '').trim() === gameName) ||
+      findCandidateDecisionByGameName_(decisions, gameName);
+    const master = findMasterRecordByGameName_(ss, gameName);
     out.candidates.push({
       game_name: gameName,
       steam_app_id: actionRow ? actionRow[col('Steam App ID')] : (decision && decision.appId) || '',
+      master_steam_app_id: master ? master.appId : '',
+      master_steam_url: master ? master.url : '',
       search_alias: actionRow ? actionRow[col('搜索别名')] : '',
       social_result: actionRow ? actionRow[col('Social结果')] : (decision && decision.socialResult) || '',
       serp_competition: actionRow ? actionRow[col('SERP竞争')] : (decision && decision.serpCompetition) || '',
       keyword_opportunity: actionRow ? actionRow[col('关键词机会')] : (decision && decision.keywordOpportunity) || '',
       machine_recommendation: actionRow ? actionRow[col('机器推荐')] : (decision && decision.machineDecision) || '',
       machine_confidence: actionRow ? actionRow[col('机器置信度')] : (decision && decision.autoRecommendationConfidence) || '',
-      machine_reason: actionRow ? actionRow[col('机器推荐理由')] : (decision && decision.autoRecommendationReasons) || '',
+      machine_reason: actionRow ? actionRow[col('机器推荐理由')] : (decision && decision.machineDecisionReason) || '',
       human_decision: actionRow ? actionRow[col('人工决定')] : (decision && decision.status) || '',
       final_status: actionRow ? actionRow[col('最终状态')] : deriveFinalStatus_(decision || {}),
       auto_research_status: decision && decision.autoResearchStatus || '',
@@ -2150,6 +2173,136 @@ function inspectSteamCandidateInboxProduction_(gameNames) {
     });
   });
   return out;
+}
+
+function findCandidateDecisionByGameName_(decisions, gameName) {
+  const key = steamCandidateResearchNameKey_(gameName);
+  return Array.from(decisions.values()).find(item => steamCandidateResearchNameKey_(item.name) === key) || null;
+}
+
+function findMasterRecordByGameName_(ss, gameName) {
+  const sheet = ss && ss.getSheetByName ? ss.getSheetByName(HOTWORD_V2.sheets.master) : null;
+  if (!sheet || sheet.getLastRow() < 2) return null;
+  const width = Math.max(sheet.getLastColumn(), HOTWORD_V2.masterHeaders.length);
+  const headers = sheet.getRange(1, 1, 1, width).getDisplayValues()[0];
+  const col = {};
+  HOTWORD_V2.masterHeaders.forEach(name => { col[name] = headers.indexOf(name); });
+  const value = (row, name) => col[name] === undefined || col[name] < 0 ? '' : row[col[name]];
+  const key = steamCandidateResearchNameKey_(gameName);
+  let match = null;
+  sheet.getRange(2, 1, sheet.getLastRow() - 1, width).getValues().forEach(row => {
+    const name = String(value(row, '游戏名称') || '').trim();
+    if (!name || steamCandidateResearchNameKey_(name) !== key) return;
+    match = {
+      appId: String(value(row, 'Steam App ID') || '').trim(),
+      name: name,
+      url: String(value(row, 'Steam URL') || '').trim(),
+      continueNext: String(value(row, '进入下一步') || '').trim()
+    };
+  });
+  return match;
+}
+
+function repairMasterAppIdsFromSteamUrl_(ss) {
+  const sheet = ss.getSheetByName(HOTWORD_V2.sheets.master);
+  const result = {repaired: 0, rows: []};
+  if (!sheet || sheet.getLastRow() < 2) return result;
+  const width = Math.max(sheet.getLastColumn(), HOTWORD_V2.masterHeaders.length);
+  const headers = sheet.getRange(1, 1, 1, width).getDisplayValues()[0];
+  const appIdCol = headers.indexOf('Steam App ID') + 1;
+  const nameCol = headers.indexOf('游戏名称') + 1;
+  const urlCol = headers.indexOf('Steam URL') + 1;
+  if (appIdCol < 1 || urlCol < 1) return result;
+  sheet.getRange(2, 1, sheet.getLastRow() - 1, width).getValues().forEach((row, index) => {
+    const appId = String(row[appIdCol - 1] || '').trim();
+    if (appId) return;
+    const url = String(row[urlCol - 1] || '').trim();
+    const match = url.match(/\/app\/(\d+)\b/);
+    if (!match) return;
+    const repairedAppId = match[1];
+    sheet.getRange(index + 2, appIdCol).setValue(repairedAppId);
+    result.repaired += 1;
+    result.rows.push({
+      row: index + 2,
+      game_name: nameCol > 0 ? String(row[nameCol - 1] || '').trim() : '',
+      steam_app_id: repairedAppId
+    });
+  });
+  return result;
+}
+
+function backfillMachineRecommendationReasons_(ss) {
+  const sheet = ss.getSheetByName(HOTWORD_V2.sheets.decisions);
+  const result = {updated: 0, rows: []};
+  if (!sheet || sheet.getLastRow() < 2) return result;
+  const decisions = readCandidateDecisions_(ss);
+  const columnMap = candidateDecisionColumnMap_(sheet);
+  decisions.forEach(decision => {
+    if (!machineResearchComplete_(decision)) return;
+    if (String(decision.machineDecisionReason || '').trim()) return;
+    const evidence = parseSteamCandidateRecalcEvidence_(decision);
+    if (!evidence) return;
+    const recommendation = buildSteamCandidateRecommendationFromEvidence_(evidence, {
+      trends_result: decision.trendsResult,
+      keyword_opportunity: decision.keywordOpportunity
+    });
+    applySteamCandidateRecommendationToDecision_(decision, recommendation);
+    if (!String(decision.machineDecisionReason || '').trim()) return;
+    candidateDecisionSetField_(sheet, decision.rowNumber, 'MachineDecisionReason', decision.machineDecisionReason, columnMap);
+    candidateDecisionSetField_(sheet, decision.rowNumber, '自动Recommendation理由', decision.autoRecommendationReasons, columnMap);
+    result.updated += 1;
+    result.rows.push({appId: decision.appId, machine_reason: decision.machineDecisionReason});
+  });
+  return result;
+}
+
+function verifyTrendsRecalcProduction_(params) {
+  const appId = String(params && params.steam_app_id || '3905450').trim();
+  const testTrends = String(params && params.trends || '强').trim();
+  const persist = String(params && params.persist || '').trim().toLowerCase() === 'true';
+  const ss = SpreadsheetApp.openById(QUALIFICATION_ELIGIBILITY_PRODUCTION_SHEET_ID);
+  const decisions = readCandidateDecisions_(ss);
+  const decision = decisions.get(appId);
+  if (!decision) return {ok: false, error: 'candidate_not_found', steam_app_id: appId};
+  if (!machineResearchComplete_(decision)) {
+    return {ok: false, error: 'machine_research_not_complete', steam_app_id: appId};
+  }
+  const before = {
+    trends_result: decision.trendsResult || '',
+    machine_recommendation: decision.machineDecision || normalizeMachineRecommendationDisplay_(decision.autoRecommendation),
+    machine_confidence: decision.autoRecommendationConfidence || '',
+    machine_reason: decision.machineDecisionReason || decision.autoRecommendationReasons || ''
+  };
+  const working = Object.assign({}, decision, {trendsResult: testTrends});
+  const recalculated = recalculateSteamCandidateRecommendationFromTrends_(working);
+  if (!recalculated) return {ok: false, error: 'recalc_unavailable', steam_app_id: appId};
+  const after = {
+    trends_result: testTrends,
+    machine_recommendation: working.machineDecision || normalizeMachineRecommendationDisplay_(working.autoRecommendation),
+    machine_confidence: working.autoRecommendationConfidence || '',
+    machine_reason: working.machineDecisionReason || working.autoRecommendationReasons || ''
+  };
+  if (persist) {
+    const decisionSheet = ss.getSheetByName(HOTWORD_V2.sheets.decisions);
+    const columnMap = candidateDecisionColumnMap_(decisionSheet);
+    candidateDecisionSetField_(decisionSheet, decision.rowNumber, 'Trends结果', testTrends, columnMap);
+    candidateDecisionSetField_(decisionSheet, decision.rowNumber, 'MachineDecision', after.machine_recommendation, columnMap);
+    candidateDecisionSetField_(decisionSheet, decision.rowNumber, '自动Recommendation置信度', after.machine_confidence, columnMap);
+    candidateDecisionSetField_(decisionSheet, decision.rowNumber, 'MachineDecisionReason', after.machine_reason, columnMap);
+    candidateDecisionSetField_(decisionSheet, decision.rowNumber, '自动Recommendation理由', after.machine_reason, columnMap);
+    refreshTodayActionsFromCandidateDecisions_(ss);
+    SpreadsheetApp.flush();
+  }
+  return {
+    ok: true,
+    steam_app_id: appId,
+    persisted: persist,
+    changed: before.machine_recommendation !== after.machine_recommendation ||
+      before.machine_confidence !== after.machine_confidence ||
+      before.machine_reason !== after.machine_reason,
+    before: before,
+    after: after
+  };
 }
 
 function setupBacktestSheet_(ss) {
