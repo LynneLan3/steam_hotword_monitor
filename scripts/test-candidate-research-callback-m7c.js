@@ -50,7 +50,8 @@ var decisionHeaders = [
   '关键词机会', '人工备注', 'Decision', 'Decision日期', 'Next Action', 'OpportunityID',
   'ResearchJobID', '自动研究状态', '自动研究时间', '自动Social摘要', '自动SERP摘要', '自动研究结果路径',
   '自动Recommendation', '自动Recommendation置信度', '自动Recommendation理由', '自动缺失证据',
-  '自动Recommendation结果路径', '自动研究错误'
+  '自动Recommendation结果路径', '自动研究错误', 'MachineDecision', 'MachineDecisionReason',
+  'PreflightVerdict', 'PreflightCheckedAt', 'PreflightReason'
 ];
 var masterHeaders = [
   '最后扫描时间', 'Steam App ID', '游戏名称', 'Steam URL', '候选来源', '来源排名',
@@ -126,7 +127,7 @@ spreadsheet = {
 };
 properties.STEAM_CANDIDATE_RESEARCH_WRITE_TOKEN = token;
 
-function completedPayload() {
+var completedPayload = function () {
   return {
     token: token,
     job_id: 'steam-research-4026250-20260823',
@@ -142,17 +143,29 @@ function completedPayload() {
     missing_evidence: [],
     social_summary: {
       status: 'AVAILABLE', evidence_count: 10, cluster_count: 4,
-      actionable_cluster_count: 2, watch_cluster_count: 1, top_topics: ['automation', 'upgrades']
+      actionable_cluster_count: 2, watch_cluster_count: 1, top_topics: ['automation', 'upgrades'],
+      verdict: '强', one_liner: 'reddit/youtube；主题:automation'
     },
     serp_summary: {
       status: 'AVAILABLE', query: 'Example Game', organic_count: 10,
       guide_density: 'LOW', high_video_ugc: true, contamination: true
     },
+    machine_fields: {
+      social_result: '强',
+      social_verdict: '强',
+      social_one_liner: 'reddit/youtube；主题:automation',
+      serp_competition: '低',
+      keyword_opportunity: '有'
+    },
+    machine_recommendation: 'BUILD',
+    preflight_verdict: 'MANUAL_REVIEW',
+    preflight_reason: 'Passed filters',
+    preflight_checked_at: '2026-08-23T02:00:00Z',
     research_result_path: 'jobs/steam-research-4026250-20260823/steam_candidate_research_result.json',
     recommendation_result_path: 'jobs/steam-research-4026250-20260823/steam_candidate_recommendation.json',
     completed_at: '2026-08-23T02:00:00Z'
   };
-}
+};
 
 function post(body) {
   return JSON.parse(sandbox.doPost({postData: {contents: JSON.stringify(body)}}).text);
@@ -163,9 +176,13 @@ assert(first.ok === true, 'authorized completed callback accepted');
 assert(decision[index(decisionHeaders, '自动研究状态')] === 'COMPLETED', 'automatic status written');
 assert(decision[index(decisionHeaders, '自动Recommendation')] === 'RECOMMEND_BUILD', 'recommendation written');
 assert(decision[index(decisionHeaders, '自动Recommendation置信度')] === 'HIGH', 'confidence written');
-assert(decision[index(decisionHeaders, '自动Social摘要')].indexOf('AVAILABLE | evidence=10 | clusters=4 | actionable=2 | automation / upgrades') === 0, 'social summary written');
+assert(decision[index(decisionHeaders, '自动Social摘要')] === '强 | reddit/youtube；主题:automation', 'social summary written');
+assert(decision[index(decisionHeaders, 'Social结果')] === '强', 'machine social result written');
+assert(decision[index(decisionHeaders, 'SERP竞争')] === '低', 'machine serp competition written');
+assert(decision[index(decisionHeaders, '关键词机会')] === '有', 'machine keyword opportunity written');
+assert(decision[index(decisionHeaders, 'MachineDecision')] === 'BUILD', 'machine recommendation normalized');
 assert(decision[index(decisionHeaders, '自动SERP摘要')] === 'AVAILABLE | organic=10 | guide=LOW | video_ugc=yes | contamination=yes', 'SERP summary written');
-assert(decision[index(decisionHeaders, 'Google Trends结果')] === '强' && decision[index(decisionHeaders, 'Social结果')] === '人工Social' && decision[index(decisionHeaders, 'SERP竞争')] === '低' && decision[index(decisionHeaders, '关键词机会')] === '有' && decision[index(decisionHeaders, 'Decision')] === 'WATCH' && decision[index(decisionHeaders, '人工备注')] === '人工备注', 'manual fields preserved');
+assert(decision[index(decisionHeaders, 'Google Trends结果')] === '强' && decision[index(decisionHeaders, 'Social结果')] === '强' && decision[index(decisionHeaders, 'SERP竞争')] === '低' && decision[index(decisionHeaders, '关键词机会')] === '有' && decision[index(decisionHeaders, 'Decision')] === 'WATCH' && decision[index(decisionHeaders, '人工备注')] === '人工备注', 'manual trends/decision preserved; machine overwrites social/serp/keyword');
 
 var beforeRepeat = JSON.stringify(decision);
 var repeat = post(completedPayload());
@@ -179,7 +196,7 @@ var wrongApp = completedPayload();
 wrongApp.steam_app_id = '9999999';
 assert(post(wrongApp).ok === false, 'wrong app id rejected');
 var invalidRecommendation = completedPayload();
-invalidRecommendation.recommendation = 'BUILD';
+invalidRecommendation.recommendation = 'INVALID_RECOMMENDATION';
 assert(post(invalidRecommendation).ok === false, 'invalid recommendation rejected');
 var unauthorized = completedPayload();
 unauthorized.token = 'wrong-token';

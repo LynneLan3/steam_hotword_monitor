@@ -181,11 +181,11 @@ var rules = new FakeSheet('规则配置', ['规则Key', '当前值'], [
   ['RECHECK_GAIN_GROWTH_MIN', 0.30], ['WATCH_RECHECK_DAYS_STRONG', 3], ['WATCH_RECHECK_DAYS_NORMAL', 7]
 ]);
 var staleRows = [
-  row(actionHeaders, {'行动类型': 'NEW', '游戏名称': 'BRIGANDINE ABYSS', 'Steam App ID': '1001', 'Decision': ''}),
-  row(actionHeaders, {'行动类型': 'NEW', '游戏名称': "Soul's Remnant", 'Steam App ID': '1002', 'Decision': ''}),
-  row(actionHeaders, {'行动类型': 'NEW', '游戏名称': 'BOMBANANA!', 'Steam App ID': '1003', 'Decision': '', '人工备注': 'keep manual note'}),
-  row(actionHeaders, {'行动类型': 'NEW', '游戏名称': 'lovebyte.exe', 'Steam App ID': '1004', 'Decision': ''}),
-  row(actionHeaders, {'行动类型': 'NEW', '游戏名称': 'Money for Girls: Amortized', 'Steam App ID': '1005', 'Decision': ''})
+  row(actionHeaders, {'行动类型': 'NEW', '游戏名称': 'BRIGANDINE ABYSS', 'Steam App ID': '1001', '人工决定': ''}),
+  row(actionHeaders, {'行动类型': 'NEW', '游戏名称': "Soul's Remnant", 'Steam App ID': '1002', '人工决定': ''}),
+  row(actionHeaders, {'行动类型': 'NEW', '游戏名称': 'BOMBANANA!', 'Steam App ID': '1003', '人工决定': '', '人工备注': 'keep manual note'}),
+  row(actionHeaders, {'行动类型': 'NEW', '游戏名称': 'lovebyte.exe', 'Steam App ID': '1004', '人工决定': ''}),
+  row(actionHeaders, {'行动类型': 'NEW', '游戏名称': 'Money for Girls: Amortized', 'Steam App ID': '1005', '人工决定': ''})
 ];
 var spreadsheet = new FakeSpreadsheet({
   '候选主表': new FakeSheet('候选主表', masterHeaders, masterRows),
@@ -274,20 +274,20 @@ assert(!find('4026250'), 'history-library Project P.I.T.T. is absent from 今日
 ['1003', '1004', '1005'].forEach(function (appId) {
   var waiting = find(appId);
   assert(waiting && waiting[actionHeaders.indexOf('行动类型')] === 'WATCH_WAITING', appId + ' is waiting');
-  assert(waiting[actionHeaders.indexOf('Decision')] === 'WATCH', appId + ' Decision is authoritative');
+  assert(waiting[actionHeaders.indexOf('人工决定')] === 'WATCH', appId + ' 人工决定 is authoritative');
   assert(String(waiting[actionHeaders.indexOf('人工动作')]).indexOf('等待 ') === 0, appId + ' does not ask for Trends');
 });
 var newManual = find('1006');
-assert(newManual[actionHeaders.indexOf('行动类型')] === 'NEW', 'new MANUAL_REVIEW remains current task');
-assert(newManual[actionHeaders.indexOf('人工动作')] === '检查 Google Trends', 'new MANUAL_REVIEW asks for Trends');
-assert(newManual[actionHeaders.indexOf('Decision')] === '', 'new MANUAL_REVIEW has no final Decision');
+assert(newManual[actionHeaders.indexOf('行动类型')] === 'RESEARCHING', 'new MANUAL_REVIEW waits for machine research');
+assert(newManual[actionHeaders.indexOf('人工动作')] === '机器研究中', 'new MANUAL_REVIEW shows machine research status');
+assert(newManual[actionHeaders.indexOf('人工决定')] === '', 'new MANUAL_REVIEW has no final 人工决定');
 var sinkingCity = find('2825860');
 assert(sinkingCity && sinkingCity[actionHeaders.indexOf('行动类型')] === 'NEW', 'P2 master-only candidate enters Today Action');
 assert(sinkingCity[actionHeaders.indexOf('游戏名称')] === 'The Sinking City 2', 'P2 real case name is preserved');
 assert(sinkingCity[actionHeaders.indexOf('第一轮类型')] === '🟡 Trend Watch', 'P2 type is preserved');
 assert(sinkingCity[actionHeaders.indexOf('人工动作')] === '检查 Google Trends', 'P2 master-only candidate asks for Trends');
 var existingTrends = find('1007');
-assert(existingTrends[actionHeaders.indexOf('人工动作')] === '检查关键词', 'existing Trends advances to keyword research');
+assert(existingTrends[actionHeaders.indexOf('人工动作')] === '机器研究中', 'existing Trends still waits for machine research');
 assert(existingTrends[actionHeaders.indexOf('Trends结果')] === '强', 'existing Trends result is synchronized');
 assert(existingTrends[actionHeaders.indexOf('Trends结果')] !== '未检查', 'existing Trends is not reset');
 assert(find('1003')[actionHeaders.indexOf('人工备注')] === 'keep manual note', 'manual note is preserved');

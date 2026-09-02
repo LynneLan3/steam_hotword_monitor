@@ -241,9 +241,13 @@ const HOTWORD_V2 = {
     '行动类型', '优先级', '游戏名称', 'Steam App ID', '第一轮类型',
     'Steam Followers', 'Steam 7d Gain', '近似增长率',
     '发布阶段', 'Steam发布日期', '距发售天数', '评论数', 'Steam评分',
-    '搜索别名', 'Google Trends链接', 'Trends结果', 'Social结果', 'SERP竞争', '关键词机会', 'Decision', '人工备注',
+    '搜索别名', 'Google Trends链接', 'Trends结果',
+    'Social结果', 'SERP竞争', '关键词机会',
+    '机器推荐', '机器置信度', '机器推荐理由',
+    '人工决定', '人工备注', '最终状态',
     '当前阶段', '研究状态', '研究完成度', '人工动作', '触发原因', '上次人工检查日',
-    'Steam URL', '判定依据', '机器决定', '推荐域名', '首年价', '注册商', '购买域名'
+    'Steam URL', '判定依据',
+    '推荐域名', '首年价', '注册商', '购买域名'
   ],
 
   decisionHeaders: [
@@ -511,7 +515,8 @@ function validateSteamCandidateResearchCallback_(body) {
   }
   // V1 preflight callback: deterministic queue verdict only. It intentionally
   // does not require the older M7B recommendation/social contract.
-  if (steamCandidateResearchCallbackString_(body.preflight_verdict)) {
+  if (steamCandidateResearchCallbackString_(body.preflight_verdict) &&
+      !steamCandidateResearchCallbackString_(body.recommendation)) {
     const verdict = steamCandidateResearchCallbackString_(body.preflight_verdict).toUpperCase();
     if (!STEAM_PREFLIGHT_VERDICTS[verdict]) return {ok: false, error: 'invalid_preflight_verdict'};
     if (!steamCandidateResearchCallbackString_(body.preflight_checked_at)) return {ok: false, error: 'missing_preflight_checked_at'};
@@ -650,12 +655,173 @@ function steamCandidateResearchJoin_(value) {
 
 function steamCandidateResearchSocialSummary_(summary) {
   const topics = steamCandidateResearchCallbackArray_(summary.top_topics);
+  const verdict = steamCandidateResearchCallbackString_(summary.verdict);
+  const oneLiner = steamCandidateResearchCallbackString_(summary.one_liner);
+  if (verdict && oneLiner) return verdict + ' | ' + oneLiner;
   let text = steamCandidateResearchCallbackString_(summary.status).toUpperCase() +
     ' | evidence=' + summary.evidence_count +
     ' | clusters=' + summary.cluster_count +
     ' | actionable=' + summary.actionable_cluster_count;
   if (topics.length) text += ' | ' + topics.join(' / ');
   return text;
+}
+
+function normalizeMachineRecommendationDisplay_(value) {
+  const normalized = steamCandidateResearchCallbackString_(value).toUpperCase();
+  if (normalized === 'RECOMMEND_BUILD' || normalized === 'BUILD') return 'BUILD';
+  if (normalized === 'RECOMMEND_WATCH' || normalized === 'WATCH') return 'WATCH';
+  if (normalized === 'RECOMMEND_REJECT' || normalized === 'REJECT' || normalized === 'INSUFFICIENT_EVIDENCE') return 'REJECT';
+  return '';
+}
+
+function deriveFinalStatus_(decision) {
+  const human = normalizeDecisionStatus_(decision && (decision.status || decision.humanDecision));
+  if (human) return human;
+  return '待人工确认';
+}
+
+function machineResearchPending_(decision) {
+  const status = steamCandidateResearchCallbackString_(decision && decision.autoResearchStatus).toUpperCase();
+  return !status || status === 'PENDING' || status === 'RUNNING';
+}
+
+function machineResearchFailed_(decision) {
+  return steamCandidateResearchCallbackString_(decision && decision.autoResearchStatus).toUpperCase() === 'FAILED';
+}
+
+function machineResearchComplete_(decision) {
+  return steamCandidateResearchCallbackString_(decision && decision.autoResearchStatus).toUpperCase() === 'COMPLETED';
+}
+
+function formatMachineSocialDisplay_(decision) {
+  const verdict = steamCandidateResearchCallbackString_(decision && decision.socialResult);
+  const summary = steamCandidateResearchCallbackString_(decision && decision.autoSocialSummary);
+  if (!verdict || verdict === '未检查') return summary || verdict || '';
+  if (summary && summary.indexOf(' | ') >= 0) return summary;
+  const oneLiner = summary && summary.indexOf(verdict + ' | ') === 0
+    ? summary.slice(verdict.length + 3)
+    : (summary || '');
+  return oneLiner ? verdict + ' | ' + oneLiner : verdict;
+}
+
+function candidateInboxHumanAction_(rec, decision) {
+  if (machineResearchPending_(decision)) return '机器研究中';
+  if (machineResearchFailed_(decision)) return '机器研究失败，待复查';
+  if (!hasCompletedManualResearchValue_(decision && decision.trendsResult)) return '检查 Google Trends';
+  if (!normalizeDecisionStatus_(decision && decision.status)) return '选择 BUILD / WATCH / REJECT';
+  return '';
+}
+
+function parseSteamCandidateRecalcEvidence_(decision) {
+  const raw = String(decision && decision.autoBuildEvidence || '').trim();
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && parsed.recalc_evidence) return parsed.recalc_evidence;
+    if (parsed && parsed.first_round_type) return parsed;
+  } catch (err) {
+    return null;
+  }
+  return null;
+}
+
+function normalizeSteamCandidateTrendsSignal_(value) {
+  const normalized = String(value || '').trim().toUpperCase();
+  if (normalized === '强' || normalized === 'STRONG') return 'STRONG';
+  if (normalized === '中' || normalized === 'MEDIUM') return 'MEDIUM';
+  if (normalized === '弱' || normalized === '无' || normalized === 'WEAK' || normalized === 'NONE') return 'WEAK_OR_NONE';
+  return 'UNKNOWN';
+}
+
+function normalizeSteamCandidateKeywordSignal_(value) {
+  const normalized = String(value || '').trim().toUpperCase();
+  if (normalized === '有' || normalized === 'YES' || normalized === 'PRESENT') return 'PRESENT';
+  if (normalized === '无' || normalized === 'NO' || normalized === 'NOT_FOUND') return 'NOT_FOUND';
+  return 'UNKNOWN';
+}
+
+function normalizeSteamCandidateFirstRoundSignal_(value) {
+  const compact = String(value || '').replace(/\s+/g, '');
+  if (compact.indexOf('🔥') === 0 || compact.indexOf('趋势') >= 0 || compact.indexOf('Early') >= 0 || compact.indexOf('🌱') === 0) return 'STRONG';
+  if (compact.indexOf('⚪') === 0 || compact.indexOf('低优先级') >= 0) return 'WEAK';
+  return 'UNKNOWN';
+}
+
+function buildSteamCandidateRecommendationFromEvidence_(evidence, manualSignals) {
+  const snapshot = evidence || {};
+  const manual = manualSignals || {};
+  const steamType = normalizeSteamCandidateFirstRoundSignal_(snapshot.first_round_type || manual.first_round_type);
+  const trends = normalizeSteamCandidateTrendsSignal_(manual.trends_result || manual.trendsResult || snapshot.trends_result);
+  const keyword = normalizeSteamCandidateKeywordSignal_(manual.keyword_opportunity || manual.keywordOpportunity || snapshot.keyword_opportunity);
+  const actionableSocial = Number(snapshot.actionable_social_cluster_count || 0) >= 1;
+  const highVideoUgc = !!snapshot.serp_high_video_ugc;
+  const guideDensity = String(snapshot.serp_guide_density || 'UNKNOWN').toUpperCase();
+  const highGuideDensity = guideDensity === 'HIGH';
+  const lowGuideDensity = guideDensity === 'LOW';
+  const reasons = [];
+  const blockingReasons = [];
+  const missingEvidence = [];
+  if (!snapshot.social_available) missingEvidence.push('SOCIAL_EVIDENCE_NOT_AVAILABLE');
+  if (!snapshot.serp_available) missingEvidence.push('SERP_EVIDENCE_NOT_AVAILABLE');
+  if (trends === 'UNKNOWN') missingEvidence.push('TRENDS_NOT_AVAILABLE');
+  if (keyword === 'UNKNOWN') missingEvidence.push('KEYWORD_OPPORTUNITY_NOT_AVAILABLE');
+
+  const build = steamType === 'STRONG' && lowGuideDensity && (actionableSocial || highVideoUgc) && !highGuideDensity;
+  const rejectWeakSteam = steamType === 'WEAK' && highGuideDensity && !actionableSocial;
+  const rejectManual = trends === 'WEAK_OR_NONE' && keyword === 'NOT_FOUND' && highGuideDensity && !actionableSocial;
+  let recommendation = 'RECOMMEND_WATCH';
+  if (build) {
+    recommendation = 'RECOMMEND_BUILD';
+    reasons.push('STEAM_STRONG_EARLY_SIGNAL');
+    if (lowGuideDensity) reasons.push('LOW_GUIDE_DENSITY');
+    if (actionableSocial) reasons.push('ACTIONABLE_SOCIAL_PROBLEMS');
+    if (highVideoUgc) reasons.push('HIGH_VIDEO_UGC_PRESENCE');
+    if (trends === 'STRONG') reasons.push('TRENDS_STRONG');
+    if (keyword === 'PRESENT') reasons.push('KEYWORD_OPPORTUNITY_PRESENT');
+  } else if (rejectWeakSteam || rejectManual) {
+    recommendation = 'RECOMMEND_REJECT';
+    if (rejectWeakSteam) reasons.push('STEAM_WEAK_SIGNAL', 'HIGH_GUIDE_DENSITY');
+    else reasons.push('TRENDS_WEAK_OR_NONE', 'KEYWORD_OPPORTUNITY_NOT_FOUND', 'HIGH_GUIDE_DENSITY');
+    reasons.push('NO_ACTIONABLE_SOCIAL_PROBLEMS');
+  } else {
+    if (steamType !== 'STRONG') blockingReasons.push('STEAM_SIGNAL_NOT_STRONG');
+    if (highGuideDensity) blockingReasons.push('HIGH_GUIDE_DENSITY');
+    if (!actionableSocial && !highVideoUgc) blockingReasons.push('NO_ACTIONABLE_SOCIAL_PROBLEMS');
+  }
+
+  let confidence = 'LOW';
+  if (steamType !== 'UNKNOWN') {
+    if (snapshot.serp_available && snapshot.social_available) confidence = 'HIGH';
+    else if (snapshot.serp_available || snapshot.social_available) confidence = 'MEDIUM';
+  }
+  return {
+    recommendation: recommendation,
+    confidence: confidence,
+    reasons: reasons,
+    blocking_reasons: blockingReasons,
+    missing_evidence: missingEvidence
+  };
+}
+
+function applySteamCandidateRecommendationToDecision_(decision, recommendation) {
+  if (!decision || !recommendation) return decision;
+  decision.autoRecommendation = recommendation.recommendation || '';
+  decision.autoRecommendationConfidence = recommendation.confidence || '';
+  decision.autoRecommendationReasons = steamCandidateResearchJoin_(recommendation.reasons);
+  decision.autoMissingEvidence = steamCandidateResearchJoin_(recommendation.missing_evidence);
+  decision.machineDecision = normalizeMachineRecommendationDisplay_(recommendation.recommendation);
+  decision.machineDecisionReason = steamCandidateResearchJoin_(recommendation.reasons);
+  return decision;
+}
+
+function recalculateSteamCandidateRecommendationFromTrends_(decision) {
+  const evidence = parseSteamCandidateRecalcEvidence_(decision);
+  if (!evidence || !machineResearchComplete_(decision)) return null;
+  const recommendation = buildSteamCandidateRecommendationFromEvidence_(evidence, {
+    trends_result: decision.trendsResult,
+    keyword_opportunity: decision.keywordOpportunity
+  });
+  return applySteamCandidateRecommendationToDecision_(decision, recommendation);
 }
 
 function steamCandidateResearchSerpSummary_(summary) {
@@ -719,17 +885,35 @@ function handleSteamCandidateResearchCallback_(body) {
   }
   steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动研究状态', status);
   steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动研究时间', body.completed_at);
+  steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, 'PreflightVerdict', body.preflight_verdict || '');
+  steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, 'PreflightCheckedAt', body.preflight_checked_at || body.completed_at);
+  steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, 'PreflightReason', body.preflight_reason || '');
+  const machine = body.machine_fields && Object.prototype.toString.call(body.machine_fields) === '[object Object]'
+    ? body.machine_fields : {};
+  if (machine.social_result) {
+    steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, 'Social结果', machine.social_result);
+  }
+  if (machine.serp_competition) {
+    steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, 'SERP竞争', machine.serp_competition);
+  }
+  if (machine.keyword_opportunity) {
+    steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '关键词机会', machine.keyword_opportunity);
+  }
   steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动Social摘要', steamCandidateResearchSocialSummary_(body.social_summary));
   steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动SERP摘要', steamCandidateResearchSerpSummary_(body.serp_summary));
+  const machineRecommendation = normalizeMachineRecommendationDisplay_(body.machine_recommendation || body.recommendation);
   steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动Recommendation', body.recommendation);
   steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动Recommendation置信度', body.confidence);
   steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动Recommendation理由', steamCandidateResearchJoin_(body.reasons));
   steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动缺失证据', steamCandidateResearchJoin_(body.missing_evidence));
-  steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动BUILD依据', JSON.stringify(body.decision_evidence || {}));
+  steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动BUILD依据', JSON.stringify({
+    recalc_evidence: body.recalc_evidence || {},
+    machine_fields: body.machine_fields || {}
+  }));
   steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动BUILD Thesis', body.decision_evidence && body.decision_evidence.buildThesis || '');
   steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动Recommendation结果路径', body.recommendation_result_path);
   steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动研究错误', '');
-  steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, 'MachineDecision', body.MachineDecision || body.recommendation);
+  steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, 'MachineDecision', machineRecommendation || body.MachineDecision || body.recommendation);
   steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, 'MachineDecisionReason', body.MachineDecisionReason || steamCandidateResearchJoin_(body.reasons));
   ['RecommendedDomain', 'DomainTLD', 'DomainFirstYearPrice', 'DomainRegistrar', 'DomainPurchaseURL', 'DomainCheckedAt',
     'DomainAlternative1', 'DomainAlternative1Price', 'DomainAlternative1PurchaseURL', 'DomainAlternative2',
@@ -1236,7 +1420,7 @@ const CANDIDATE_DECISION_ENUMS_ = {
   'SERP竞争': {allowed: ['低', '中', '高', '未检查'], fallback: '未检查'},
   '关键词机会': {allowed: ['有', '无', '未检查'], fallback: '未检查'},
   'Decision': {allowed: ['BUILD', 'WATCH', 'REJECT'], fallback: ''},
-  'Next Action': {allowed: ['Google Trends', 'Social验证', 'SERP检查', 'Keyword Research', 'Site Build', 'Recheck', 'None', 'Automatic Preflight'], fallback: ''}
+  'Next Action': {allowed: ['Google Trends', 'Social验证', 'SERP检查', 'Keyword Research', 'Decision', 'Site Build', 'Recheck', 'None', 'Automatic Preflight'], fallback: ''}
 };
 
 function candidateDecisionEnumValue_(field, value) {
@@ -1800,7 +1984,7 @@ function setupTodayActionUi_(ss) {
   const headers = sheet.getRange(3, 1, 1, HOTWORD_V2.actionHeaders.length).getDisplayValues()[0];
   const col = name => headers.indexOf(name) + 1;
   const actionCol = col('行动类型');
-  const decisionCol = col('Decision');
+  const decisionCol = col('人工决定') || col('Decision');
   // V3.3 列重排迁移：旧列（例如 W 列）的验证规则不能继续作用于新列。
   // 先清空今日行动数据区的全部验证，再按当前表头重新绑定人工字段。
   const validationRange = sheet.getRange(4, 1, Math.max(sheet.getMaxRows() - 3, 1), sheet.getMaxColumns());
@@ -1808,9 +1992,7 @@ function setupTodayActionUi_(ss) {
   if (typeof SpreadsheetApp === 'undefined' || !SpreadsheetApp.newDataValidation) return;
   const editableOptions = {
     'Trends结果': ['强', '中', '弱', '无', '未检查'],
-    'Social结果': ['强', '中', '弱', '无', '未检查'],
-    'SERP竞争': ['低', '中', '高', '未检查'],
-    '关键词机会': ['有', '无', '未检查'],
+    '人工决定': ['BUILD', 'WATCH', 'REJECT'],
     'Decision': ['BUILD', 'WATCH', 'REJECT']
   };
   Object.keys(editableOptions).forEach(name => {
@@ -1903,6 +2085,45 @@ function recoverSteamCandidateResearch() {
   }
 }
 
+/** Production smoke readback for inbox verification; read-only. */
+function inspectSteamCandidateInboxProduction_(gameNames) {
+  const names = (gameNames || ['Zad Archery', 'WheelMates', 'Anime Shop Simulator']).map(String);
+  const ss = SpreadsheetApp.openById(QUALIFICATION_ELIGIBILITY_PRODUCTION_SHEET_ID);
+  const actionSheet = ss.getSheetByName(HOTWORD_V2.sheets.action);
+  const headers = actionSheet.getRange(3, 1, 1, HOTWORD_V2.actionHeaders.length).getDisplayValues()[0];
+  const col = name => headers.indexOf(name);
+  const width = HOTWORD_V2.actionHeaders.length;
+  const rows = actionSheet.getLastRow() >= 4
+    ? actionSheet.getRange(4, 1, actionSheet.getLastRow() - 3, width).getDisplayValues()
+    : [];
+  const decisions = readCandidateDecisions_(ss);
+  const out = {
+    actionHeaderCount: headers.length,
+    actionHeaders: headers,
+    candidates: []
+  };
+  names.forEach(gameName => {
+    const actionRow = rows.find(row => String(row[col('游戏名称')] || '').trim() === gameName);
+    const decision = Array.from(decisions.values()).find(item => String(item.name || '').trim() === gameName);
+    out.candidates.push({
+      game_name: gameName,
+      steam_app_id: actionRow ? actionRow[col('Steam App ID')] : (decision && decision.appId) || '',
+      search_alias: actionRow ? actionRow[col('搜索别名')] : '',
+      social_result: actionRow ? actionRow[col('Social结果')] : (decision && decision.socialResult) || '',
+      serp_competition: actionRow ? actionRow[col('SERP竞争')] : (decision && decision.serpCompetition) || '',
+      keyword_opportunity: actionRow ? actionRow[col('关键词机会')] : (decision && decision.keywordOpportunity) || '',
+      machine_recommendation: actionRow ? actionRow[col('机器推荐')] : (decision && decision.machineDecision) || '',
+      machine_confidence: actionRow ? actionRow[col('机器置信度')] : (decision && decision.autoRecommendationConfidence) || '',
+      machine_reason: actionRow ? actionRow[col('机器推荐理由')] : (decision && decision.autoRecommendationReasons) || '',
+      human_decision: actionRow ? actionRow[col('人工决定')] : (decision && decision.status) || '',
+      final_status: actionRow ? actionRow[col('最终状态')] : deriveFinalStatus_(decision || {}),
+      auto_research_status: decision && decision.autoResearchStatus || '',
+      auto_social_summary: decision && decision.autoSocialSummary || ''
+    });
+  });
+  return out;
+}
+
 function setupBacktestSheet_(ss) {
   const name = '1B规则回测';
   let sheet = ss.getSheetByName(name);
@@ -1967,7 +2188,7 @@ function getUsageGuideLines_() {
     '今日行动：实时待办队列。这里只保留当前仍需人工处理的任务；研究完成、BUILD、REJECT 后会实时移出。它不是每日候选快照。',
     '今日候选快照：每天正式 Steam 扫描完成后保存当天首次筛出的完整 P1/P2 候选；按日期+Steam App ID 去重，历史日期永久保留。',
     '候选决策：后台自动同步数据库，以 Steam App ID 唯一标识；日常无需打开或人工编辑。',
-    '每天操作：1.只打开今日行动；2.点击 Google Trends 链接；3.在同一行选择 Trends、Social、SERP、Keyword 结果；4.最后选择 BUILD / WATCH / REJECT；5.必要时写一句人工备注。其余字段自动记录。',
+    '每天操作：1.只打开今日行动；2.等待机器研究完成（Social/SERP/关键词机会自动写回）；3.点击 Google Trends 链接并填写 Trends 结果；4.必要时补充 Volume/KD 等到人工备注；5.选择 BUILD / WATCH / REJECT。其余字段自动记录。',
     '今日行动复查规则：无人工记录的1B候选标记 NEW；WATCH 仅在到期或当前7d Gain较上次检查增长至少30%时出现；BUILD / REJECT 不再出现。每天最多采样 P1 6 个、P2 6 个；未采样候选仍保留在候选主表。',
     '指标说明：数据字典。查字段来源、公式、是否实验规则；不是每日操作入口。',
     '候选主表：系统当前所有候选及自动计算结果。用来回答“为什么推荐 / 为什么过滤”，不是每天逐行浏览的工作表。',
@@ -6846,26 +7067,23 @@ function candidateWatchRecheckGate_(rec, decision, today, rules) {
 }
 
 function candidateManualEvidenceNextAction_(rec, decision, allowWeakTrendRecheck) {
+  if (machineResearchPending_(decision)) return 'Automatic Preflight';
+  if (machineResearchFailed_(decision)) return 'Automatic Preflight';
   const trends = String(decision && decision.trendsResult || '').trim();
   const trendsDone = hasCompletedManualResearchValue_(trends);
   if (!trendsDone) return 'Google Trends';
+  if (!normalizeDecisionStatus_(decision && decision.status)) return 'Decision';
   const trendWeak = trends === '弱' || trends === '无';
   if (trendWeak && !allowWeakTrendRecheck) return 'Recheck';
-  if ((rec && (rec.firstRoundType === '🌱 Early候选' || rec.firstRoundType === '🟢 Early Watch')) && trendWeak &&
-      !hasCompletedManualResearchValue_(decision.socialResult)) return 'Social验证';
-  const stage = String(decision && decision.finalResearchStage || '').trim().toUpperCase();
-  if (stage === 'SERP_PROBE' && !hasCompletedManualResearchValue_(decision.serpCompetition)) return 'SERP检查';
-  if (stage === 'KEYWORD_RESEARCH' && !hasCompletedManualResearchValue_(decision.keywordOpportunity)) return 'Keyword Research';
-  if (!hasCompletedManualResearchValue_(decision.keywordOpportunity)) return 'Keyword Research';
-  if (!hasCompletedManualResearchValue_(decision.serpCompetition)) return 'SERP检查';
   return 'Recheck';
 }
 
 function candidateManualEvidenceNeedsNoProvider_(rec, decision, allowWeakTrendRecheck) {
+  if (machineResearchPending_(decision) || machineResearchFailed_(decision)) return false;
   const trendsDone = hasCompletedManualResearchValue_(decision && decision.trendsResult);
   if (!trendsDone) return false;
   const nextAction = candidateManualEvidenceNextAction_(rec, decision, allowWeakTrendRecheck);
-  return nextAction !== 'Google Trends';
+  return nextAction === 'Recheck' && !normalizeDecisionStatus_(decision && decision.status);
 }
 
 function isTodayActionP2Type_(type) {
@@ -6914,14 +7132,26 @@ function decideTodayAction_(rec, decision, today, rules) {
   const status = normalizeDecisionStatus_(decision && decision.status);
   if (!status) {
     const isManualReview = String(decision && decision.preflightVerdict || '').trim().toUpperCase() === 'MANUAL_REVIEW';
+    if (machineResearchPending_(decision)) {
+      return {include: true, type: 'RESEARCHING', reason: '机器研究进行中', humanAction: '机器研究中'};
+    }
+    if (machineResearchFailed_(decision)) {
+      return {include: true, type: 'RESEARCHING', reason: '机器研究失败', humanAction: '机器研究失败，待复查'};
+    }
     if (!isManualReview && candidateManualEvidenceNeedsNoProvider_(rec, decision, candidateExternalSignalIsNew_(decision))) return {include: false};
     const manualEvidenceAction = candidateManualEvidenceNextAction_(rec, decision, candidateExternalSignalIsNew_(decision));
     if (manualEvidenceAction === 'Recheck') return {include: false};
-    if (decision && (decision.researchStatus === '研究中' || decision.researchStatus === '已完成')) {
-      return {include: true, type: 'RESEARCHING', reason: decision.researchStatus === '已完成' ? '已完成研究但尚未填写最终Decision' : '人工研究尚未完成', humanAction: manualEvidenceAction};
+    if (machineResearchComplete_(decision) || (decision && (decision.researchStatus === '研究中' || decision.researchStatus === '已完成'))) {
+      const humanAction = candidateInboxHumanAction_(rec, decision);
+      return {
+        include: true,
+        type: machineResearchComplete_(decision) ? 'RESEARCHING' : 'RESEARCHING',
+        reason: machineResearchComplete_(decision) ? '机器研究完成，等待人工决定' : '人工研究尚未完成',
+        humanAction: humanAction || '继续完成研究'
+      };
     }
     if (isManualReview && hasCompletedManualResearchValue_(decision && decision.trendsResult)) {
-      return {include: true, type: 'RESEARCHING', reason: 'Preflight要求人工继续研究', humanAction: manualEvidenceAction};
+      return {include: true, type: 'RESEARCHING', reason: 'Preflight要求人工继续研究', humanAction: candidateInboxHumanAction_(rec, decision)};
     }
     return {include: true, type: 'NEW', reason: '首次进入1B，尚无人工复查记录', humanAction: '检查 Google Trends'};
   }
@@ -6968,7 +7198,11 @@ function isUnfinishedResearchValue_(value) {
 function deriveResearchStatus_(decision) {
   const status = normalizeDecisionStatus_(decision && decision.status);
   if (status) return '已完成';
-  const fields = [decision && decision.trendsResult, decision && decision.socialResult, decision && decision.serpCompetition, decision && decision.keywordOpportunity];
+  if (machineResearchPending_(decision)) return '研究中';
+  if (machineResearchComplete_(decision)) {
+    return hasCompletedManualResearchValue_(decision && decision.trendsResult) ? '研究中' : '待研究';
+  }
+  const fields = [decision && decision.trendsResult];
   return fields.every(isUnfinishedResearchValue_) ? '待研究' : '研究中';
 }
 
@@ -6979,11 +7213,11 @@ function deriveResearchCompletion_(decision) {
 
 function deriveHumanAction_(rec, decision, isWatchRecheck) {
   if (isWatchRecheck) return '重新验证趋势变化';
+  const inboxAction = candidateInboxHumanAction_(rec, decision);
+  if (inboxAction) return inboxAction;
   const action = candidateManualEvidenceNextAction_(rec, decision, candidateExternalSignalIsNew_(decision));
   if (action === 'Google Trends') return '检查 Google Trends';
-  if (action === 'Social验证') return '检查 Social';
-  if (action === 'SERP检查') return '检查 SERP';
-  if (action === 'Keyword Research') return '检查关键词';
+  if (action === 'Decision') return '选择 BUILD / WATCH / REJECT';
   return '继续验证';
 }
 
@@ -8121,7 +8355,7 @@ function syncCandidateDecisionFromActionEdit_(e) {
   const sheet = e.range.getSheet();
   if (sheet.getName() !== HOTWORD_V2.sheets.action || e.range.getRow() < 4) return;
   const headers = sheet.getRange(3, 1, 1, HOTWORD_V2.actionHeaders.length).getDisplayValues()[0];
-  const editable = ['Trends结果', 'Social结果', 'SERP竞争', '关键词机会', 'Decision', '人工备注'];
+  const editable = ['Trends结果', '人工决定', 'Decision', '人工备注'];
   const rangeStart = e.range.getColumn();
   const rangeEnd = e.range.getLastColumn ? e.range.getLastColumn() : rangeStart;
   const editedHeaders = editable.filter(name => {
@@ -8150,11 +8384,12 @@ function syncCandidateDecisionFromActionEdit_(e) {
   decision.firstType = decision.firstType || at('第一轮类型') || '';
   decision.currentStage = at('当前阶段') || decision.currentStage;
   decision.trendsResult = at('Trends结果') || '';
-  decision.socialResult = at('Social结果') || '';
-  decision.serpCompetition = at('SERP竞争') || '';
-  decision.keywordOpportunity = at('关键词机会') || '';
   decision.manualNote = at('人工备注') || '';
-  decision.status = normalizeDecisionStatus_(at('Decision'));
+  decision.status = normalizeDecisionStatus_(at('人工决定') || at('Decision'));
+  const trendsEdited = editedHeaders.indexOf('Trends结果') >= 0;
+  if (trendsEdited) {
+    recalculateSteamCandidateRecommendationFromTrends_(decision);
+  }
   const masterRow = findMasterRecord_(e.source, appId);
   if (masterRow) {
     decision.firstSeen = decision.firstSeen || masterRow[28] || '';
@@ -8196,7 +8431,12 @@ function syncCandidateDecisionFromActionEdit_(e) {
     '研究状态': decision.researchStatus,
     '人工动作': decision.status ? '' : deriveHumanAction_({firstRoundType: decision.firstType}, decision, false),
     '研究完成度': deriveResearchCompletion_(decision),
-    'Decision': decision.status
+    '人工决定': decision.status,
+    'Decision': decision.status,
+    '最终状态': deriveFinalStatus_(decision),
+    '机器推荐': decision.machineDecision || normalizeMachineRecommendationDisplay_(decision.autoRecommendation),
+    '机器置信度': decision.autoRecommendationConfidence || '',
+    '机器推荐理由': decision.machineDecisionReason || decision.autoRecommendationReasons || ''
   };
   Object.keys(output).forEach(name => {
     const col = headers.indexOf(name) + 1;
@@ -8276,8 +8516,32 @@ function candidateDecisionEditAffectsTodayAction_(e) {
 
 function onEdit(e) {
   syncCandidateDecisionFromActionEdit_(e);
+  captureCandidateTrendsRecalc_(e);
   captureCandidateDecisionEdit_(e);
   if (candidateDecisionEditAffectsTodayAction_(e)) refreshTodayActionsFromCandidateDecisions_(e.source);
+}
+
+function captureCandidateTrendsRecalc_(e) {
+  if (!e || !e.range) return;
+  const sheet = e.range.getSheet();
+  if (sheet.getName() !== HOTWORD_V2.sheets.decisions || e.range.getRow() < 2) return;
+  const columnMap = candidateDecisionColumnMap_(sheet);
+  const trendsColumn = columnMap.byName['Google Trends结果'] || 0;
+  if (!trendsColumn) return;
+  const editStart = e.range.getColumn();
+  const editEnd = e.range.getLastColumn ? e.range.getLastColumn() : editStart;
+  if (trendsColumn < editStart || trendsColumn > editEnd) return;
+  const appId = String(sheet.getRange(e.range.getRow(), columnMap.byName['Steam App ID'] || 1).getDisplayValue() || '').trim();
+  if (!appId) return;
+  const decisions = readCandidateDecisions_(e.source);
+  const decision = decisions.get(appId);
+  if (!decision) return;
+  decision.trendsResult = sheet.getRange(e.range.getRow(), trendsColumn).getDisplayValue();
+  const recalculated = recalculateSteamCandidateRecommendationFromTrends_(decision);
+  if (!recalculated) return;
+  sheet.getRange(decision.rowNumber, 1, 1, columnMap.width)
+    .setValues([candidateDecisionRow_(recalculated, columnMap, decision.row)]);
+  refreshTodayActionsFromCandidateDecisions_(e.source);
 }
 
 /**
@@ -8290,7 +8554,7 @@ function actionRow_(rec) {
   const trendsLink = trendsUrl
     ? '=HYPERLINK("' + trendsUrl.replace(/"/g, '""') + '","打开 Trends")'
     : '';
-  const humanAction = rec.todayAction && (rec.todayAction.isWaiting || rec.todayAction.isCompleted)
+  const humanAction = rec.todayAction && rec.todayAction.humanAction
     ? rec.todayAction.humanAction
     : deriveHumanAction_({firstRoundType: rec.firstRoundType}, rec.todayAction && rec.todayAction.decision, false);
   const decision = rec.todayAction && rec.todayAction.decision || {};
@@ -8298,6 +8562,13 @@ function actionRow_(rec) {
   const purchaseLink = purchaseUrl
     ? '=HYPERLINK("' + purchaseUrl.replace(/"/g, '""') + '","购买域名")'
     : '';
+  const machineRecommendation = normalizeMachineRecommendationDisplay_(
+    decision.machineDecision || decision.autoRecommendation
+  );
+  const machineConfidence = decision.autoRecommendationConfidence || '';
+  const machineReason = decision.machineDecisionReason || decision.autoRecommendationReasons || '';
+  const humanDecision = normalizeDecisionStatus_(decision.status) || '';
+  const finalStatus = deriveFinalStatus_(decision);
 
   return [
     rec.todayAction.type,
@@ -8316,11 +8587,15 @@ function actionRow_(rec) {
     rec.searchAlias || '',
     trendsLink,
     rec.todayAction.decision && rec.todayAction.decision.trendsResult || '',
-    rec.todayAction.decision && rec.todayAction.decision.socialResult || '',
+    formatMachineSocialDisplay_(decision),
     rec.todayAction.decision && rec.todayAction.decision.serpCompetition || '',
     rec.todayAction.decision && rec.todayAction.decision.keywordOpportunity || '',
-    rec.todayAction.decision && rec.todayAction.decision.status || '',
+    machineRecommendation,
+    machineConfidence,
+    machineReason,
+    humanDecision,
     rec.todayAction.decision && rec.todayAction.decision.manualNote || '',
+    finalStatus,
     rec.currentStage,
     rec.todayAction.decision && rec.todayAction.decision.researchStatus || '',
     rec.todayAction.decision && rec.todayAction.decision.researchStatus === '已完成' ? '已完成' : rec.todayAction.decision && rec.todayAction.decision.researchStatus === '研究中' ? '进行中' : '未开始',
@@ -8329,7 +8604,6 @@ function actionRow_(rec) {
     rec.todayAction.lastCheckedDate || (rec.todayAction.decision && rec.todayAction.decision.lastCheckedDate) || '',
     rec.url,
     rec.firstRoundReason,
-    decision.machineDecision || '',
     decision.recommendedDomain || '',
     decision.domainFirstYearPrice == null ? '' : decision.domainFirstYearPrice,
     decision.domainRegistrar || '',
