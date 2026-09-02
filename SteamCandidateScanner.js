@@ -397,8 +397,9 @@ function doGet(e) {
       .setMimeType(ContentService.MimeType.JSON);
   }
   if (action === 'pendingSteamCandidateResearchJobs') {
+    const ss = SpreadsheetApp.openById(QUALIFICATION_ELIGIBILITY_PRODUCTION_SHEET_ID);
     return ContentService
-      .createTextOutput(JSON.stringify({ jobs: loadPendingSteamCandidateResearchJobs_() }))
+      .createTextOutput(JSON.stringify({ jobs: loadPendingSteamCandidateResearchJobs_(ss) }))
       .setMimeType(ContentService.MimeType.JSON);
   }
   if (action === 'inspectSteamCandidateInboxProduction') {
@@ -421,15 +422,21 @@ function doGet(e) {
     }
     try {
       const masterRepair = repairMasterAppIdsFromSteamUrl_(ss);
+      const snapshotRepair = repairProductionCandidatesFromSnapshot_(ss, ['Anime Shop Simulator']);
+      const staleRepair = repairStalePendingResearchJobs_(ss);
       const reasonBackfill = backfillMachineRecommendationReasons_(ss);
       const queue = enqueueSteamCandidateResearchJobs_(ss, new Date());
+      const forceQueue = forceEnqueueProductionResearch_(ss, ['3393280'], new Date());
       const refresh = refreshTodayActionsFromCandidateDecisions_(ss);
       SpreadsheetApp.flush();
       return ContentService.createTextOutput(JSON.stringify({
         ok: true,
         masterRepair: masterRepair,
+        snapshotRepair: snapshotRepair,
+        staleRepair: staleRepair,
         reasonBackfill: reasonBackfill,
         queue: queue,
+        forceQueue: forceQueue,
         refresh: refresh
       }))
         .setMimeType(ContentService.MimeType.JSON);
@@ -440,6 +447,19 @@ function doGet(e) {
   if (action === 'verifyTrendsRecalcProduction') {
     return ContentService
       .createTextOutput(JSON.stringify(verifyTrendsRecalcProduction_(e && e.parameter || {})))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+  if (action === 'searchProductionCandidateSources') {
+    const query = e && e.parameter ? String(e.parameter.name || e.parameter.q || '').trim() : '';
+    return ContentService
+      .createTextOutput(JSON.stringify(searchProductionCandidateSources_(query)))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+  if (action === 'diagnoseEnqueueEligibility') {
+    const appId = e && e.parameter ? String(e.parameter.steam_app_id || '').trim() : '';
+    const ss = SpreadsheetApp.openById(QUALIFICATION_ELIGIBILITY_PRODUCTION_SHEET_ID);
+    return ContentService
+      .createTextOutput(JSON.stringify(diagnoseEnqueueEligibility_(ss, appId)))
       .setMimeType(ContentService.MimeType.JSON);
   }
   return ContentService
@@ -2150,9 +2170,8 @@ function inspectSteamCandidateInboxProduction_(gameNames) {
     candidates: []
   };
   names.forEach(gameName => {
-    const actionRow = rows.find(row => String(row[col('游戏名称')] || '').trim() === gameName);
-    const decision = Array.from(decisions.values()).find(item => String(item.name || '').trim() === gameName) ||
-      findCandidateDecisionByGameName_(decisions, gameName);
+    const actionRow = rows.find(row => normalizeGameName_(row[col('游戏名称')] || '') === normalizeGameName_(gameName));
+    const decision = findCandidateDecisionByGameName_(decisions, gameName);
     const master = findMasterRecordByGameName_(ss, gameName);
     out.candidates.push({
       game_name: gameName,
@@ -2176,8 +2195,9 @@ function inspectSteamCandidateInboxProduction_(gameNames) {
 }
 
 function findCandidateDecisionByGameName_(decisions, gameName) {
-  const key = steamCandidateResearchNameKey_(gameName);
-  return Array.from(decisions.values()).find(item => steamCandidateResearchNameKey_(item.name) === key) || null;
+  const key = normalizeGameName_(gameName);
+  if (!key) return null;
+  return Array.from(decisions.values()).find(item => normalizeGameName_(item.name) === key) || null;
 }
 
 function findMasterRecordByGameName_(ss, gameName) {
@@ -2188,19 +2208,153 @@ function findMasterRecordByGameName_(ss, gameName) {
   const col = {};
   HOTWORD_V2.masterHeaders.forEach(name => { col[name] = headers.indexOf(name); });
   const value = (row, name) => col[name] === undefined || col[name] < 0 ? '' : row[col[name]];
-  const key = steamCandidateResearchNameKey_(gameName);
+  const key = normalizeGameName_(gameName);
+  if (!key) return null;
   let match = null;
   sheet.getRange(2, 1, sheet.getLastRow() - 1, width).getValues().forEach(row => {
     const name = String(value(row, '游戏名称') || '').trim();
-    if (!name || steamCandidateResearchNameKey_(name) !== key) return;
+    if (!name || normalizeGameName_(name) !== key) return;
     match = {
       appId: String(value(row, 'Steam App ID') || '').trim(),
       name: name,
       url: String(value(row, 'Steam URL') || '').trim(),
-      continueNext: String(value(row, '进入下一步') || '').trim()
+      continueNext: String(value(row, '进入下一步') || '').trim(),
+      firstRoundType: String(value(row, '第一轮类型') || '').trim(),
+      currentStage: String(value(row, '当前筛选阶段') || '').trim(),
+      result1A: String(value(row, '1A结果') || '').trim()
     };
   });
   return match;
+}
+
+function searchProductionCandidateSources_(query) {
+  const key = normalizeGameName_(query);
+  const ss = SpreadsheetApp.openById(QUALIFICATION_ELIGIBILITY_PRODUCTION_SHEET_ID);
+  const out = {query: query, key: key, matches: []};
+  if (!key) return out;
+  const push = (source, payload) => out.matches.push(Object.assign({source: source}, payload));
+
+  const master = findMasterRecordByGameName_(ss, query);
+  if (master) push('master', master);
+
+  const decisions = readCandidateDecisions_(ss);
+  const decision = findCandidateDecisionByGameName_(decisions, query);
+  if (decision) {
+    push('decision', {
+      appId: decision.appId,
+      name: decision.name,
+      autoResearchStatus: decision.autoResearchStatus,
+      researchJobId: decision.researchJobId,
+      preflightVerdict: decision.preflightVerdict,
+      status: decision.status || ''
+    });
+  }
+
+  const snapSheet = ss.getSheetByName(HOTWORD_V2.sheets.candidateSnapshot);
+  if (snapSheet && snapSheet.getLastRow() >= 2) {
+    const width = HOTWORD_V2.candidateSnapshotHeaders.length;
+    const headers = snapSheet.getRange(1, 1, 1, width).getDisplayValues()[0];
+    snapSheet.getRange(2, 1, snapSheet.getLastRow() - 1, width).getDisplayValues().forEach((row, index) => {
+      const name = String(row[headers.indexOf('游戏名称')] || '').trim();
+      if (normalizeGameName_(name) !== key) return;
+      push('snapshot', {
+        row: index + 2,
+        appId: String(row[headers.indexOf('Steam App ID')] || '').trim(),
+        name: name,
+        date: String(row[headers.indexOf('日期')] || '').trim()
+      });
+    });
+  }
+
+  const actionSheet = ss.getSheetByName(HOTWORD_V2.sheets.action);
+  if (actionSheet && actionSheet.getLastRow() >= 4) {
+    const headers = actionSheet.getRange(3, 1, 1, HOTWORD_V2.actionHeaders.length).getDisplayValues()[0];
+    actionSheet.getRange(4, 1, actionSheet.getLastRow() - 3, HOTWORD_V2.actionHeaders.length).getDisplayValues()
+      .forEach((row, index) => {
+        const name = String(row[headers.indexOf('游戏名称')] || '').trim();
+        if (normalizeGameName_(name) !== key) return;
+        push('today_action', {
+          row: index + 4,
+          appId: String(row[headers.indexOf('Steam App ID')] || '').trim(),
+          name: name
+        });
+      });
+  }
+  return out;
+}
+
+function repairProductionCandidatesFromSnapshot_(ss, gameNames) {
+  const names = (gameNames || []).map(String).filter(Boolean);
+  const result = {repaired: 0, rows: [], skipped: []};
+  if (!names.length) return result;
+  const snapSheet = ss.getSheetByName(HOTWORD_V2.sheets.candidateSnapshot);
+  if (!snapSheet || snapSheet.getLastRow() < 2) return result;
+  const width = HOTWORD_V2.candidateSnapshotHeaders.length;
+  const headers = snapSheet.getRange(1, 1, 1, width).getDisplayValues()[0];
+  const valueAt = (row, name) => {
+    const column = headers.indexOf(name);
+    return column >= 0 ? row[column] : '';
+  };
+  const now = new Date();
+  names.forEach(gameName => {
+    const key = normalizeGameName_(gameName);
+    const existing = findMasterRecordByGameName_(ss, gameName);
+    if (existing && isReliableSteamAppId_(existing.appId)) {
+      result.skipped.push({game_name: gameName, reason: 'master_exists', appId: existing.appId});
+      return;
+    }
+    let snapshotRow = null;
+    snapSheet.getRange(2, 1, snapSheet.getLastRow() - 1, width).getDisplayValues().forEach(row => {
+      const name = String(valueAt(row, '游戏名称') || '').trim();
+      if (normalizeGameName_(name) !== key) return;
+      snapshotRow = row;
+    });
+    if (!snapshotRow) {
+      result.skipped.push({game_name: gameName, reason: 'snapshot_missing'});
+      return;
+    }
+    const appId = String(valueAt(snapshotRow, 'Steam App ID') || '').trim();
+    if (!isReliableSteamAppId_(appId)) {
+      result.skipped.push({game_name: gameName, reason: 'snapshot_app_id_missing'});
+      return;
+    }
+    const rec = {
+      appId: appId,
+      name: String(valueAt(snapshotRow, '游戏名称') || gameName).trim(),
+      url: 'https://store.steampowered.com/app/' + appId + '/',
+      source: 'snapshot_repair',
+      sourceRank: '',
+      releaseDate: valueAt(snapshotRow, 'Steam 发布日期') || '',
+      releaseRaw: '',
+      releaseStage: valueAt(snapshotRow, '发布阶段') || '',
+      daysToRelease: valueAt(snapshotRow, '距发售天数'),
+      followers: valueAt(snapshotRow, 'Steam Followers'),
+      baselineFollowers: '',
+      gain7d: valueAt(snapshotRow, 'Steam 7d Gain'),
+      growthRate: valueAt(snapshotRow, '近似增长率'),
+      coverageDays: '',
+      reviews: '',
+      positiveReviews: '',
+      rating: '',
+      result1A: '通过',
+      reason1A: '',
+      firstRoundType: valueAt(snapshotRow, '第一轮类型') || '🌱 Early候选',
+      priority: valueAt(snapshotRow, '优先级') || 'P1 高',
+      continueNext: '是',
+      nextAction: 'Automatic Preflight',
+      firstRoundReason: String(valueAt(snapshotRow, '触发原因') || 'snapshot_repair'),
+      currentStage: '1B完成→人工第二轮',
+      dataStatus: 'snapshot_repair',
+      dataNotes: ['snapshot_repair'],
+      qualificationEligible: true,
+      qualificationStatus: 'ELIGIBLE'
+    };
+    upsertMaster_(ss, [rec], now, 'SNAPSHOT-REPAIR', null);
+    syncCandidateDecisions_(ss, [rec], now, loadRules_(ss));
+    result.repaired += 1;
+    result.rows.push({game_name: rec.name, steam_app_id: appId});
+  });
+  return result;
 }
 
 function repairMasterAppIdsFromSteamUrl_(ss) {
@@ -2227,6 +2381,111 @@ function repairMasterAppIdsFromSteamUrl_(ss) {
       game_name: nameCol > 0 ? String(row[nameCol - 1] || '').trim() : '',
       steam_app_id: repairedAppId
     });
+  });
+  return result;
+}
+
+function diagnoseEnqueueEligibility_(ss, appId) {
+  const out = {steam_app_id: appId, eligible: true, blockers: []};
+  const masterRow = findMasterRecord_(ss, appId);
+  if (!masterRow) {
+    out.eligible = false;
+    out.blockers.push('master_row_missing');
+    return out;
+  }
+  const masterCol = {};
+  HOTWORD_V2.masterHeaders.forEach((name, index) => { masterCol[name] = index; });
+  const value = name => masterRow[masterCol[name]];
+  const continueNext = String(value('进入下一步') || '').trim();
+  if (!isReliableSteamAppId_(appId) || continueNext !== '是') out.blockers.push('master_gate');
+  const oneAResult = String(value('1A结果') || '').trim();
+  if (oneAResult && !STEAM_CANDIDATE_1A_PASS_RESULTS[oneAResult]) out.blockers.push('one_a_failed:' + oneAResult);
+  const decision = readCandidateDecisions_(ss).get(appId);
+  if (!decision || !decision.rowNumber) out.blockers.push('decision_missing');
+  if (decision) {
+    out.decision = {
+      status: decision.status,
+      autoResearchStatus: decision.autoResearchStatus,
+      researchJobId: decision.researchJobId,
+      preflightVerdict: decision.preflightVerdict,
+      machineResearchComplete: machineResearchComplete_(decision)
+    };
+    if (String(decision.researchJobId || '').trim() &&
+        !(STEAM_PREFLIGHT_ENABLED && steamCandidatePreflightDue_(decision, new Date()))) {
+      out.blockers.push('existing_job_id');
+    }
+    const persistedStatus = normalizeDecisionStatus_(decision.status);
+    if (persistedStatus === 'BUILD' || persistedStatus === 'REJECT' ||
+        (persistedStatus === 'WATCH' && !steamCandidatePreflightDue_(decision, new Date()) &&
+          machineResearchComplete_(decision))) {
+      out.blockers.push('decision_status:' + persistedStatus);
+    }
+    const candidateRec = {
+      gain7d: value('Steam 7d Gain'),
+      firstRoundType: value('第一轮类型')
+    };
+    if (candidateManualEvidenceNeedsNoProvider_(candidateRec, decision, candidateExternalSignalIsNew_(decision))) {
+      out.blockers.push('manual_evidence_no_provider');
+    }
+  }
+  out.eligible = out.blockers.length === 0;
+  return out;
+}
+
+function forceEnqueueProductionResearch_(ss, appIds, createdAt) {
+  const ids = (appIds || []).map(String).filter(isReliableSteamAppId_);
+  const result = {enqueued: 0, rows: []};
+  if (!ids.length) return result;
+  const decisionSheet = ss.getSheetByName(HOTWORD_V2.sheets.decisions);
+  const decisionCol = candidateDecisionColumnMap_(decisionSheet);
+  const masterCol = {};
+  HOTWORD_V2.masterHeaders.forEach((name, index) => { masterCol[name] = index; });
+  const now = createdAt || new Date();
+  const cycleDate = steamCandidateResearchDateString_(now, ss);
+  const decisions = readCandidateDecisions_(ss);
+  ids.forEach(appId => {
+    const masterRow = findMasterRecord_(ss, appId);
+    const decision = decisions.get(appId);
+    if (!masterRow || !decision || !decision.rowNumber || machineResearchComplete_(decision)) {
+      result.rows.push({appId: appId, skipped: true});
+      return;
+    }
+    const jobId = 'steam-research-' + appId + '-' + cycleDate.replace(/-/g, '');
+    const job = buildSteamCandidateResearchJob_(
+      masterRow,
+      masterCol,
+      Object.assign({}, decision, {researchJobId: jobId, autoResearchTime: now, status: ''}),
+      ss,
+      now
+    );
+    candidateDecisionSetField_(decisionSheet, decision.rowNumber, 'ResearchJobID', job.job_id, decisionCol);
+    candidateDecisionSetField_(decisionSheet, decision.rowNumber, '自动研究状态', STEAM_CANDIDATE_RESEARCH_PENDING, decisionCol);
+    candidateDecisionSetField_(decisionSheet, decision.rowNumber, '自动研究时间', now, decisionCol);
+    candidateDecisionSetField_(decisionSheet, decision.rowNumber, 'PreflightVerdict', STEAM_PREFLIGHT_ENABLED ? 'PENDING' : '', decisionCol);
+    candidateDecisionSetField_(decisionSheet, decision.rowNumber, 'Decision', '', decisionCol);
+    candidateDecisionSetField_(decisionSheet, decision.rowNumber, '决策状态', '', decisionCol);
+  result.enqueued += 1;
+  result.rows.push({appId: appId, job_id: job.job_id});
+  });
+  return result;
+}
+
+function repairStalePendingResearchJobs_(ss) {
+  const result = {repaired: 0, rows: []};
+  const decisionSheet = ss.getSheetByName(HOTWORD_V2.sheets.decisions);
+  if (!decisionSheet || decisionSheet.getLastRow() < 2) return result;
+  const columnMap = candidateDecisionColumnMap_(decisionSheet);
+  const cycleDate = steamCandidateResearchDateString_(new Date(), ss).replace(/-/g, '');
+  readCandidateDecisions_(ss).forEach(decision => {
+  const status = String(decision.autoResearchStatus || '').trim();
+  if (status && status !== STEAM_CANDIDATE_RESEARCH_PENDING) return;
+  const jobId = String(decision.researchJobId || '').trim();
+  if (!jobId || jobId.indexOf(cycleDate) >= 0) return;
+  candidateDecisionSetField_(decisionSheet, decision.rowNumber, 'ResearchJobID', '', columnMap);
+  candidateDecisionSetField_(decisionSheet, decision.rowNumber, '自动研究状态', STEAM_CANDIDATE_RESEARCH_PENDING, columnMap);
+  candidateDecisionSetField_(decisionSheet, decision.rowNumber, 'PreflightVerdict', STEAM_PREFLIGHT_ENABLED ? 'PENDING' : '', columnMap);
+  result.repaired += 1;
+  result.rows.push({appId: decision.appId, name: decision.name, clearedJobId: jobId});
   });
   return result;
 }
@@ -8325,7 +8584,7 @@ function enqueueSteamCandidateResearchJobs_(ss, createdAt) {
     const appId = String(masterRow[masterCol['Steam App ID']] || '').trim();
     const continueNext = String(masterRow[masterCol['进入下一步']] || '').trim();
     if (!isReliableSteamAppId_(appId) || continueNext !== '是') return;
-    const oneAResult = String(masterRow[masterCol['1A结果']] || '').trim().toUpperCase();
+    const oneAResult = String(masterRow[masterCol['1A结果']] || '').trim();
     if (oneAResult && !STEAM_CANDIDATE_1A_PASS_RESULTS[oneAResult]) return;
 
     const decision = decisions.get(appId);
@@ -8341,7 +8600,8 @@ function enqueueSteamCandidateResearchJobs_(ss, createdAt) {
     // re-enter using the existing recheck date semantics.
     const persistedStatus = normalizeDecisionStatus_(decision.status);
     if (persistedStatus === 'BUILD' || persistedStatus === 'REJECT' ||
-        (persistedStatus === 'WATCH' && !steamCandidatePreflightDue_(decision, now))) {
+        (persistedStatus === 'WATCH' && !steamCandidatePreflightDue_(decision, now) &&
+          machineResearchComplete_(decision))) {
       skipped += 1;
       return;
     }
@@ -8351,7 +8611,7 @@ function enqueueSteamCandidateResearchJobs_(ss, createdAt) {
     };
     if (persistedStatus === 'WATCH') {
       const watchGate = candidateWatchRecheckGate_(candidateRec, decision, now, rules);
-      if (watchGate.due && !watchGate.allowed) {
+      if (machineResearchComplete_(decision) && watchGate.due && !watchGate.allowed) {
         skipped += 1;
         return;
       }
@@ -8394,8 +8654,8 @@ function enqueueSteamCandidateResearchJobs_(ss, createdAt) {
   return { created: created.length, skipped: skipped, jobs: created };
 }
 
-function loadPendingSteamCandidateResearchJobs_() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
+function loadPendingSteamCandidateResearchJobs_(spreadsheet) {
+  const ss = spreadsheet || SpreadsheetApp.getActiveSpreadsheet();
   if (!ss) return [];
   const decisionSheet = ss.getSheetByName(HOTWORD_V2.sheets.decisions);
   const masterSheet = ss.getSheetByName(HOTWORD_V2.sheets.master);
@@ -8423,12 +8683,13 @@ function loadPendingSteamCandidateResearchJobs_() {
     if (String(masterRow[masterCol['进入下一步']] || '').trim() !== '是') return;
     const status = normalizeDecisionStatus_(decision.status);
     if (status === 'REJECT' || status === 'BUILD') return;
-    if (status === 'WATCH' && !steamCandidatePreflightDue_(decision, new Date())) return;
+    if (status === 'WATCH' && !steamCandidatePreflightDue_(decision, new Date()) &&
+        machineResearchComplete_(decision)) return;
     const candidateRec = {
       gain7d: masterRow[masterCol['Steam 7d Gain']],
       firstRoundType: masterRow[masterCol['第一轮类型']]
     };
-    if (status === 'WATCH') {
+    if (status === 'WATCH' && machineResearchComplete_(decision)) {
       const watchGate = candidateWatchRecheckGate_(candidateRec, decision, new Date(), rules);
       if (watchGate.due && !watchGate.allowed) return;
     }
