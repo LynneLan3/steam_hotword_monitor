@@ -17,7 +17,64 @@ var spreadsheet;
 
 var sandbox = {
   console: console,
-  SpreadsheetApp: { getActiveSpreadsheet: function () { return spreadsheet; } },
+  SpreadsheetApp: {
+    getActiveSpreadsheet: function () { return spreadsheet; },
+    openById: function () {
+      return {
+        getId: function () { return 'hist-ss'; },
+        getSheetByName: function (name) {
+          if (name !== 'steam_candidate_decision_history') return null;
+          if (!this._hist) {
+            var headers = [
+              'decision_id', 'observed_date', 'steam_app_id', 'game_name', 'decision',
+              'decision_date', 'research_status', 'trends_result', 'social_result',
+              'serp_competition', 'keyword_opportunity', 'reason', 'human_note',
+              'opportunity_id', 'research_job_id', 'payload_json', 'synced_at'
+            ];
+            var rows = [];
+            this._hist = {
+              getLastRow: function () { return rows.length + 1; },
+              getLastColumn: function () { return headers.length; },
+              getMaxColumns: function () { return 40; },
+              insertColumnsAfter: function () {},
+              getRange: function (rowNumber, columnNumber, rowCount, columnCount) {
+                return {
+                  getValues: function () {
+                    if (rowNumber === 1) return [headers];
+                    return rows.slice(rowNumber - 2, rowNumber - 2 + (rowCount || 1));
+                  },
+                  getDisplayValues: function () { return this.getValues(); },
+                  setValue: function (value) {
+                    if (rowNumber === 1) {
+                      while (headers.length < columnNumber) headers.push('');
+                      headers[columnNumber - 1] = value;
+                    } else {
+                      while (rows.length < rowNumber - 1) rows.push([]);
+                      while (rows[rowNumber - 2].length < columnNumber) rows[rowNumber - 2].push('');
+                      rows[rowNumber - 2][columnNumber - 1] = value;
+                    }
+                  },
+                  setValues: function (values) {
+                    values.forEach(function (valueRow, idx) {
+                      if (rowNumber === 1) {
+                        headers.splice(0, headers.length);
+                        valueRow.forEach(function (v) { headers.push(v); });
+                      } else {
+                        while (rows.length < rowNumber - 1 + idx) rows.push([]);
+                        rows[rowNumber - 2 + idx] = valueRow.slice();
+                      }
+                    });
+                  }
+                };
+              }
+            };
+          }
+          return this._hist;
+        },
+        insertSheet: function (name) { return this.getSheetByName(name); }
+      };
+    }
+  },
   Utilities: {
     getUuid: function () { return 'generated-token'; },
     formatDate: function (date) {
@@ -79,6 +136,12 @@ function makeSheet(rows, headers) {
         },
         setValue: function (value) {
           writes += 1;
+          if (rowNumber === 1) {
+            while (headers.length < columnNumber) headers.push('');
+            headers[columnNumber - 1] = value;
+            return;
+          }
+          while (rows[rowNumber - 2].length < columnNumber) rows[rowNumber - 2].push('');
           rows[rowNumber - 2][columnNumber - 1] = value;
         },
         setValues: function (values) {

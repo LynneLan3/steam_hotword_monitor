@@ -432,6 +432,14 @@ function hotwordExternalApplyDecisionSummary_(ss, resolution, data, interpretati
   put('TrendLastChecked', data.observedAt || new Date());
   put('ExternalSignal', hotwordExternalMergeSignals_(String(rows[rowIndex][columnMap.byName['ExternalSignal'] - 1] || ''), 'GOOGLE_TRENDS'));
   put('FinalResearchStage', interpretation.route);
+  // Master Trends结果: ExternalEvidence may fill empty cells only; never overwrite
+  // an existing manually filled value on 候选主表.
+  if (legacy) {
+    updateCandidateMasterOutcome_(ss, {
+      steamAppId: resolution.appId,
+      gameName: resolution.game
+    }, {'Trends结果': legacy}, {trendsOnlyIfEmpty: true});
+  }
 
   const decision = String(
     rows[rowIndex][columnMap.byName['Decision'] - 1] ||

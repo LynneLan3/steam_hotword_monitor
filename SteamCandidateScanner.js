@@ -58,6 +58,8 @@ const HOTWORD_V2 = {
 
   monitoringHistory: {
     spreadsheetName: 'Steam_监控回测历史库',
+    // Known production identity; never silently create a second history file.
+    spreadsheetId: '1Pc4838TigPM5j3hnatkZV9_c-EL5IExF3DMGo23AI4E',
     propertyKey: 'STEAM_MONITORING_HISTORY_SPREADSHEET_ID_V1',
     tables: {
       gameDaily: 'steam_game_daily',
@@ -488,6 +490,17 @@ function doGet(e) {
     const ss = SpreadsheetApp.openById(QUALIFICATION_ELIGIBILITY_PRODUCTION_SHEET_ID);
     return ContentService
       .createTextOutput(JSON.stringify(diagnoseEnqueueEligibility_(ss, appId)))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+  if (action === 'ensureCandidateOutcomeSchemasProduction') {
+    const rawAppId = e && e.parameter ? String(e.parameter.steam_app_id || e.parameter.app_id || '').trim() : '';
+    const writeTest = String(e && e.parameter && (e.parameter.write_test || e.parameter.writeTest || '') || '')
+      .toLowerCase() === 'true' || String(e && e.parameter && (e.parameter.write_test || '') || '') === '1';
+    return ContentService
+      .createTextOutput(JSON.stringify(ensureCandidateOutcomeSchemasProduction_({
+        steamAppId: rawAppId,
+        writeTest: writeTest
+      })))
       .setMimeType(ContentService.MimeType.JSON);
   }
   return ContentService
@@ -1022,10 +1035,24 @@ function handleSteamCandidateResearchCallback_(body) {
     'DomainAlternative2Price', 'DomainAlternative2PurchaseURL'].forEach(function (field) {
       steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, field, body[field] == null ? '' : body[field]);
     });
+  const ss = SpreadsheetApp.getActiveSpreadsheet() ||
+    SpreadsheetApp.openById(QUALIFICATION_ELIGIBILITY_PRODUCTION_SHEET_ID);
+  const masterWrite = writeResearchCallbackToCandidateMaster_(ss, body, decision);
+  const historyWrite = appendSteamCandidateDecisionHistoryFromDecision_(ss, decision, {
+    machine_recommendation: normalizeMasterMachineRecommendation_(
+      machineRecommendation || body.machine_recommendation || body.recommendation
+    ),
+    machine_confidence: body.confidence || decision.autoRecommendationConfidence || '',
+    social_result: machine.social_result || decision.socialResult || '',
+    serp_competition: machine.serp_competition || decision.serpCompetition || '',
+    reason: 'research_callback'
+  });
   return {
     ok: true,
     job_id: body.job_id,
     execution_status: status,
+    master_outcome_write: masterWrite,
+    decision_history_write: historyWrite,
     today_action_refresh: refreshTodayActionsFromCandidateDecisions_()
   };
 }
@@ -8919,6 +8946,28 @@ function syncCandidateDecisionFromActionEdit_(e) {
     const col = headers.indexOf(name) + 1;
     if (col > 0) sheet.getRange(rowNumber, col).setValue(output[name]);
   });
+  const masterFields = {};
+  if (editedHeaders.indexOf('Trends结果') >= 0) masterFields['Trends结果'] = decision.trendsResult || '';
+  if (editedHeaders.indexOf('人工决定') >= 0 || editedHeaders.indexOf('Decision') >= 0) {
+    masterFields['人工决定'] = normalizeMasterHumanDecision_(decision.status);
+  }
+  if (Object.keys(masterFields).length) {
+    updateCandidateMasterOutcome_(e.source, {
+      steamAppId: appId,
+      gameName: decision.name
+    }, masterFields, {allowHumanOverwrite: true});
+  }
+  if (editedHeaders.indexOf('人工决定') >= 0 || editedHeaders.indexOf('Decision') >= 0 ||
+      editedHeaders.indexOf('Trends结果') >= 0) {
+    appendSteamCandidateDecisionHistoryFromDecision_(e.source, decision, {
+      machine_recommendation: normalizeMasterMachineRecommendation_(
+        decision.machineDecision || decision.autoRecommendation
+      ),
+      machine_confidence: decision.autoRecommendationConfidence || '',
+      final_status: deriveMasterFinalStatus_(decision.status),
+      reason: 'today_action_edit'
+    });
+  }
   refreshTodayActionsFromCandidateDecisions_(e.source);
 }
 
@@ -8971,6 +9020,43 @@ function captureCandidateDecisionEdit_(e) {
   if (status === 'BUILD') upsertSitePoolRecord_(e.source, sheet.getRange(e.range.getRow(), 2).getValue(), appId, checkedAt, {
     opportunityId: opportunityIdColumn > 0 ? sheet.getRange(e.range.getRow(), opportunityIdColumn).getValue() : ''
   });
+  const gameName = sheet.getRange(e.range.getRow(), columnMap.byName['游戏名称'] || 2).getDisplayValue();
+  updateCandidateMasterOutcome_(e.source, {
+    steamAppId: appId,
+    gameName: gameName
+  }, {
+    '人工决定': normalizeMasterHumanDecision_(status)
+  }, {allowHumanOverwrite: true});
+  appendSteamCandidateDecisionHistoryFromDecision_(e.source, {
+    appId: appId,
+    name: gameName,
+    status: status,
+    decisionDate: status === 'BUILD' || status === 'REJECT' ? checkedAt : '',
+    researchStatus: '已完成',
+    trendsResult: columnMap.byName['Google Trends结果']
+      ? sheet.getRange(e.range.getRow(), columnMap.byName['Google Trends结果']).getDisplayValue() : '',
+    socialResult: columnMap.byName['Social结果']
+      ? sheet.getRange(e.range.getRow(), columnMap.byName['Social结果']).getDisplayValue() : '',
+    serpCompetition: columnMap.byName['SERP竞争']
+      ? sheet.getRange(e.range.getRow(), columnMap.byName['SERP竞争']).getDisplayValue() : '',
+    keywordOpportunity: columnMap.byName['关键词机会']
+      ? sheet.getRange(e.range.getRow(), columnMap.byName['关键词机会']).getDisplayValue() : '',
+    manualNote: columnMap.byName['人工备注']
+      ? sheet.getRange(e.range.getRow(), columnMap.byName['人工备注']).getDisplayValue() : '',
+    opportunityId: opportunityIdColumn > 0
+      ? sheet.getRange(e.range.getRow(), opportunityIdColumn).getDisplayValue() : '',
+    researchJobId: columnMap.byName['ResearchJobID']
+      ? sheet.getRange(e.range.getRow(), columnMap.byName['ResearchJobID']).getDisplayValue() : '',
+    machineDecision: columnMap.byName['MachineDecision']
+      ? sheet.getRange(e.range.getRow(), columnMap.byName['MachineDecision']).getDisplayValue() : '',
+    autoRecommendationConfidence: columnMap.byName['自动Recommendation置信度']
+      ? sheet.getRange(e.range.getRow(), columnMap.byName['自动Recommendation置信度']).getDisplayValue() : '',
+    decisionId: columnMap.byName['DecisionID']
+      ? sheet.getRange(e.range.getRow(), columnMap.byName['DecisionID']).getDisplayValue() : ''
+  }, {
+    final_status: deriveMasterFinalStatus_(status),
+    reason: 'candidate_decision_edit'
+  });
 }
 
 function candidateDecisionEditAffectsTodayAction_(e) {
@@ -9015,9 +9101,25 @@ function captureCandidateTrendsRecalc_(e) {
   if (!decision) return;
   decision.trendsResult = sheet.getRange(e.range.getRow(), trendsColumn).getDisplayValue();
   const recalculated = recalculateSteamCandidateRecommendationFromTrends_(decision);
-  if (!recalculated) return;
+  if (!recalculated) {
+    updateCandidateMasterOutcome_(e.source, {
+      steamAppId: appId,
+      gameName: decision.name
+    }, {'Trends结果': decision.trendsResult || ''});
+    return;
+  }
   sheet.getRange(decision.rowNumber, 1, 1, columnMap.width)
     .setValues([candidateDecisionRow_(recalculated, columnMap, decision.row)]);
+  updateCandidateMasterOutcome_(e.source, {
+    steamAppId: appId,
+    gameName: decision.name
+  }, {
+    'Trends结果': decision.trendsResult || '',
+    '机器推荐': normalizeMasterMachineRecommendation_(
+      recalculated.machineDecision || recalculated.autoRecommendation
+    ),
+    '机器置信度': recalculated.autoRecommendationConfidence || ''
+  });
   refreshTodayActionsFromCandidateDecisions_(e.source);
 }
 
@@ -9095,6 +9197,7 @@ function actionRow_(rec) {
 
 function upsertMaster_(ss, records, runTime, runId, stats) {
   const sheet = ss.getSheetByName(HOTWORD_V2.sheets.master);
+  ensureUnifiedCandidateSchema_(sheet);
   const index = new Map();
   const lastRow = sheet.getLastRow();
 
@@ -9107,6 +9210,7 @@ function upsertMaster_(ss, records, runTime, runId, stats) {
   }
 
   const newRows = [];
+  const touchedAppIds = [];
 
   for (const rec of records) {
     const existingRow = index.get(rec.appId);
@@ -9155,14 +9259,19 @@ function upsertMaster_(ss, records, runTime, runId, stats) {
 
     if (existingRow) {
       sheet.getRange(existingRow, 1, 1, row.length).setValues([row]);
+      touchedAppIds.push(rec.appId);
     } else {
       newRows.push(row);
+      touchedAppIds.push(rec.appId);
     }
   }
 
   if (newRows.length) {
     sheet.getRange(sheet.getLastRow() + 1, 1, newRows.length, HOTWORD_V2.masterHeaders.length).setValues(newRows);
   }
+  touchedAppIds.forEach(appId => {
+    seedCandidateMasterPendingStatus_(ss, {steamAppId: String(appId || '').trim()});
+  });
 }
 
 // G018 P3: additive fields on the existing 候选主表.  These are intentionally
@@ -9173,15 +9282,29 @@ const UNIFIED_CANDIDATE_HEADERS = [
   'Twitch排名', 'Twitch观察时间', 'Twitch来源'
 ];
 
+// Outcome / research history columns on 候选主表. Append-only; never rearrange
+// legacy Steam or G018 identity columns. Human fields are never auto-overwritten.
+const CANDIDATE_OUTCOME_HEADERS = [
+  'Trends结果', 'Social结果', 'SERP竞争',
+  '机器推荐', '机器置信度', '人工决定', '最终状态'
+];
+
+const CANDIDATE_MASTER_FINAL_STATUSES = {
+  PENDING_RESEARCH: '待研究',
+  WATCH: '观察',
+  BUILD: '建站',
+  SKIP: '放弃'
+};
+
 function ensureUnifiedCandidateSchema_(sheet) {
   const width = Math.max(sheet.getLastColumn(), 1);
   const headers = sheet.getRange(1, 1, 1, width).getDisplayValues()[0];
   let lastColumn = width;
   const appended = [];
-  UNIFIED_CANDIDATE_HEADERS.forEach(name => {
+  UNIFIED_CANDIDATE_HEADERS.concat(CANDIDATE_OUTCOME_HEADERS).forEach(name => {
     if (headers.indexOf(name) >= 0) return;
     lastColumn += 1;
-    if (sheet.getMaxColumns && lastColumn > sheet.getMaxColumns() && sheet.insertColumnsAfter) {
+    if (sheet.getMaxColumns && sheet.insertColumnsAfter && lastColumn > sheet.getMaxColumns()) {
       sheet.insertColumnsAfter(sheet.getMaxColumns(), 1);
     }
     sheet.getRange(1, lastColumn).setValue(name);
@@ -9189,6 +9312,408 @@ function ensureUnifiedCandidateSchema_(sheet) {
     appended.push(name);
   });
   return {headers: headers, width: lastColumn, appended: appended};
+}
+
+function normalizeMasterMachineRecommendation_(value) {
+  const normalized = steamCandidateResearchCallbackString_(value).toUpperCase();
+  if (normalized === 'RECOMMEND_BUILD' || normalized === 'BUILD') return 'BUILD';
+  if (normalized === 'RECOMMEND_WATCH' || normalized === 'WATCH') return 'WATCH';
+  if (normalized === 'RECOMMEND_REJECT' || normalized === 'REJECT' ||
+      normalized === 'SKIP' || normalized === 'ALREADY_BUILT' ||
+      normalized === 'INSUFFICIENT_EVIDENCE') return 'SKIP';
+  return '';
+}
+
+function normalizeMasterHumanDecision_(value) {
+  return normalizeMasterMachineRecommendation_(value);
+}
+
+function deriveMasterFinalStatus_(humanDecision, existingFinalStatus) {
+  const decision = normalizeMasterHumanDecision_(humanDecision);
+  if (decision === 'BUILD') return CANDIDATE_MASTER_FINAL_STATUSES.BUILD;
+  if (decision === 'WATCH') return CANDIDATE_MASTER_FINAL_STATUSES.WATCH;
+  if (decision === 'SKIP') return CANDIDATE_MASTER_FINAL_STATUSES.SKIP;
+  const existing = String(existingFinalStatus || '').trim();
+  if (existing) return existing;
+  return CANDIDATE_MASTER_FINAL_STATUSES.PENDING_RESEARCH;
+}
+
+/**
+ * Update research/decision outcome fields on an existing 候选主表 row.
+ * Match order: Candidate ID → Steam App ID → exact normalized game name.
+ * Never inserts a duplicate row. Never overwrites a non-empty 人工决定 unless
+ * options.allowHumanOverwrite is true (manual edit paths only).
+ * ExternalEvidence Trends writes must pass options.trendsOnlyIfEmpty=true.
+ */
+function updateCandidateMasterOutcome_(ss, keys, fields, options) {
+  ss = ss || SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) throw new Error('Spreadsheet is required');
+  const sheet = ss.getSheetByName(HOTWORD_V2.sheets.master);
+  if (!sheet) return {ok: false, error: 'master_missing', updated: 0};
+  const schema = ensureUnifiedCandidateSchema_(sheet);
+  const col = name => schema.headers.indexOf(name);
+  if (sheet.getLastRow() < 2) return {ok: false, error: 'master_empty', updated: 0};
+  const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, schema.width).getValues();
+  const candidateId = String(keys && (keys.candidateId || keys.candidate_id) || '').trim();
+  const appId = String(keys && (keys.steamAppId || keys.steam_app_id || keys.appId) || '').trim();
+  const gameName = normalizeGameName_(keys && (keys.gameName || keys.game_name || keys.name) || '');
+  let rowIndex = -1;
+  const idCol = col('Candidate ID');
+  const appCol = col('Steam App ID');
+  const nameCol = col('游戏名称');
+  if (candidateId && idCol >= 0) {
+    rowIndex = rows.findIndex(row => String(row[idCol] || '').trim() === candidateId);
+  }
+  if (rowIndex < 0 && appId && appCol >= 0) {
+    rowIndex = rows.findIndex(row => String(row[appCol] || '').trim() === appId);
+  }
+  if (rowIndex < 0 && gameName && nameCol >= 0) {
+    rowIndex = rows.findIndex(row => normalizeGameName_(row[nameCol] || '') === gameName);
+  }
+  if (rowIndex < 0) return {ok: false, error: 'candidate_not_found', updated: 0};
+
+  const row = rows[rowIndex].slice();
+  while (row.length < schema.width) row.push('');
+  const allowHumanOverwrite = !!(options && options.allowHumanOverwrite);
+  const source = fields && typeof fields === 'object' ? fields : {};
+  const write = (header, value, opts) => {
+    const position = col(header);
+    if (position < 0) return false;
+    if (value === undefined || value === null) return false;
+    const text = typeof value === 'string' ? value : String(value);
+    if (opts && opts.onlyIfEmpty) {
+      const existing = row[position];
+      if (existing !== '' && existing !== null && existing !== undefined && String(existing).trim() !== '') {
+        return false;
+      }
+    }
+    row[position] = text;
+    return true;
+  };
+
+  let trendsWrote = null;
+  if (source['Trends结果'] !== undefined) {
+    trendsWrote = write('Trends结果', source['Trends结果'], {
+      onlyIfEmpty: !!(options && options.trendsOnlyIfEmpty)
+    });
+  }
+  if (source['Social结果'] !== undefined) write('Social结果', source['Social结果']);
+  if (source['SERP竞争'] !== undefined) write('SERP竞争', source['SERP竞争']);
+  if (source['机器推荐'] !== undefined) {
+    write('机器推荐', normalizeMasterMachineRecommendation_(source['机器推荐']) || source['机器推荐']);
+  }
+  if (source['机器置信度'] !== undefined) write('机器置信度', source['机器置信度']);
+
+  const humanCol = col('人工决定');
+  const existingHuman = humanCol >= 0 ? String(row[humanCol] || '').trim() : '';
+  if (source['人工决定'] !== undefined) {
+    const nextHuman = normalizeMasterHumanDecision_(source['人工决定']);
+    if (allowHumanOverwrite || !existingHuman) {
+      if (nextHuman) write('人工决定', nextHuman);
+    }
+  }
+
+  const finalCol = col('最终状态');
+  const existingFinal = finalCol >= 0 ? row[finalCol] : '';
+  if (source['最终状态'] !== undefined && String(source['最终状态']).trim()) {
+    write('最终状态', source['最终状态'], {onlyIfEmpty: !!(options && options.finalStatusOnlyIfEmpty)});
+  } else if (source['人工决定'] !== undefined || existingHuman || (humanCol >= 0 && row[humanCol])) {
+    const humanForStatus = humanCol >= 0 ? row[humanCol] : '';
+    write('最终状态', deriveMasterFinalStatus_(humanForStatus, existingFinal));
+  } else if (!String(existingFinal || '').trim()) {
+    write('最终状态', CANDIDATE_MASTER_FINAL_STATUSES.PENDING_RESEARCH);
+  }
+
+  sheet.getRange(rowIndex + 2, 1, 1, schema.width).setValues([row]);
+  return {
+    ok: true,
+    updated: 1,
+    rowNumber: rowIndex + 2,
+    candidateId: idCol >= 0 ? String(row[idCol] || '').trim() : '',
+    steamAppId: appCol >= 0 ? String(row[appCol] || '').trim() : '',
+    schemaAppended: schema.appended,
+    trendsWrote: trendsWrote
+  };
+}
+
+function seedCandidateMasterPendingStatus_(ss, keys) {
+  return updateCandidateMasterOutcome_(ss, keys, {
+    '最终状态': CANDIDATE_MASTER_FINAL_STATUSES.PENDING_RESEARCH
+  }, {allowHumanOverwrite: false, finalStatusOnlyIfEmpty: true});
+}
+
+function writeResearchCallbackToCandidateMaster_(ss, body, decision) {
+  const machine = body && body.machine_fields && Object.prototype.toString.call(body.machine_fields) === '[object Object]'
+    ? body.machine_fields : {};
+  const masterOutcome = body && body.master_outcome_fields && Object.prototype.toString.call(body.master_outcome_fields) === '[object Object]'
+    ? body.master_outcome_fields : {};
+  const fields = {};
+  const social = masterOutcome.social_result || machine.social_result;
+  const serp = masterOutcome.serp_competition || machine.serp_competition;
+  const recommendation = masterOutcome.machine_recommendation ||
+    body.machine_recommendation || body.recommendation;
+  const confidence = masterOutcome.machine_confidence || body.confidence;
+  if (social) fields['Social结果'] = social;
+  if (serp) fields['SERP竞争'] = serp;
+  if (recommendation) fields['机器推荐'] = normalizeMasterMachineRecommendation_(recommendation);
+  if (confidence !== undefined && confidence !== null && String(confidence).trim() !== '') {
+    fields['机器置信度'] = confidence;
+  }
+  if (!Object.keys(fields).length) return {ok: true, updated: 0, skipped: true};
+  return updateCandidateMasterOutcome_(ss, {
+    candidateId: body && (body.candidate_id || body.CandidateID),
+    steamAppId: body && body.steam_app_id || (decision && decision.appId),
+    gameName: body && body.game_name || (decision && decision.name)
+  }, fields);
+}
+
+// ---------------------------------------------------------------------------
+// Steam_监控回测历史库 / steam_candidate_decision_history
+// Append-only decision snapshots. Existing columns stay put; only additive
+// outcome fields are ensured at the end of the header row.
+// ---------------------------------------------------------------------------
+
+const STEAM_CANDIDATE_DECISION_HISTORY_BASE_HEADERS = [
+  'decision_id', 'observed_date', 'steam_app_id', 'game_name', 'decision',
+  'decision_date', 'research_status', 'trends_result', 'social_result',
+  'serp_competition', 'keyword_opportunity', 'reason', 'human_note',
+  'opportunity_id', 'research_job_id', 'payload_json', 'synced_at'
+];
+
+const STEAM_CANDIDATE_DECISION_HISTORY_OUTCOME_HEADERS = [
+  'machine_recommendation', 'machine_confidence', 'final_status'
+];
+
+function getSteamMonitoringHistorySpreadsheet_() {
+  const config = HOTWORD_V2.monitoringHistory;
+  const props = PropertiesService.getScriptProperties();
+  let id = String(props.getProperty(config.propertyKey) || config.spreadsheetId || '').trim();
+  if (!id && config.spreadsheetId) id = String(config.spreadsheetId).trim();
+  if (!id) throw new Error('Steam monitoring history spreadsheet id is missing');
+  const ss = SpreadsheetApp.openById(id);
+  if (props.getProperty(config.propertyKey) !== id) props.setProperty(config.propertyKey, id);
+  return ss;
+}
+
+/**
+ * Append-only header ensure for steam_candidate_decision_history.
+ * Never rearranges existing columns or rewrites historical rows.
+ */
+function ensureSteamCandidateDecisionHistorySchema_(sheet) {
+  if (!sheet) throw new Error('steam_candidate_decision_history sheet is required');
+  const width = Math.max(sheet.getLastColumn(), 1);
+  const headers = sheet.getRange(1, 1, 1, width).getDisplayValues()[0]
+    .map(value => String(value || '').trim());
+  while (headers.length && !headers[headers.length - 1]) headers.pop();
+  let lastColumn = headers.length;
+  const appended = [];
+  const desired = STEAM_CANDIDATE_DECISION_HISTORY_BASE_HEADERS
+    .concat(STEAM_CANDIDATE_DECISION_HISTORY_OUTCOME_HEADERS);
+  desired.forEach(name => {
+    if (headers.indexOf(name) >= 0) return;
+    lastColumn += 1;
+    if (sheet.getMaxColumns && sheet.insertColumnsAfter && lastColumn > sheet.getMaxColumns()) {
+      sheet.insertColumnsAfter(sheet.getMaxColumns(), 1);
+    }
+    sheet.getRange(1, lastColumn).setValue(name);
+    headers.push(name);
+    appended.push(name);
+  });
+  return {headers: headers, width: lastColumn, appended: appended};
+}
+
+function steamCandidateDecisionHistorySheet_(ss) {
+  const historySs = ss || getSteamMonitoringHistorySpreadsheet_();
+  const name = HOTWORD_V2.monitoringHistory.tables.candidateDecision;
+  let sheet = historySs.getSheetByName(name);
+  if (!sheet) sheet = historySs.insertSheet(name);
+  const schema = ensureSteamCandidateDecisionHistorySchema_(sheet);
+  return {spreadsheet: historySs, sheet: sheet, schema: schema};
+}
+
+function buildSteamCandidateDecisionHistorySnapshot_(decision, extras) {
+  const extra = extras && typeof extras === 'object' ? extras : {};
+  const appId = String(decision && (decision.appId || decision.steam_app_id) || '').trim();
+  const gameName = String(decision && (decision.name || decision.game_name) || '').trim();
+  const status = normalizeDecisionStatus_(decision && decision.status) ||
+    String(extra.decision || '').trim();
+  const machineRecommendation = String(
+    extra.machine_recommendation !== undefined ? extra.machine_recommendation :
+      (normalizeMasterMachineRecommendation_(
+        decision && (decision.machineDecision || decision.autoRecommendation)
+      ) || '')
+  ).trim();
+  const machineConfidence = String(
+    extra.machine_confidence !== undefined ? extra.machine_confidence :
+      (decision && decision.autoRecommendationConfidence || '')
+  ).trim();
+  const finalStatus = String(
+    extra.final_status !== undefined ? extra.final_status :
+      deriveMasterFinalStatus_(status || (decision && decision.status))
+  ).trim();
+  const decisionId = String(
+    decision && decision.decisionId || extra.decision_id ||
+    ((status || 'unknown') + '|' + appId + '|' + (decision && decision.decisionDate || ''))
+  ).trim();
+  const now = new Date();
+  let observedDate = extra.observed_date || '';
+  if (!observedDate) {
+    if (typeof Utilities !== 'undefined' && Utilities.formatDate) {
+      observedDate = Utilities.formatDate(now, 'Asia/Shanghai', 'yyyy-MM-dd');
+    } else {
+      observedDate = now.toISOString().slice(0, 10);
+    }
+  }
+  const payload = extra.payload_json !== undefined ? extra.payload_json : {
+    steam_app_id: appId,
+    game_name: gameName,
+    decision: status,
+    machine_recommendation: machineRecommendation,
+    machine_confidence: machineConfidence,
+    final_status: finalStatus,
+    reason: extra.reason || ''
+  };
+  return {
+    decision_id: decisionId,
+    observed_date: observedDate,
+    steam_app_id: appId,
+    game_name: gameName,
+    decision: status,
+    decision_date: decision && decision.decisionDate || extra.decision_date || '',
+    research_status: decision && decision.researchStatus || extra.research_status || '',
+    trends_result: extra.trends_result !== undefined ? extra.trends_result : (decision && decision.trendsResult || ''),
+    social_result: extra.social_result !== undefined ? extra.social_result : (decision && decision.socialResult || ''),
+    serp_competition: extra.serp_competition !== undefined ? extra.serp_competition : (decision && decision.serpCompetition || ''),
+    keyword_opportunity: decision && decision.keywordOpportunity || extra.keyword_opportunity || '',
+    reason: extra.reason || '',
+    human_note: decision && decision.manualNote || extra.human_note || '',
+    opportunity_id: decision && decision.opportunityId || extra.opportunity_id || '',
+    research_job_id: decision && decision.researchJobId || extra.research_job_id || '',
+    payload_json: typeof payload === 'string' ? payload : JSON.stringify(payload),
+    synced_at: extra.synced_at || now,
+    machine_recommendation: machineRecommendation,
+    machine_confidence: machineConfidence,
+    final_status: finalStatus
+  };
+}
+
+/**
+ * Append one decision snapshot. Never updates existing history rows.
+ */
+function appendSteamCandidateDecisionHistorySnapshot_(snapshot, options) {
+  const history = steamCandidateDecisionHistorySheet_(options && options.spreadsheet);
+  const headers = history.schema.headers;
+  const row = headers.map(name => {
+    if (!snapshot || snapshot[name] === undefined || snapshot[name] === null) return '';
+    return snapshot[name];
+  });
+  const start = history.sheet.getLastRow() + 1;
+  history.sheet.getRange(start, 1, 1, headers.length).setValues([row]);
+  return {
+    ok: true,
+    appended: 1,
+    rowNumber: start,
+    schemaAppended: history.schema.appended,
+    headers: headers,
+    spreadsheetId: history.spreadsheet.getId()
+  };
+}
+
+function appendSteamCandidateDecisionHistoryFromDecision_(ss, decision, extras) {
+  try {
+    const snapshot = buildSteamCandidateDecisionHistorySnapshot_(decision, extras);
+    return appendSteamCandidateDecisionHistorySnapshot_(snapshot, {
+      spreadsheet: getSteamMonitoringHistorySpreadsheet_()
+    });
+  } catch (err) {
+    return {
+      ok: false,
+      appended: 0,
+      error: String(err && err.message || err || 'decision_history_append_failed')
+    };
+  }
+}
+
+/**
+ * Production: ensure 候选主表 7 outcome columns + decision history 3 columns.
+ * Optionally append one test snapshot for a real candidate.
+ */
+function ensureCandidateOutcomeSchemasProduction_(options) {
+  const opts = options && typeof options === 'object' ? options : {};
+  const ss = SpreadsheetApp.openById(QUALIFICATION_ELIGIBILITY_PRODUCTION_SHEET_ID);
+  const masterSheet = ss.getSheetByName(HOTWORD_V2.sheets.master);
+  if (!masterSheet) return {ok: false, error: 'master_missing'};
+  const masterSchema = ensureUnifiedCandidateSchema_(masterSheet);
+  const requiredMaster = CANDIDATE_OUTCOME_HEADERS.slice();
+  const masterHeaders = masterSchema.headers.slice();
+  const masterMissing = requiredMaster.filter(name => masterHeaders.indexOf(name) < 0);
+
+  const history = steamCandidateDecisionHistorySheet_();
+  const requiredHistory = STEAM_CANDIDATE_DECISION_HISTORY_OUTCOME_HEADERS.slice();
+  const historyMissing = requiredHistory.filter(name => history.schema.headers.indexOf(name) < 0);
+
+  let testWrite = null;
+  if (opts.writeTest) {
+    const appId = String(opts.steamAppId || '').trim();
+    let decision = null;
+    if (appId) {
+      decision = readCandidateDecisions_(ss).get(appId) || null;
+    }
+    if (!decision) {
+      const decisions = Array.from(readCandidateDecisions_(ss).values());
+      decision = decisions.find(item => item && item.appId) || null;
+    }
+    if (!decision) {
+      testWrite = {ok: false, error: 'no_candidate_for_test_write'};
+    } else {
+      const masterOutcome = {};
+      const masterWidth = Math.max(masterSheet.getLastColumn(), masterSchema.width);
+      const headers = masterSheet.getRange(1, 1, 1, masterWidth).getDisplayValues()[0];
+      const rows = masterSheet.getLastRow() >= 2
+        ? masterSheet.getRange(2, 1, masterSheet.getLastRow() - 1, masterWidth).getDisplayValues()
+        : [];
+      const appCol = headers.indexOf('Steam App ID');
+      const row = appCol >= 0
+        ? rows.find(r => String(r[appCol] || '').trim() === String(decision.appId))
+        : null;
+      const at = name => {
+        const idx = headers.indexOf(name);
+        return idx >= 0 && row ? String(row[idx] || '').trim() : '';
+      };
+      testWrite = appendSteamCandidateDecisionHistoryFromDecision_(ss, decision, {
+        machine_recommendation: at('机器推荐') ||
+          normalizeMasterMachineRecommendation_(decision.machineDecision || decision.autoRecommendation),
+        machine_confidence: at('机器置信度') || decision.autoRecommendationConfidence || '',
+        final_status: at('最终状态') || deriveMasterFinalStatus_(decision.status),
+        trends_result: at('Trends结果') || decision.trendsResult || '',
+        social_result: at('Social结果') || decision.socialResult || '',
+        serp_competition: at('SERP竞争') || decision.serpCompetition || '',
+        reason: 'schema_ensure_test_write'
+      });
+    }
+  }
+
+  SpreadsheetApp.flush();
+  return {
+    ok: masterMissing.length === 0 && historyMissing.length === 0,
+    master: {
+      spreadsheetId: ss.getId(),
+      sheet: HOTWORD_V2.sheets.master,
+      appended: masterSchema.appended,
+      headers: masterHeaders,
+      requiredPresent: requiredMaster.filter(name => masterHeaders.indexOf(name) >= 0),
+      missing: masterMissing
+    },
+    decisionHistory: {
+      spreadsheetId: history.spreadsheet.getId(),
+      sheet: HOTWORD_V2.monitoringHistory.tables.candidateDecision,
+      appended: history.schema.appended,
+      headers: history.schema.headers,
+      requiredPresent: requiredHistory.filter(name => history.schema.headers.indexOf(name) >= 0),
+      missing: historyMissing
+    },
+    testWrite: testWrite
+  };
 }
 
 function unifiedCandidateSource_(candidate) {
@@ -9292,6 +9817,11 @@ function upsertUnifiedCandidates_(ss, candidates) {
     index.set('id:' + candidateId, rowIndex);
     if (appIds[0]) index.set('app:' + appIds[0], rowIndex);
     index.set('name:' + normalizeGameName_(name), rowIndex);
+    const finalCol = col('最终状态');
+    if (finalCol >= 0 && (rows[rowIndex][finalCol] === '' || rows[rowIndex][finalCol] === null || rows[rowIndex][finalCol] === undefined)) {
+      rows[rowIndex][finalCol] = CANDIDATE_MASTER_FINAL_STATUSES.PENDING_RESEARCH;
+      sheet.getRange(rowIndex + 2, finalCol + 1).setValue(CANDIDATE_MASTER_FINAL_STATUSES.PENDING_RESEARCH);
+    }
   });
   return {ok: true, inserted: inserted, updated: updated, schemaAppended: schema.appended};
 }

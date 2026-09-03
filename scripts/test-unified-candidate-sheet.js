@@ -103,5 +103,5 @@ assert(JSON.stringify(sheet.rows).length >= before.length, 'rerun leaves existin
 
 var missingHeadersSheet = new FakeSheet(oldHeaders.concat(['Candidate ID']), []);
 var missingHeadersResult = context.upsertUnifiedCandidates_(new FakeSpreadsheet(missingHeadersSheet), [twitchCandidate('schema', 'Schema Game')]);
-assert(missingHeadersResult.schemaAppended.length === 5, 'missing additive headers auto-appended');
+assert(missingHeadersResult.schemaAppended.length === 12, 'missing additive headers auto-appended (5 Twitch + 7 outcome)');
 console.log('PASS scripts/test-unified-candidate-sheet.js (Steam/Twitch source combinations, merge, idempotency, legacy compatibility)');
