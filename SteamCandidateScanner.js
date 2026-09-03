@@ -402,6 +402,16 @@ function doGet(e) {
       .createTextOutput(JSON.stringify({ jobs: loadPendingSteamCandidateResearchJobs_(ss) }))
       .setMimeType(ContentService.MimeType.JSON);
   }
+  if (action === 'pendingPlayerAliasDiscoveryJobs') {
+    const ss = SpreadsheetApp.openById(QUALIFICATION_ELIGIBILITY_PRODUCTION_SHEET_ID);
+    return ContentService
+      .createTextOutput(JSON.stringify({
+        jobs: typeof loadPendingPlayerAliasDiscoveryJobs_ === 'function'
+          ? loadPendingPlayerAliasDiscoveryJobs_(ss)
+          : []
+      }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
   if (action === 'inspectSteamCandidateInboxProduction') {
     return ContentService
       .createTextOutput(JSON.stringify(inspectSteamCandidateInboxProduction_()))
@@ -496,6 +506,13 @@ function doPost(e) {
     const jobType = String(body.job_type || '').trim().toUpperCase();
     if (jobType === UNIFIED_CANDIDATE_UPSERT_JOB_TYPE) {
       return steamCandidateResearchJsonOutput_(handleUnifiedCandidateUpsertCallback_(body));
+    }
+    if (jobType === 'PLAYER_ALIAS_DISCOVERY') {
+      return steamCandidateResearchJsonOutput_(
+        typeof handlePlayerAliasDiscoveryCallback_ === 'function'
+          ? handlePlayerAliasDiscoveryCallback_(body)
+          : {ok: false, error: 'alias_callback_unavailable'}
+      );
     }
     if (jobType !== STEAM_CANDIDATE_RESEARCH_JOB_TYPE) {
       return steamCandidateResearchJsonOutput_({ok: false, error: 'unsupported_job_type'});

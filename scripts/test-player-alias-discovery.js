@@ -132,6 +132,18 @@ function runUnitTests() {
   assert(headersBlock.indexOf("'Google Trends链接'") >= 0, 'Google Trends链接 retained');
   assert(headersBlock.indexOf("repairPlayerAliasFalseNegativesProduction") >= 0, 'doGet wires repair action');
   assert(headersBlock.indexOf("verifyPlayerAliasDiscoveryProduction") >= 0, 'doGet wires verify action');
+  assert(headersBlock.indexOf("pendingPlayerAliasDiscoveryJobs") >= 0, 'doGet wires pending alias jobs');
+  assert(headersBlock.indexOf("PLAYER_ALIAS_DISCOVERY") >= 0, 'doPost routes PLAYER_ALIAS_DISCOVERY');
+  assert(headersBlock.indexOf('discoverPlayerSearchAlias_') < 0 ||
+    fs.readFileSync(path.join(root, 'PlayerAliasDiscovery.gs'), 'utf8').indexOf('enqueuePlayerAliasDiscoveryJob_') >= 0,
+    'enqueue helper exists');
+  assert(fs.readFileSync(path.join(root, 'PlayerAliasDiscovery.gs'), 'utf8')
+    .indexOf('ensurePlayerSearchAliasesForTodayActions_') >= 0, 'ensure helper exists');
+  assert(fs.readFileSync(path.join(root, 'PlayerAliasDiscovery.gs'), 'utf8')
+    .indexOf('enqueue hotword-engine') >= 0 ||
+    fs.readFileSync(path.join(root, 'PlayerAliasDiscovery.gs'), 'utf8')
+      .indexOf('enqueuePlayerAliasDiscoveryJob_') >= 0,
+    'ensure path enqueues instead of only scraping');
 
   var row = sandbox.actionRow_({
     name: 'Mortal Shell II',
@@ -289,52 +301,89 @@ function runUnitTests() {
   assert(sandbox.playerAliasResolveDiscoveryStatus_('Combolands', [{ok: true}]) === 'FOUND', 'resolve found');
   assert(sandbox.playerAliasResolveDiscoveryStatus_('', [{ok: true}, {ok: false}]) === 'NO_ALIAS_EVIDENCE', 'resolve no evidence');
 
+  // Enqueue path: ensure does not call live scraping; writes PENDING
+  var enqueueSheet = new FakeSheet('Trends研究记录', sandbox.HOTWORD_TRENDS_RESEARCH_HEADERS);
+  var enqueueSs = new FakeSpreadsheet({'Trends研究记录': enqueueSheet});
+  var actions = [{
+    appId: '4075620',
+    name: 'Combolands: Roguelike Citybuilder',
+    url: 'https://store.steampowered.com/app/4075620/',
+    firstRoundType: '🔥 趋势候选',
+    priority: 'P1 高',
+    searchAlias: '',
+    todayAction: {type: 'NEW', decision: {}}
+  }];
+  var ensureResult = sandbox.ensurePlayerSearchAliasesForTodayActions_(enqueueSs, actions);
+  assert(ensureResult.enqueued === 1, 'ensure enqueues one alias job');
+  assert(!actions[0].searchAlias, 'search alias stays empty until callback');
+  var pendingJobs = sandbox.loadPendingPlayerAliasDiscoveryJobs_(enqueueSs);
+  assert(pendingJobs.length === 1, 'pending alias job listed');
+  assert(pendingJobs[0].job_type === 'PLAYER_ALIAS_DISCOVERY', 'pending job type');
+  assert(pendingJobs[0].steam_app_id === '4075620', 'pending app id');
+  assert(pendingJobs[0].game_name.indexOf('Combolands') === 0, 'pending game name');
+
+  var callbackBody = {
+    job_id: pendingJobs[0].job_id,
+    job_type: 'PLAYER_ALIAS_DISCOVERY',
+    steam_app_id: '4075620',
+    game_name: 'Combolands: Roguelike Citybuilder',
+    steam_url: 'https://store.steampowered.com/app/4075620/',
+    execution_status: 'COMPLETED',
+    alias: 'Combolands',
+    status: 'FOUND',
+    confidence: 'HIGH',
+    source_count: 2,
+    source_urls: [
+      'https://www.reddit.com/r/IndieGaming/comments/abc/combolands/',
+      'https://www.youtube.com/watch?v=combo1'
+    ],
+    evidence: [{
+      source: 'reddit',
+      title: 'Combolands steam impressions',
+      snippet: 'playing Combolands',
+      url: 'https://www.reddit.com/r/IndieGaming/comments/abc/combolands/'
+    }],
+    patterns: ['Combolands'],
+    ranked: [{text: 'Combolands', hits: 2, sources: ['reddit', 'youtube']}],
+    source_diags: [
+      {source: 'reddit', ok: true, http_status: 200, empty: false, parse_count: 1, error: ''}
+    ]
+  };
+  sandbox.SpreadsheetApp = {
+    getActiveSpreadsheet: function () { return enqueueSs; },
+    openById: function () { return enqueueSs; }
+  };
+  sandbox.refreshTodayActionsFromCandidateDecisions_ = function () {
+    return {ok: true, refreshed: true};
+  };
+  sandbox.readMasterRecords_ = function () { return new Map(); };
+  sandbox.readCandidateDecisions_ = function () { return new Map(); };
+  var callbackResult = sandbox.handlePlayerAliasDiscoveryCallback_(callbackBody);
+  assert(callbackResult.ok === true, 'alias callback ok');
+  assert(callbackResult.alias === 'Combolands', 'callback writes alias');
+  assert(callbackResult.status === 'FOUND', 'callback status FOUND');
+  var afterCache = sandbox.readCachedPlayerSearchAlias_(enqueueSs, '4075620');
+  assert(afterCache.found === true && afterCache.alias === 'Combolands', 'FOUND becomes durable cache');
+  var evidenceAfter = String(enqueueSheet.rows[enqueueSheet.rows.length - 1][
+    sandbox.HOTWORD_TRENDS_RESEARCH_HEADERS.indexOf('EvidenceRef')
+  ] || '');
+  assert(evidenceAfter.indexOf('source_urls=') >= 0, 'EvidenceRef includes source_urls');
+  assert(evidenceAfter.indexOf('reddit.com') >= 0, 'EvidenceRef includes real URL');
+
   console.log('PASS unit checks');
 }
 
 (async function main() {
   runUnitTests();
 
-  var fetchImpl = fetchTextSync;
-
-  console.log('\n=== Live alias discovery (Google / YouTube / Reddit / Steam Community) ===');
-  var liveResults = [];
-  for (var i = 0; i < REAL_CASES.length; i += 1) {
-    var item = REAL_CASES[i];
-    var discovery = sandbox.discoverPlayerSearchAlias_(item.name, item.appId,
-      'https://store.steampowered.com/app/' + item.appId + '/', {fetchImpl: fetchImpl});
-    liveResults.push({
-      game: item.name,
-      appId: item.appId,
-      alias: discovery.alias,
-      status: discovery.status,
-      sourceHits: (discovery.ranked || []).slice(0, 3),
-      snippetCount: (discovery.evidence || []).length,
-      sourceDiags: discovery.sourceDiags
-    });
-    console.log('\n' + item.name + ' (' + item.appId + ')');
-    console.log('  搜索别名: ' + (discovery.alias || '(空)'));
-    console.log('  状态: ' + discovery.status + ' | 证据条数: ' + (discovery.evidence || []).length);
-    if (discovery.sourceDiags && discovery.sourceDiags.length) {
-      discovery.sourceDiags.forEach(function (diag) {
-        console.log('  源诊断: ' + sandbox.playerAliasFormatSourceDiag_(diag));
-      });
-    }
-    if (discovery.ranked && discovery.ranked.length) {
-      discovery.ranked.slice(0, 3).forEach(function (rank) {
-        console.log('  候选: ' + rank.text + ' | hits=' + rank.hits + ' | sources=' + rank.sources.join(','));
-      });
-    }
-    var trends = sandbox.buildTrendsQuery_(item.name, discovery.alias);
-    console.log('  Trends查询: ' + trends.query);
-  }
-
-  var mortal = liveResults.find(function (row) { return row.game === 'Mortal Shell II'; });
-  assert(mortal && mortal.alias, 'Mortal Shell II should discover a player alias from live sources');
-  assert(mortal.status === 'FOUND', 'Mortal Shell II live status FOUND');
+  // Live discovery moved to hotword-engine providers. Keep a light optional
+  // smoke that only asserts enqueue helpers remain wired; do not require
+  // Apps Script UrlFetch success against Reddit/Google.
+  console.log('\n=== Alias discovery ownership ===');
+  console.log('Production discovery runs in hotword-engine PLAYER_ALIAS_DISCOVERY jobs.');
+  console.log('Apps Script only enqueues PENDING and applies callbacks.');
 
   console.log('\nPASS scripts/test-player-alias-discovery.js');
-  console.log(JSON.stringify({liveResults: liveResults}, null, 2));
 })().catch(function (err) {
   console.error(err.stack || err);
   process.exit(1);
