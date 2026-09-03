@@ -734,15 +734,27 @@ function readTodayActionSearchAliasesProduction_(ss, appIds) {
   const rows = [];
   const dataHeight = sheet.getLastRow() - 3;
   if (dataHeight < 1) return [];
-  sheet.getRange(4, 1, sheet.getLastRow(), headerWidth).getDisplayValues().forEach(row => {
+  const displayRows = sheet.getRange(4, 1, sheet.getLastRow(), headerWidth).getDisplayValues();
+  const formulaRows = trendsColumn >= 0
+    ? sheet.getRange(4, trendsColumn + 1, sheet.getLastRow(), 1).getFormulas()
+    : [];
+  displayRows.forEach((row, index) => {
     const appId = String(row[appColumn] || '').trim();
     if (!appId) return;
     if (wanted.size && !wanted.has(appId)) return;
+    const formula = formulaRows[index] && formulaRows[index][0]
+      ? String(formulaRows[index][0] || '')
+      : '';
+    const trendsUrlMatch = /HYPERLINK\("([^"]+)"/i.exec(formula);
     rows.push({
       appId: appId,
       game: nameColumn >= 0 ? String(row[nameColumn] || '').trim() : '',
       searchAlias: aliasColumn >= 0 ? String(row[aliasColumn] || '').trim() : '',
-      trendsLink: trendsColumn >= 0 ? String(row[trendsColumn] || '').trim() : ''
+      trendsLink: trendsColumn >= 0 ? String(row[trendsColumn] || '').trim() : '',
+      trendsUrl: trendsUrlMatch ? trendsUrlMatch[1] : '',
+      trendsQueryUsesAlias: !!(trendsUrlMatch && aliasColumn >= 0 &&
+        String(row[aliasColumn] || '').trim() &&
+        decodeURIComponent(trendsUrlMatch[1]).indexOf(String(row[aliasColumn] || '').trim()) >= 0)
     });
   });
   return rows;
