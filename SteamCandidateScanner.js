@@ -398,6 +398,11 @@ function doGet(e) {
     return ContentService.createTextOutput(JSON.stringify(repairResult))
       .setMimeType(ContentService.MimeType.JSON);
   }
+  if (action === 'g022RepairMissingRunLedger') {
+    const requestedRunId = String(e.parameter.runId || '20260902-084337');
+    return ContentService.createTextOutput(JSON.stringify(g022RepairMissingRunLedgerFromExisting_(requestedRunId)))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
   if (action === 'pendingSteamCandidateResearchJobs') {
     const ss = SpreadsheetApp.openById(QUALIFICATION_ELIGIBILITY_PRODUCTION_SHEET_ID);
     return ContentService
@@ -503,6 +508,28 @@ function doGet(e) {
       })))
       .setMimeType(ContentService.MimeType.JSON);
   }
+  if (action === 'g022FinalizeExistingRunProduction') {
+    const runId = String(e && e.parameter && e.parameter.runId || '20260903-084334').trim();
+    return ContentService
+      .createTextOutput(JSON.stringify(g022FinalizeExistingRunProduction_(runId)))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+  if (action === 'backfillCandidateOutcomesProduction') {
+    const step = String(e && e.parameter && e.parameter.step || 'all').trim().toLowerCase();
+    return ContentService
+      .createTextOutput(JSON.stringify(backfillCandidateOutcomesProduction_({
+        verifyNames: String(e && e.parameter && e.parameter.verify_names || '').trim(),
+        step: step
+      })))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+  if (action === 'verifyCandidateMasterOutcomesProduction') {
+    const names = String(e && e.parameter && (e.parameter.names || e.parameter.verify_names) || '')
+      .split('|').map(value => value.trim()).filter(Boolean);
+    return ContentService
+      .createTextOutput(JSON.stringify(verifyCandidateMasterOutcomesProduction_(names)))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
   return ContentService
     .createTextOutput(JSON.stringify({ error: 'unknown_action', jobs: [] }))
     .setMimeType(ContentService.MimeType.JSON);
@@ -519,6 +546,9 @@ function doPost(e) {
     const jobType = String(body.job_type || '').trim().toUpperCase();
     if (jobType === UNIFIED_CANDIDATE_UPSERT_JOB_TYPE) {
       return steamCandidateResearchJsonOutput_(handleUnifiedCandidateUpsertCallback_(body));
+    }
+    if (jobType === 'TWITCH_HISTORICAL_RAW_LEDGER_APPEND') {
+      return steamCandidateResearchJsonOutput_(handleTwitchHistoricalLedgerCallback_(body));
     }
     if (jobType === 'PLAYER_ALIAS_DISCOVERY') {
       return steamCandidateResearchJsonOutput_(
@@ -9239,6 +9269,21 @@ function upsertMaster_(ss, records, runTime, runId, stats) {
 
     const row = masterRow_(rec, runTime, firstSeen, runId, manualNote);
 
+    // Steam-only rows get a stable Candidate ID so later outcome writes can
+    // prefer Candidate ID and still fall back to Steam App ID.
+    if (existingRow) {
+      const schema = ensureUnifiedCandidateSchema_(sheet);
+      const candidateCol = schema.headers.indexOf('Candidate ID');
+      if (candidateCol >= 0) {
+        const existingCandidateId = String(
+          sheet.getRange(existingRow, candidateCol + 1).getDisplayValue() || ''
+        ).trim();
+        if (!existingCandidateId && rec.appId) {
+          sheet.getRange(existingRow, candidateCol + 1).setValue(stableSteamCandidateId_(rec.appId));
+        }
+      }
+    }
+
     // A failed GP request is not a new observation and must not erase a
     // previously successful enrichment in the master table.
     if (existingRow && rec._gpEnrichmentFailed) {
@@ -9268,10 +9313,25 @@ function upsertMaster_(ss, records, runTime, runId, stats) {
 
   if (newRows.length) {
     sheet.getRange(sheet.getLastRow() + 1, 1, newRows.length, HOTWORD_V2.masterHeaders.length).setValues(newRows);
+    const schema = ensureUnifiedCandidateSchema_(sheet);
+    const candidateCol = schema.headers.indexOf('Candidate ID');
+    if (candidateCol >= 0) {
+      const startRow = sheet.getLastRow() - newRows.length + 1;
+      newRows.forEach((row, offset) => {
+        const appId = String(row[1] || '').trim();
+        if (!appId) return;
+        sheet.getRange(startRow + offset, candidateCol + 1).setValue(stableSteamCandidateId_(appId));
+      });
+    }
   }
   touchedAppIds.forEach(appId => {
     seedCandidateMasterPendingStatus_(ss, {steamAppId: String(appId || '').trim()});
   });
+}
+
+function stableSteamCandidateId_(appId) {
+  const id = String(appId || '').trim();
+  return id ? ('steam-' + id) : '';
 }
 
 // G018 P3: additive fields on the existing 候选主表.  These are intentionally
@@ -9597,12 +9657,58 @@ function buildSteamCandidateDecisionHistorySnapshot_(decision, extras) {
   };
 }
 
+function steamCandidateDecisionHistoryStateKey_(snapshot) {
+  const source = snapshot && typeof snapshot === 'object' ? snapshot : {};
+  return [
+    String(source.decision_id || '').trim(),
+    String(source.steam_app_id || '').trim(),
+    String(source.decision || '').trim(),
+    String(source.trends_result || '').trim(),
+    String(source.social_result || '').trim(),
+    String(source.serp_competition || '').trim(),
+    String(source.machine_recommendation || '').trim(),
+    String(source.machine_confidence || '').trim(),
+    String(source.final_status || '').trim()
+  ].join('\u0001');
+}
+
 /**
  * Append one decision snapshot. Never updates existing history rows.
+ * Idempotent against an identical decision_id/Steam App ID + outcome state.
  */
 function appendSteamCandidateDecisionHistorySnapshot_(snapshot, options) {
   const history = steamCandidateDecisionHistorySheet_(options && options.spreadsheet);
   const headers = history.schema.headers;
+  const stateKey = steamCandidateDecisionHistoryStateKey_(snapshot);
+  if (history.sheet.getLastRow() >= 2) {
+    const existing = history.sheet.getRange(2, 1, history.sheet.getLastRow() - 1, headers.length).getDisplayValues();
+    const idx = name => headers.indexOf(name);
+    const duplicate = existing.some(row => {
+      const current = {
+        decision_id: idx('decision_id') >= 0 ? row[idx('decision_id')] : '',
+        steam_app_id: idx('steam_app_id') >= 0 ? row[idx('steam_app_id')] : '',
+        decision: idx('decision') >= 0 ? row[idx('decision')] : '',
+        trends_result: idx('trends_result') >= 0 ? row[idx('trends_result')] : '',
+        social_result: idx('social_result') >= 0 ? row[idx('social_result')] : '',
+        serp_competition: idx('serp_competition') >= 0 ? row[idx('serp_competition')] : '',
+        machine_recommendation: idx('machine_recommendation') >= 0 ? row[idx('machine_recommendation')] : '',
+        machine_confidence: idx('machine_confidence') >= 0 ? row[idx('machine_confidence')] : '',
+        final_status: idx('final_status') >= 0 ? row[idx('final_status')] : ''
+      };
+      return steamCandidateDecisionHistoryStateKey_(current) === stateKey;
+    });
+    if (duplicate) {
+      return {
+        ok: true,
+        appended: 0,
+        deduped: 1,
+        rowNumber: 0,
+        schemaAppended: history.schema.appended,
+        headers: headers,
+        spreadsheetId: history.spreadsheet.getId()
+      };
+    }
+  }
   const row = headers.map(name => {
     if (!snapshot || snapshot[name] === undefined || snapshot[name] === null) return '';
     return snapshot[name];
@@ -9612,6 +9718,7 @@ function appendSteamCandidateDecisionHistorySnapshot_(snapshot, options) {
   return {
     ok: true,
     appended: 1,
+    deduped: 0,
     rowNumber: start,
     schemaAppended: history.schema.appended,
     headers: headers,
@@ -9714,6 +9821,194 @@ function ensureCandidateOutcomeSchemasProduction_(options) {
     },
     testWrite: testWrite
   };
+}
+
+/**
+ * Fill stable Candidate ID for existing Steam-only master rows.
+ * Never inserts rows; never overwrites a non-empty Candidate ID.
+ */
+function backfillSteamCandidateIdsOnMaster_(ss) {
+  ss = ss || SpreadsheetApp.openById(QUALIFICATION_ELIGIBILITY_PRODUCTION_SHEET_ID);
+  const sheet = ss.getSheetByName(HOTWORD_V2.sheets.master);
+  if (!sheet) return {ok: false, error: 'master_missing', filled: 0, skipped: 0};
+  const schema = ensureUnifiedCandidateSchema_(sheet);
+  const idCol = schema.headers.indexOf('Candidate ID');
+  const appCol = schema.headers.indexOf('Steam App ID');
+  if (idCol < 0 || appCol < 0) return {ok: false, error: 'schema_missing', filled: 0, skipped: 0};
+  if (sheet.getLastRow() < 2) return {ok: true, filled: 0, skipped: 0};
+  const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, schema.width).getValues();
+  let filled = 0;
+  let skipped = 0;
+  rows.forEach((row, index) => {
+    const appId = String(row[appCol] || '').trim();
+    const candidateId = String(row[idCol] || '').trim();
+    if (!appId || candidateId) { skipped += 1; return; }
+    sheet.getRange(index + 2, idCol + 1).setValue(stableSteamCandidateId_(appId));
+    filled += 1;
+  });
+  return {ok: true, filled: filled, skipped: skipped, total: rows.length};
+}
+
+function backfillCandidateDecisionsToMaster_(ss) {
+  ss = ss || SpreadsheetApp.openById(QUALIFICATION_ELIGIBILITY_PRODUCTION_SHEET_ID);
+  ensureUnifiedCandidateSchema_(ss.getSheetByName(HOTWORD_V2.sheets.master));
+  const decisions = readCandidateDecisions_(ss);
+  let updated = 0, skipped = 0, missing = 0;
+  const samples = [];
+  decisions.forEach(decision => {
+    if (!decision || !decision.appId) { skipped += 1; return; }
+    const fields = {};
+    if (decision.trendsResult) fields['Trends结果'] = decision.trendsResult;
+    if (decision.socialResult) fields['Social结果'] = decision.socialResult;
+    if (decision.serpCompetition) fields['SERP竞争'] = decision.serpCompetition;
+    const machine = normalizeMasterMachineRecommendation_(
+      decision.autoRecommendation || decision.machineDecision
+    );
+    if (machine) fields['机器推荐'] = machine;
+    if (decision.autoRecommendationConfidence) fields['机器置信度'] = decision.autoRecommendationConfidence;
+    if (decision.status) fields['人工决定'] = decision.status;
+    if (!Object.keys(fields).length) fields['最终状态'] = deriveMasterFinalStatus_(decision.status);
+    const result = updateCandidateMasterOutcome_(ss, {
+      candidateId: stableSteamCandidateId_(decision.appId),
+      steamAppId: decision.appId,
+      gameName: decision.name
+    }, fields, {allowHumanOverwrite: false, trendsOnlyIfEmpty: true});
+    if (result && result.ok) {
+      updated += 1;
+      if (samples.length < 12) samples.push({
+        steamAppId: decision.appId, gameName: decision.name,
+        rowNumber: result.rowNumber,
+        candidateId: result.candidateId || stableSteamCandidateId_(decision.appId)
+      });
+    } else if (result && result.error === 'candidate_not_found') missing += 1;
+    else skipped += 1;
+  });
+  return {ok: true, updated: updated, skipped: skipped, missing: missing, decisionCount: decisions.size, samples: samples};
+}
+
+function backfillSteamCandidateDecisionHistory_(ss) {
+  ss = ss || SpreadsheetApp.openById(QUALIFICATION_ELIGIBILITY_PRODUCTION_SHEET_ID);
+  const decisions = readCandidateDecisions_(ss);
+  const history = steamCandidateDecisionHistorySheet_();
+  const headers = history.schema.headers;
+  const existingKeys = new Set();
+  if (history.sheet.getLastRow() >= 2) {
+    const existing = history.sheet.getRange(2, 1, history.sheet.getLastRow() - 1, headers.length).getDisplayValues();
+    const idx = name => headers.indexOf(name);
+    existing.forEach(row => {
+      existingKeys.add(steamCandidateDecisionHistoryStateKey_({
+        decision_id: idx('decision_id') >= 0 ? row[idx('decision_id')] : '',
+        steam_app_id: idx('steam_app_id') >= 0 ? row[idx('steam_app_id')] : '',
+        decision: idx('decision') >= 0 ? row[idx('decision')] : '',
+        trends_result: idx('trends_result') >= 0 ? row[idx('trends_result')] : '',
+        social_result: idx('social_result') >= 0 ? row[idx('social_result')] : '',
+        serp_competition: idx('serp_competition') >= 0 ? row[idx('serp_competition')] : '',
+        machine_recommendation: idx('machine_recommendation') >= 0 ? row[idx('machine_recommendation')] : '',
+        machine_confidence: idx('machine_confidence') >= 0 ? row[idx('machine_confidence')] : '',
+        final_status: idx('final_status') >= 0 ? row[idx('final_status')] : ''
+      }));
+    });
+  }
+  let appended = 0, deduped = 0, failed = 0;
+  const samples = [];
+  const newRows = [];
+  decisions.forEach(decision => {
+    if (!decision || !decision.appId) return;
+    const machine = normalizeMasterMachineRecommendation_(
+      decision.autoRecommendation || decision.machineDecision
+    );
+    const snapshot = buildSteamCandidateDecisionHistorySnapshot_(decision, {
+      machine_recommendation: machine,
+      machine_confidence: decision.autoRecommendationConfidence || '',
+      final_status: deriveMasterFinalStatus_(decision.status),
+      trends_result: decision.trendsResult || '',
+      social_result: decision.socialResult || '',
+      serp_competition: decision.serpCompetition || '',
+      reason: 'candidate_decision_backfill'
+    });
+    const stateKey = steamCandidateDecisionHistoryStateKey_(snapshot);
+    if (existingKeys.has(stateKey)) { deduped += 1; return; }
+    existingKeys.add(stateKey);
+    newRows.push(headers.map(name => snapshot[name] === undefined || snapshot[name] === null ? '' : snapshot[name]));
+    appended += 1;
+    if (samples.length < 12) samples.push({
+      steamAppId: decision.appId, gameName: decision.name, decision: snapshot.decision,
+      machine_recommendation: snapshot.machine_recommendation, final_status: snapshot.final_status,
+      observed_date: snapshot.observed_date
+    });
+  });
+  if (newRows.length) {
+    try {
+      history.sheet.getRange(history.sheet.getLastRow() + 1, 1, newRows.length, headers.length).setValues(newRows);
+    } catch (err) {
+      return {ok: false, appended: 0, deduped: deduped, failed: newRows.length, decisionCount: decisions.size,
+        error: String(err && err.message || err || 'history_backfill_write_failed'), samples: samples};
+    }
+  }
+  return {ok: failed === 0, appended: appended, deduped: deduped, failed: failed, decisionCount: decisions.size, samples: samples};
+}
+
+function deleteSchemaEnsureTestDecisionHistoryRow_() {
+  const history = steamCandidateDecisionHistorySheet_();
+  const sheet = history.sheet;
+  const headers = history.schema.headers;
+  const appCol = headers.indexOf('steam_app_id');
+  const reasonCol = headers.indexOf('reason');
+  if (appCol < 0 || reasonCol < 0 || sheet.getLastRow() < 2) return {ok: true, deleted: 0, reason: 'nothing_to_delete'};
+  const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, headers.length).getDisplayValues();
+  const targets = [];
+  rows.forEach((row, index) => {
+    if (String(row[appCol] || '').trim() === '4948000' && String(row[reasonCol] || '').trim() === 'schema_ensure_test_write') {
+      targets.push(index + 2);
+    }
+  });
+  targets.sort((a, b) => b - a).forEach(rowNumber => sheet.deleteRow(rowNumber));
+  return {ok: true, deleted: targets.length, steamAppId: '4948000', reason: 'schema_ensure_test_write'};
+}
+
+function verifyCandidateMasterOutcomesProduction_(names) {
+  const wanted = (Array.isArray(names) && names.length ? names : [
+    'the cabin game', 'Zad Archery', 'SHRIMP GAME: OVERKRILL', 'Gawr Gura: Quest for Bread'
+  ]).map(value => String(value || '').trim()).filter(Boolean);
+  const ss = SpreadsheetApp.openById(QUALIFICATION_ELIGIBILITY_PRODUCTION_SHEET_ID);
+  const sheet = ss.getSheetByName(HOTWORD_V2.sheets.master);
+  if (!sheet || sheet.getLastRow() < 2) return {ok: false, error: 'master_empty', rows: []};
+  const schema = ensureUnifiedCandidateSchema_(sheet);
+  const col = name => schema.headers.indexOf(name);
+  const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, schema.width).getDisplayValues();
+  const out = wanted.map(name => {
+    const needle = normalizeGameName_(name);
+    const row = rows.find(item => normalizeGameName_(item[col('游戏名称')] || '') === needle) || null;
+    if (!row) return {gameName: name, found: false};
+    const at = header => { const idx = col(header); return idx >= 0 ? String(row[idx] || '').trim() : ''; };
+    return {
+      gameName: name, found: true, steamAppId: at('Steam App ID'), candidateId: at('Candidate ID'),
+      trends: at('Trends结果'), social: at('Social结果'), serp: at('SERP竞争'),
+      machineRecommendation: at('机器推荐'), machineConfidence: at('机器置信度'),
+      humanDecision: at('人工决定'), finalStatus: at('最终状态'),
+      filled: !!(at('Trends结果') || at('Social结果') || at('SERP竞争') || at('机器推荐') || at('最终状态'))
+    };
+  });
+  return {ok: out.every(item => item.found && item.filled), rows: out};
+}
+
+function backfillCandidateOutcomesProduction_(options) {
+  const opts = options && typeof options === 'object' ? options : {};
+  const step = String(opts.step || 'all').trim().toLowerCase() || 'all';
+  const ss = SpreadsheetApp.openById(QUALIFICATION_ELIGIBILITY_PRODUCTION_SHEET_ID);
+  const out = {ok: true, step: step};
+  if (step === 'all' || step === 'schema') out.schema = ensureCandidateOutcomeSchemasProduction_({writeTest: false});
+  if (step === 'all' || step === 'ids') out.candidateIds = backfillSteamCandidateIdsOnMaster_(ss);
+  if (step === 'all' || step === 'master') out.master = backfillCandidateDecisionsToMaster_(ss);
+  if (step === 'all' || step === 'delete') out.deletedTestRow = deleteSchemaEnsureTestDecisionHistoryRow_();
+  if (step === 'all' || step === 'history') out.history = backfillSteamCandidateDecisionHistory_(ss);
+  if (step === 'all' || step === 'verify') {
+    const verifyNames = String(opts.verifyNames || '').split('|').map(value => value.trim()).filter(Boolean);
+    out.verify = verifyCandidateMasterOutcomesProduction_(verifyNames);
+  }
+  SpreadsheetApp.flush();
+  out.ok = Object.keys(out).every(key => key === 'ok' || key === 'step' || !out[key] || out[key].ok !== false);
+  return out;
 }
 
 function unifiedCandidateSource_(candidate) {
