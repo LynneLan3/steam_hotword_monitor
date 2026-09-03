@@ -3,43 +3,109 @@
  * Reddit / Steam Community 检索玩家实际使用的简称、缩写、去副标题名、数字写法。
  * 禁止模型猜测；无明确证据则留空。
  * 证据写入现有 Trends研究记录（TrendVerdict=ALIAS_DISCOVERY）。
+ *
+ * 状态语义：
+ * - FOUND：真实非空 alias，允许 durable cache hit
+ * - NO_ALIAS_EVIDENCE：来源正常返回但证据不足；短期可跳过，到期复查（非永久 negative cache）
+ * - RETRIEVAL_FAILED：全部来源抓取失败；下次运行必须重试
  */
 
 const PLAYER_ALIAS_DISCOVERY_VERDICT_ = 'ALIAS_DISCOVERY';
 const PLAYER_ALIAS_MIN_SOURCE_HITS_ = 2;
+const PLAYER_ALIAS_NO_EVIDENCE_RECHECK_DAYS_ = 7;
+const PLAYER_ALIAS_STATUS_FOUND_ = 'FOUND';
+const PLAYER_ALIAS_STATUS_NO_EVIDENCE_ = 'NO_ALIAS_EVIDENCE';
+const PLAYER_ALIAS_STATUS_RETRIEVAL_FAILED_ = 'RETRIEVAL_FAILED';
+const PLAYER_ALIAS_SOURCES_ = ['reddit', 'youtube', 'steam_community', 'google'];
 const PLAYER_ALIAS_ROMAN_WORDS_ = {
   II: '2', III: '3', IV: '4', V: '5', VI: '6', VII: '7', VIII: '8', IX: '9', X: '10'
 };
 
 /**
+ * 只有真实非空 alias 才算 cache hit（found=true）。
+ * SearchTerm=(none) / RETRIEVAL_FAILED / NO_ALIAS_EVIDENCE 一律不算成功缓存。
  * @param {Object} ss
  * @param {string} appId
- * @return {{alias:string,found:boolean,researchId:string}}
+ * @return {{alias:string,found:boolean,researchId:string,status:string,recordedAt:Date|null,searchTerm:string}}
  */
 function readCachedPlayerSearchAlias_(ss, appId) {
+  const latest = readLatestPlayerAliasAttempt_(ss, appId);
+  if (!latest) {
+    return {alias: '', found: false, researchId: '', status: '', recordedAt: null, searchTerm: ''};
+  }
+  const alias = String(latest.alias || '').trim();
+  const found = !!alias && alias !== '(none)' && latest.status === PLAYER_ALIAS_STATUS_FOUND_;
+  return {
+    alias: found ? alias : '',
+    found: found,
+    researchId: latest.researchId || '',
+    status: latest.status || '',
+    recordedAt: latest.recordedAt || null,
+    searchTerm: latest.searchTerm || ''
+  };
+}
+
+/**
+ * 读取某 AppID 最新一条 ALIAS_DISCOVERY 尝试（含失败 / 无证据）。
+ * @param {Object} ss
+ * @param {string} appId
+ * @return {Object|null}
+ */
+function readLatestPlayerAliasAttempt_(ss, appId) {
   const sheet = ss && ss.getSheetByName ? ss.getSheetByName(HOTWORD_V2.sheets.trendsResearch) : null;
   const normalizedAppId = String(appId || '').trim();
-  if (!sheet || sheet.getLastRow() < 2 || !normalizedAppId) return {alias: '', found: false, researchId: ''};
+  if (!sheet || sheet.getLastRow() < 2 || !normalizedAppId) return null;
 
   const headers = sheet.getRange(1, 1, 1, Math.max(sheet.getLastColumn(), 1)).getDisplayValues()[0];
   const appColumn = headers.indexOf('AppID');
   const verdictColumn = headers.indexOf('TrendVerdict');
   const searchColumn = headers.indexOf('SearchTerm');
   const researchColumn = headers.indexOf('ResearchID');
-  if (appColumn < 0 || verdictColumn < 0) return {alias: '', found: false, researchId: ''};
+  const evidenceColumn = headers.indexOf('EvidenceRef');
+  const recordedColumn = headers.indexOf('RecordedAt');
+  const dateColumn = headers.indexOf('ResearchDate');
+  if (appColumn < 0 || verdictColumn < 0) return null;
 
-  let alias = '';
-  let researchId = '';
-  let found = false;
+  let latest = null;
   sheet.getRange(2, 1, sheet.getLastRow() - 1, Math.max(sheet.getLastColumn(), 1)).getDisplayValues().forEach(row => {
     if (String(row[appColumn] || '').trim() !== normalizedAppId) return;
     if (String(row[verdictColumn] || '').trim().toUpperCase() !== PLAYER_ALIAS_DISCOVERY_VERDICT_) return;
-    found = true;
-    researchId = researchColumn >= 0 ? String(row[researchColumn] || '').trim() : '';
-    const candidate = searchColumn >= 0 ? String(row[searchColumn] || '').trim() : '';
-    if (candidate && candidate !== '(none)') alias = candidate;
+    const searchTerm = searchColumn >= 0 ? String(row[searchColumn] || '').trim() : '';
+    const evidenceRef = evidenceColumn >= 0 ? String(row[evidenceColumn] || '') : '';
+    const status = playerAliasParseStatusFromEvidence_(evidenceRef, searchTerm);
+    const alias = searchTerm && searchTerm !== '(none)' ? searchTerm : '';
+    const recordedAt = playerAliasParseRecordedAt_(
+      recordedColumn >= 0 ? row[recordedColumn] : '',
+      dateColumn >= 0 ? row[dateColumn] : ''
+    );
+    const candidate = {
+      alias: alias,
+      searchTerm: searchTerm,
+      status: status,
+      researchId: researchColumn >= 0 ? String(row[researchColumn] || '').trim() : '',
+      evidenceRef: evidenceRef,
+      recordedAt: recordedAt,
+      rowIndex: 0
+    };
+    if (!latest || playerAliasAttemptIsNewer_(candidate, latest)) latest = candidate;
   });
-  return {alias: alias, found: found, researchId: researchId};
+  return latest;
+}
+
+/**
+ * 是否应跳过本次发现（仅 NO_ALIAS_EVIDENCE 在复查窗口内可 defer）。
+ * RETRIEVAL_FAILED 与历史无状态 (none) 永不 defer。
+ * @param {Object} ss
+ * @param {string} appId
+ * @return {boolean}
+ */
+function shouldDeferPlayerAliasDiscovery_(ss, appId) {
+  const latest = readLatestPlayerAliasAttempt_(ss, appId);
+  if (!latest) return false;
+  if (latest.alias && latest.status === PLAYER_ALIAS_STATUS_FOUND_) return true;
+  if (latest.status === PLAYER_ALIAS_STATUS_RETRIEVAL_FAILED_) return false;
+  if (latest.status !== PLAYER_ALIAS_STATUS_NO_EVIDENCE_) return false;
+  return !playerAliasIsDueForRecheck_(latest.recordedAt, PLAYER_ALIAS_NO_EVIDENCE_RECHECK_DAYS_);
 }
 
 /**
@@ -47,43 +113,74 @@ function readCachedPlayerSearchAlias_(ss, appId) {
  * @param {string} appId
  * @param {string} steamUrl
  * @param {Object} [options]
- * @return {{alias:string,evidence:Array<Object>,status:string,patterns:Array<string>}}
+ * @return {{alias:string,evidence:Array<Object>,status:string,patterns:Array<string>,ranked:Array<Object>,sourceDiags:Array<Object>}}
  */
 function discoverPlayerSearchAlias_(gameName, appId, steamUrl, options) {
   options = options || {};
   const officialName = String(gameName || '').trim();
-  if (!officialName) return {alias: '', evidence: [], status: 'EMPTY', patterns: []};
+  if (!officialName) {
+    return {
+      alias: '', evidence: [], status: 'EMPTY', patterns: [], ranked: [], sourceDiags: []
+    };
+  }
 
   const patterns = playerAliasGenerateEvidencePatterns_(officialName);
-  const snippets = playerAliasCollectSearchSnippets_(officialName, appId, steamUrl, options.fetchImpl);
+  const collected = playerAliasCollectSearchSnippets_(officialName, appId, steamUrl, options.fetchImpl);
+  const snippets = collected.snippets || [];
+  const sourceDiags = collected.sourceDiags || [];
   const ranked = playerAliasRankCandidates_(officialName, patterns, snippets)
     .filter(entry => !playerAliasIsNumeralVariantOnly_(entry.text, officialName))
     .filter(entry => !playerAliasIsWeakSubtitleOnlyAlias_(entry.text, officialName));
   const best = ranked.length ? ranked[0] : null;
   const alias = best && best.hits >= PLAYER_ALIAS_MIN_SOURCE_HITS_ ? best.text : '';
+  const status = playerAliasResolveDiscoveryStatus_(alias, sourceDiags);
 
   return {
     alias: alias,
     evidence: snippets.slice(0, 40),
-    status: alias ? 'FOUND' : 'NONE',
+    status: status,
     patterns: patterns,
-    ranked: ranked.slice(0, 5)
+    ranked: ranked.slice(0, 5),
+    sourceDiags: sourceDiags
   };
+}
+
+/**
+ * @param {string} alias
+ * @param {Array<Object>} sourceDiags
+ * @return {string}
+ */
+function playerAliasResolveDiscoveryStatus_(alias, sourceDiags) {
+  if (alias) return PLAYER_ALIAS_STATUS_FOUND_;
+  const diags = sourceDiags || [];
+  if (!diags.length) return PLAYER_ALIAS_STATUS_RETRIEVAL_FAILED_;
+  const anyOk = diags.some(item => item && item.ok);
+  if (!anyOk) return PLAYER_ALIAS_STATUS_RETRIEVAL_FAILED_;
+  return PLAYER_ALIAS_STATUS_NO_EVIDENCE_;
 }
 
 /**
  * @param {Object} ss
  * @param {Object} rec
  * @param {{alias:string,evidence:Array<Object>,status:string,patterns:Array<string>}} discovery
- * @return {{written:boolean,researchId:string}}
+ * @param {Object} [options]
+ * @return {{written:boolean,researchId:string,duplicate?:boolean,deferred?:boolean}}
  */
-function writePlayerAliasResearchRecord_(ss, rec, discovery) {
+function writePlayerAliasResearchRecord_(ss, rec, discovery, options) {
+  options = options || {};
   const sheet = ss && ss.getSheetByName ? ss.getSheetByName(HOTWORD_V2.sheets.trendsResearch) : null;
   if (!sheet) return {written: false, researchId: ''};
 
   const appId = String(rec && rec.appId || '').trim();
-  const cached = readCachedPlayerSearchAlias_(ss, appId);
-  if (cached.found) return {written: false, researchId: cached.researchId, duplicate: true};
+  if (!options.force) {
+    const cached = readCachedPlayerSearchAlias_(ss, appId);
+    if (cached.found) return {written: false, researchId: cached.researchId, duplicate: true};
+    if (shouldDeferPlayerAliasDiscovery_(ss, appId) &&
+        discovery && discovery.status === PLAYER_ALIAS_STATUS_NO_EVIDENCE_) {
+      const latest = readLatestPlayerAliasAttempt_(ss, appId);
+      return {written: false, researchId: latest && latest.researchId || '', deferred: true};
+    }
+  }
 
   const headers = HOTWORD_TRENDS_RESEARCH_HEADERS || [
     'ResearchID', 'ResearchDate', 'EvidenceID', 'AppID', 'Game', 'OpportunityID',
@@ -92,7 +189,11 @@ function writePlayerAliasResearchRecord_(ss, rec, discovery) {
     'EntityMatchConfidence', 'Steam1BType', 'SteamPriority', 'TrendVerdict',
     'RecommendedRoute', 'EvidenceRef', 'RecordedAt'
   ];
-  const evidenceId = 'alias-' + appId + '-' + playerAliasHashKey_(rec.name + '|' + String(discovery && discovery.alias || ''));
+  const status = discovery && discovery.status ? discovery.status : PLAYER_ALIAS_STATUS_NO_EVIDENCE_;
+  const aliasText = discovery && discovery.alias ? discovery.alias : '';
+  const evidenceId = 'alias-' + appId + '-' + playerAliasHashKey_(
+    rec.name + '|' + aliasText + '|' + status + '|' + playerAliasDateText_(new Date())
+  );
   const researchId = 'alias-research-' + evidenceId;
   const opportunityId = rec.todayAction && rec.todayAction.decision && rec.todayAction.decision.opportunityId
     ? rec.todayAction.decision.opportunityId
@@ -100,6 +201,8 @@ function writePlayerAliasResearchRecord_(ss, rec, discovery) {
       ? opportunityIdFromSteamCandidate_(rec.name, appId) : '');
 
   const evidenceSummary = playerAliasEvidenceSummary_(discovery);
+  const confidence = aliasText ? 'HIGH'
+    : (status === PLAYER_ALIAS_STATUS_RETRIEVAL_FAILED_ ? 'UNKNOWN' : 'LOW');
   const row = hotwordExternalRow_ ? hotwordExternalRow_(headers, {
     ResearchID: researchId,
     ResearchDate: playerAliasDateText_(new Date()),
@@ -107,7 +210,7 @@ function writePlayerAliasResearchRecord_(ss, rec, discovery) {
     AppID: appId,
     Game: rec.name,
     OpportunityID: opportunityId,
-    SearchTerm: discovery && discovery.alias ? discovery.alias : '(none)',
+    SearchTerm: aliasText || '(none)',
     Geo: HOTWORD_V2 && HOTWORD_V2.trendsExplore ? HOTWORD_V2.trendsExplore.geo || 'US' : 'US',
     Window: HOTWORD_V2 && HOTWORD_V2.trendsExplore ? HOTWORD_V2.trendsExplore.date || 'today 1-m' : 'today 1-m',
     Benchmark: '',
@@ -116,8 +219,8 @@ function writePlayerAliasResearchRecord_(ss, rec, discovery) {
     RelativeStrength: '',
     TrendDirection: '',
     Breakout: '',
-    BrandAmbiguity: '',
-    EntityMatchConfidence: discovery && discovery.alias ? 'HIGH' : 'LOW',
+    BrandAmbiguity: status,
+    EntityMatchConfidence: confidence,
     Steam1BType: rec.firstRoundType || '',
     SteamPriority: rec.priority || '',
     TrendVerdict: PLAYER_ALIAS_DISCOVERY_VERDICT_,
@@ -128,11 +231,11 @@ function writePlayerAliasResearchRecord_(ss, rec, discovery) {
     const values = {
       ResearchID: researchId, ResearchDate: playerAliasDateText_(new Date()), EvidenceID: evidenceId,
       AppID: appId, Game: rec.name, OpportunityID: opportunityId,
-      SearchTerm: discovery && discovery.alias ? discovery.alias : '(none)',
+      SearchTerm: aliasText || '(none)',
       Geo: 'US', Window: 'today 1-m', Benchmark: '',
       CandidateAvg: '', BenchmarkAvg: '', RelativeStrength: '', TrendDirection: '',
-      Breakout: '', BrandAmbiguity: '',
-      EntityMatchConfidence: discovery && discovery.alias ? 'HIGH' : 'LOW',
+      Breakout: '', BrandAmbiguity: status,
+      EntityMatchConfidence: confidence,
       Steam1BType: rec.firstRoundType || '', SteamPriority: rec.priority || '',
       TrendVerdict: PLAYER_ALIAS_DISCOVERY_VERDICT_,
       RecommendedRoute: 'Google Trends', EvidenceRef: evidenceSummary, RecordedAt: new Date()
@@ -156,6 +259,10 @@ function ensurePlayerSearchAliasesForTodayActions_(ss, actions) {
       return;
     }
     if (!shouldRunPlayerAliasDiscovery_(rec)) {
+      rec.searchAlias = '';
+      return;
+    }
+    if (shouldDeferPlayerAliasDiscovery_(ss, rec.appId)) {
       rec.searchAlias = '';
       return;
     }
@@ -184,6 +291,240 @@ function shouldRunPlayerAliasDiscovery_(rec) {
  */
 function needsPlayerAliasDiscovery_(rec) {
   return shouldRunPlayerAliasDiscovery_(rec);
+}
+
+/**
+ * 生产修复：对历史 ALIAS_DISCOVERY + SearchTerm=(none)（及指定 AppID）强制重跑发现。
+ * @param {Object} [params]
+ * @return {Object}
+ */
+function repairPlayerAliasFalseNegativesProduction_(params) {
+  params = params || {};
+  const ss = SpreadsheetApp.openById(QUALIFICATION_ELIGIBILITY_PRODUCTION_SHEET_ID);
+  const forceAppIds = (params.appIds || params.app_ids || [])
+    .map(id => String(id || '').trim())
+    .filter(Boolean);
+  const defaultTargets = ['4075620', '4339280', '2445260'];
+  const targetSet = new Set(forceAppIds.length ? forceAppIds : defaultTargets);
+
+  const noneCandidates = listPlayerAliasNoneCandidates_(ss);
+  noneCandidates.forEach(item => targetSet.add(item.appId));
+
+  const master = typeof readMasterRecords_ === 'function' ? readMasterRecords_(ss) : new Map();
+  const decisions = typeof readCandidateDecisions_ === 'function' ? readCandidateDecisions_(ss) : new Map();
+  const results = [];
+
+  Array.from(targetSet).forEach(appId => {
+    const masterRec = master.get ? master.get(appId) : null;
+    const decision = decisions.get ? decisions.get(appId) : null;
+    const name = (masterRec && masterRec.name) ||
+      (decision && decision.name) ||
+      playerAliasLookupGameNameFromTrends_(ss, appId) ||
+      '';
+    const url = (masterRec && masterRec.url) ||
+      ('https://store.steampowered.com/app/' + appId + '/');
+    if (!name) {
+      results.push({appId: appId, ok: false, error: 'game_name_missing'});
+      return;
+    }
+    const before = readLatestPlayerAliasAttempt_(ss, appId);
+    const discovery = discoverPlayerSearchAlias_(name, appId, url);
+    const written = writePlayerAliasResearchRecord_(ss, {
+      appId: appId,
+      name: name,
+      url: url,
+      firstRoundType: masterRec && masterRec.firstRoundType || '',
+      priority: masterRec && masterRec.priority || '',
+      todayAction: {decision: decision || {}}
+    }, discovery, {force: true});
+    results.push({
+      appId: appId,
+      game: name,
+      ok: true,
+      alias: discovery.alias || '',
+      status: discovery.status,
+      written: written.written,
+      researchId: written.researchId,
+      sourceDiags: discovery.sourceDiags || [],
+      ranked: (discovery.ranked || []).slice(0, 3).map(entry => ({
+        text: entry.text,
+        hits: entry.hits,
+        sources: entry.sources
+      })),
+      beforeStatus: before && before.status || '',
+      beforeSearchTerm: before && before.searchTerm || ''
+    });
+  });
+
+  const refresh = typeof refreshTodayActionsFromCandidateDecisions_ === 'function'
+    ? refreshTodayActionsFromCandidateDecisions_(ss)
+    : {ok: false, skipped: true};
+  SpreadsheetApp.flush();
+
+  const todayAlias = readTodayActionSearchAliasesProduction_(ss, Array.from(targetSet));
+  return {
+    ok: true,
+    repairedCount: results.filter(item => item.ok).length,
+    results: results,
+    refresh: refresh,
+    todayActionAliases: todayAlias
+  };
+}
+
+/**
+ * 生产验证：检查指定候选的最新 ALIAS_DISCOVERY 记录，禁止永久 negative cache。
+ * @param {Object} [params]
+ * @return {Object}
+ */
+function verifyPlayerAliasDiscoveryProduction_(params) {
+  params = params || {};
+  const ss = SpreadsheetApp.openById(QUALIFICATION_ELIGIBILITY_PRODUCTION_SHEET_ID);
+  const appIds = (params.appIds || params.app_ids || ['4075620', '4339280', '2445260'])
+    .map(id => String(id || '').trim())
+    .filter(Boolean);
+
+  const checks = appIds.map(appId => {
+    const latest = readLatestPlayerAliasAttempt_(ss, appId);
+    const cached = readCachedPlayerSearchAlias_(ss, appId);
+    const deferred = shouldDeferPlayerAliasDiscovery_(ss, appId);
+    const evidenceRef = latest && latest.evidenceRef || '';
+    const hasSourceDiag = /sources=/.test(evidenceRef) || /http=/.test(evidenceRef);
+    const hasRanked = /ranked=/.test(evidenceRef);
+    const status = latest && latest.status || '';
+    const searchTerm = latest && latest.searchTerm || '';
+    const permanentNoneSkip = searchTerm === '(none)' &&
+      cached.found === false &&
+      deferred === true &&
+      status !== PLAYER_ALIAS_STATUS_NO_EVIDENCE_;
+    const legacyPatternsOnlyNone = searchTerm === '(none)' &&
+      /patterns=/.test(evidenceRef) &&
+      !hasSourceDiag &&
+      !/status=/.test(evidenceRef);
+    const okStatus = status === PLAYER_ALIAS_STATUS_FOUND_ ||
+      status === PLAYER_ALIAS_STATUS_NO_EVIDENCE_ ||
+      status === PLAYER_ALIAS_STATUS_RETRIEVAL_FAILED_;
+    const evidenceOk = status === PLAYER_ALIAS_STATUS_FOUND_
+      ? (hasSourceDiag || hasRanked)
+      : (hasSourceDiag || status === PLAYER_ALIAS_STATUS_RETRIEVAL_FAILED_);
+    return {
+      appId: appId,
+      ok: !!(latest && okStatus && evidenceOk && !permanentNoneSkip && !legacyPatternsOnlyNone),
+      status: status,
+      searchTerm: searchTerm,
+      alias: cached.alias || '',
+      foundCacheHit: cached.found,
+      deferred: deferred,
+      hasSourceDiag: hasSourceDiag,
+      hasRanked: hasRanked,
+      permanentNoneSkip: permanentNoneSkip,
+      legacyPatternsOnlyNone: legacyPatternsOnlyNone,
+      evidenceRefPreview: evidenceRef.slice(0, 500),
+      researchId: latest && latest.researchId || ''
+    };
+  });
+
+  const todayAliases = readTodayActionSearchAliasesProduction_(ss, appIds);
+  return {
+    ok: checks.every(item => item.ok),
+    checks: checks,
+    todayActionAliases: todayAliases,
+    rules: {
+      cacheHitOnlyRealAlias: true,
+      retrievalFailedAlwaysRetry: true,
+      noAliasEvidenceRecheckDays: PLAYER_ALIAS_NO_EVIDENCE_RECHECK_DAYS_,
+      forbidden: 'SearchTerm=(none) with only patterns=... permanently skipped'
+    }
+  };
+}
+
+/**
+ * @param {Object} ss
+ * @return {Array<{appId:string,game:string,searchTerm:string,status:string}>}
+ */
+function listPlayerAliasNoneCandidates_(ss) {
+  const sheet = ss && ss.getSheetByName ? ss.getSheetByName(HOTWORD_V2.sheets.trendsResearch) : null;
+  if (!sheet || sheet.getLastRow() < 2) return [];
+  const headers = sheet.getRange(1, 1, 1, Math.max(sheet.getLastColumn(), 1)).getDisplayValues()[0];
+  const appColumn = headers.indexOf('AppID');
+  const gameColumn = headers.indexOf('Game');
+  const verdictColumn = headers.indexOf('TrendVerdict');
+  const searchColumn = headers.indexOf('SearchTerm');
+  const evidenceColumn = headers.indexOf('EvidenceRef');
+  if (appColumn < 0 || verdictColumn < 0 || searchColumn < 0) return [];
+
+  const byApp = new Map();
+  sheet.getRange(2, 1, sheet.getLastRow() - 1, Math.max(sheet.getLastColumn(), 1)).getDisplayValues().forEach(row => {
+    if (String(row[verdictColumn] || '').trim().toUpperCase() !== PLAYER_ALIAS_DISCOVERY_VERDICT_) return;
+    const appId = String(row[appColumn] || '').trim();
+    if (!appId) return;
+    const searchTerm = String(row[searchColumn] || '').trim();
+    const evidenceRef = evidenceColumn >= 0 ? String(row[evidenceColumn] || '') : '';
+    const status = playerAliasParseStatusFromEvidence_(evidenceRef, searchTerm);
+    byApp.set(appId, {
+      appId: appId,
+      game: gameColumn >= 0 ? String(row[gameColumn] || '').trim() : '',
+      searchTerm: searchTerm,
+      status: status
+    });
+  });
+
+  return Array.from(byApp.values()).filter(item => {
+    if (item.searchTerm && item.searchTerm !== '(none)') return false;
+    return item.status !== PLAYER_ALIAS_STATUS_FOUND_;
+  });
+}
+
+/**
+ * @param {Object} ss
+ * @param {Array<string>} appIds
+ * @return {Array<Object>}
+ */
+function readTodayActionSearchAliasesProduction_(ss, appIds) {
+  const sheetName = HOTWORD_V2.sheets.action || '今日行动';
+  const sheet = ss && ss.getSheetByName ? ss.getSheetByName(sheetName) : null;
+  if (!sheet || sheet.getLastRow() < 4) return [];
+  const headerWidth = Math.max(
+    sheet.getLastColumn(),
+    HOTWORD_V2.actionHeaders ? HOTWORD_V2.actionHeaders.length : 1
+  );
+  const headers = sheet.getRange(3, 1, 3, headerWidth).getDisplayValues()[0];
+  const appColumn = headers.indexOf('Steam App ID');
+  const nameColumn = headers.indexOf('游戏名称');
+  const aliasColumn = headers.indexOf('搜索别名');
+  const trendsColumn = headers.indexOf('Google Trends链接');
+  if (appColumn < 0) return [];
+  const wanted = new Set((appIds || []).map(id => String(id || '').trim()).filter(Boolean));
+  const rows = [];
+  const dataHeight = sheet.getLastRow() - 3;
+  if (dataHeight < 1) return [];
+  sheet.getRange(4, 1, sheet.getLastRow(), headerWidth).getDisplayValues().forEach(row => {
+    const appId = String(row[appColumn] || '').trim();
+    if (!appId) return;
+    if (wanted.size && !wanted.has(appId)) return;
+    rows.push({
+      appId: appId,
+      game: nameColumn >= 0 ? String(row[nameColumn] || '').trim() : '',
+      searchAlias: aliasColumn >= 0 ? String(row[aliasColumn] || '').trim() : '',
+      trendsLink: trendsColumn >= 0 ? String(row[trendsColumn] || '').trim() : ''
+    });
+  });
+  return rows;
+}
+
+function playerAliasLookupGameNameFromTrends_(ss, appId) {
+  const sheet = ss && ss.getSheetByName ? ss.getSheetByName(HOTWORD_V2.sheets.trendsResearch) : null;
+  if (!sheet || sheet.getLastRow() < 2) return '';
+  const headers = sheet.getRange(1, 1, 1, Math.max(sheet.getLastColumn(), 1)).getDisplayValues()[0];
+  const appColumn = headers.indexOf('AppID');
+  const gameColumn = headers.indexOf('Game');
+  if (appColumn < 0 || gameColumn < 0) return '';
+  let name = '';
+  sheet.getRange(2, 1, sheet.getLastRow() - 1, Math.max(sheet.getLastColumn(), 1)).getDisplayValues().forEach(row => {
+    if (String(row[appColumn] || '').trim() !== String(appId || '').trim()) return;
+    const candidate = String(row[gameColumn] || '').trim();
+    if (candidate) name = candidate;
+  });
+  return name;
 }
 
 function playerAliasDateText_(date) {
@@ -215,8 +556,13 @@ function playerAliasHashKey_(text) {
 
 function playerAliasEvidenceSummary_(discovery) {
   const parts = [];
+  const status = discovery && discovery.status ? discovery.status : '';
+  if (status) parts.push('status=' + status);
   if (discovery && discovery.patterns && discovery.patterns.length) {
     parts.push('patterns=' + discovery.patterns.join('; '));
+  }
+  if (discovery && discovery.sourceDiags && discovery.sourceDiags.length) {
+    parts.push('sources=' + discovery.sourceDiags.map(playerAliasFormatSourceDiag_).join('; '));
   }
   (discovery && discovery.evidence || []).slice(0, 12).forEach(item => {
     parts.push(String(item.source || 'unknown') + ': ' + String(item.title || item.snippet || '').slice(0, 120));
@@ -227,6 +573,54 @@ function playerAliasEvidenceSummary_(discovery) {
     ).join('; '));
   }
   return parts.join(' | ').slice(0, 4500);
+}
+
+function playerAliasFormatSourceDiag_(diag) {
+  const item = diag || {};
+  return String(item.source || 'unknown') +
+    '(http=' + (item.httpStatus == null ? '?' : item.httpStatus) +
+    ',empty=' + (item.empty ? '1' : '0') +
+    ',parsed=' + (item.parseCount == null ? 0 : item.parseCount) +
+    ',ok=' + (item.ok ? '1' : '0') +
+    (item.error ? ',err=' + String(item.error).slice(0, 80) : '') +
+    ')';
+}
+
+function playerAliasParseStatusFromEvidence_(evidenceRef, searchTerm) {
+  const text = String(evidenceRef || '');
+  const match = /(?:^|\||\s)status=([A-Z_]+)/.exec(text);
+  if (match && match[1]) return match[1];
+  const alias = String(searchTerm || '').trim();
+  if (alias && alias !== '(none)') return PLAYER_ALIAS_STATUS_FOUND_;
+  // 历史假阴性：只有 patterns=...、SearchTerm=(none)、无 status → 视为需重试，不当成功
+  return '';
+}
+
+function playerAliasParseRecordedAt_(recordedRaw, dateRaw) {
+  if (recordedRaw instanceof Date && !isNaN(recordedRaw.getTime())) return recordedRaw;
+  const recordedText = String(recordedRaw || '').trim();
+  if (recordedText) {
+    const parsed = new Date(recordedText);
+    if (!isNaN(parsed.getTime())) return parsed;
+  }
+  const dateText = String(dateRaw || '').trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(dateText)) {
+    const parsed = new Date(dateText + 'T00:00:00+08:00');
+    if (!isNaN(parsed.getTime())) return parsed;
+  }
+  return null;
+}
+
+function playerAliasAttemptIsNewer_(left, right) {
+  const leftTime = left && left.recordedAt instanceof Date ? left.recordedAt.getTime() : 0;
+  const rightTime = right && right.recordedAt instanceof Date ? right.recordedAt.getTime() : 0;
+  return leftTime >= rightTime;
+}
+
+function playerAliasIsDueForRecheck_(recordedAt, days) {
+  if (!(recordedAt instanceof Date) || isNaN(recordedAt.getTime())) return true;
+  const windowMs = Math.max(1, Number(days) || PLAYER_ALIAS_NO_EVIDENCE_RECHECK_DAYS_) * 24 * 60 * 60 * 1000;
+  return (Date.now() - recordedAt.getTime()) >= windowMs;
 }
 
 function playerAliasGenerateEvidencePatterns_(officialName) {
@@ -246,6 +640,8 @@ function playerAliasGenerateEvidencePatterns_(officialName) {
     if (main && sub) {
       patterns.add(main + ' ' + sub);
       playerAliasRomanVariants_(main + ' ' + sub).forEach(item => patterns.add(item));
+      // 主标题本身常是玩家搜索简称（如 Combolands / ShipShaper），需证据命中后才采用
+      if (main.length >= 4) patterns.add(main);
       if (sub.length >= 8) patterns.add(sub);
     }
   }
@@ -253,10 +649,14 @@ function playerAliasGenerateEvidencePatterns_(officialName) {
   return Array.from(patterns).filter(item => item && item.length >= 3);
 }
 
+/**
+ * @return {{snippets:Array<Object>,sourceDiags:Array<Object>}}
+ */
 function playerAliasCollectSearchSnippets_(gameName, appId, steamUrl, fetchImpl) {
   const fetchFn = fetchImpl || playerAliasFetchText_;
   const query = playerAliasCleanName_(gameName);
   const snippets = [];
+  const sourceDiags = [];
   const push = (source, title, snippet, url) => {
     const text = String(title || '').trim();
     const body = String(snippet || '').trim();
@@ -264,16 +664,65 @@ function playerAliasCollectSearchSnippets_(gameName, appId, steamUrl, fetchImpl)
     snippets.push({source: source, title: text, snippet: body, url: String(url || '').trim()});
   };
 
-  playerAliasSearchReddit_(query, appId, fetchFn).forEach(item => push('reddit', item.title, item.snippet, item.url));
-  playerAliasSearchYouTube_(query, appId, fetchFn).forEach(item => push('youtube', item.title, item.snippet, item.url));
-  playerAliasSearchSteamCommunity_(query, appId, steamUrl, fetchFn).forEach(item => push('steam_community', item.title, item.snippet, item.url));
-  playerAliasSearchGoogle_(query, appId, fetchFn).forEach(item => push('google', item.title, item.snippet, item.url));
-  return snippets;
+  const reddit = playerAliasSearchReddit_(query, appId, fetchFn);
+  sourceDiags.push(reddit.diag);
+  reddit.items.forEach(item => push('reddit', item.title, item.snippet, item.url));
+
+  const youtube = playerAliasSearchYouTube_(query, appId, fetchFn);
+  sourceDiags.push(youtube.diag);
+  youtube.items.forEach(item => push('youtube', item.title, item.snippet, item.url));
+
+  const steam = playerAliasSearchSteamCommunity_(query, appId, steamUrl, fetchFn);
+  sourceDiags.push(steam.diag);
+  steam.items.forEach(item => push('steam_community', item.title, item.snippet, item.url));
+
+  const google = playerAliasSearchGoogle_(query, appId, fetchFn);
+  sourceDiags.push(google.diag);
+  google.items.forEach(item => push('google', item.title, item.snippet, item.url));
+
+  return {snippets: snippets, sourceDiags: sourceDiags};
+}
+
+/**
+ * 兼容旧 fetchImpl：若返回字符串则包成结果对象；新实现可直接返回 {text,httpStatus,empty,error}。
+ * @param {Function} fetchFn
+ * @param {string} url
+ * @return {{text:string,httpStatus:number|null,empty:boolean,error:string}}
+ */
+function playerAliasInvokeFetch_(fetchFn, url) {
+  try {
+    const raw = fetchFn(url);
+    if (raw && typeof raw === 'object' && !Array.isArray(raw) && Object.prototype.hasOwnProperty.call(raw, 'text')) {
+      const text = String(raw.text || '');
+      return {
+        text: text,
+        httpStatus: raw.httpStatus == null ? (text ? 200 : null) : raw.httpStatus,
+        empty: raw.empty != null ? !!raw.empty : !text,
+        error: String(raw.error || '')
+      };
+    }
+    const text = String(raw || '');
+    return {
+      text: text,
+      httpStatus: text ? 200 : null,
+      empty: !text,
+      error: text ? '' : 'empty_response'
+    };
+  } catch (err) {
+    return {
+      text: '',
+      httpStatus: null,
+      empty: true,
+      error: String(err && err.message || err || 'fetch_exception').slice(0, 160)
+    };
+  }
 }
 
 function playerAliasFetchText_(url, options) {
   options = options || {};
-  if (typeof UrlFetchApp === 'undefined') return '';
+  if (typeof UrlFetchApp === 'undefined') {
+    return {text: '', httpStatus: null, empty: true, error: 'UrlFetchApp_unavailable'};
+  }
   try {
     const resp = UrlFetchApp.fetch(url, {
       muteHttpExceptions: true,
@@ -284,10 +733,29 @@ function playerAliasFetchText_(url, options) {
       },
       validateHttpsCertificates: true
     });
-    if (resp.getResponseCode() >= 400) return '';
-    return resp.getContentText('UTF-8');
+    const httpStatus = resp.getResponseCode();
+    const text = resp.getContentText('UTF-8') || '';
+    if (httpStatus >= 400) {
+      return {
+        text: '',
+        httpStatus: httpStatus,
+        empty: true,
+        error: 'http_' + httpStatus
+      };
+    }
+    return {
+      text: text,
+      httpStatus: httpStatus,
+      empty: !text,
+      error: text ? '' : 'empty_body'
+    };
   } catch (err) {
-    return '';
+    return {
+      text: '',
+      httpStatus: null,
+      empty: true,
+      error: String(err && err.message || err || 'fetch_exception').slice(0, 160)
+    };
   }
 }
 
@@ -297,11 +765,28 @@ function playerAliasSearchReddit_(query, appId, fetchFn) {
     'https://www.reddit.com/search.json?q=' + encodeURIComponent(q) + '&limit=25&sort=relevance',
     'https://old.reddit.com/search.json?q=' + encodeURIComponent(q) + '&limit=25&sort=relevance'
   ];
+  const diag = {
+    source: 'reddit',
+    httpStatus: null,
+    empty: true,
+    parseCount: 0,
+    ok: false,
+    error: ''
+  };
   for (let i = 0; i < urls.length; i += 1) {
-    const text = fetchFn(urls[i]);
-    if (!text || text.charAt(0) !== '{') continue;
+    const fetched = playerAliasInvokeFetch_(fetchFn, urls[i]);
+    diag.httpStatus = fetched.httpStatus;
+    diag.empty = fetched.empty;
+    if (fetched.error && !fetched.text) {
+      diag.error = fetched.error;
+      continue;
+    }
+    if (!fetched.text || fetched.text.charAt(0) !== '{') {
+      diag.error = fetched.text ? 'non_json_body' : (fetched.error || 'empty_response');
+      continue;
+    }
     try {
-      const data = JSON.parse(text);
+      const data = JSON.parse(fetched.text);
       const rows = (data.data && data.data.children || []).map(child => {
         const item = child.data || {};
         return {
@@ -310,26 +795,49 @@ function playerAliasSearchReddit_(query, appId, fetchFn) {
           url: item.permalink ? 'https://www.reddit.com' + item.permalink : ''
         };
       });
-      if (rows.length) return rows;
+      diag.parseCount = rows.length;
+      diag.ok = true;
+      diag.error = '';
+      return {items: rows, diag: diag};
     } catch (err) {
-      // try next endpoint
+      diag.error = 'json_parse_error';
     }
   }
-  return [];
+  return {items: [], diag: diag};
 }
 
 function playerAliasSearchYouTube_(query, appId, fetchFn) {
   const url = 'https://www.youtube.com/results?search_query=' + encodeURIComponent(query + ' steam game');
-  const html = fetchFn(url);
-  if (!html) return [];
+  const diag = {
+    source: 'youtube',
+    httpStatus: null,
+    empty: true,
+    parseCount: 0,
+    ok: false,
+    error: ''
+  };
+  const fetched = playerAliasInvokeFetch_(fetchFn, url);
+  diag.httpStatus = fetched.httpStatus;
+  diag.empty = fetched.empty;
+  if (!fetched.text) {
+    diag.error = fetched.error || 'empty_response';
+    return {items: [], diag: diag};
+  }
   const results = [];
   const titleRegex = /"title":\{"runs":\[\{"text":"((?:\\.|[^"\\])*)"/g;
   let match;
-  while ((match = titleRegex.exec(html)) && results.length < 20) {
+  while ((match = titleRegex.exec(fetched.text)) && results.length < 20) {
     const title = playerAliasUnescapeJson_(match[1]);
     if (title) results.push({title: title, snippet: '', url: ''});
   }
-  return results;
+  diag.parseCount = results.length;
+  const looksLikeYouTube = fetched.text.indexOf('ytInitialData') >= 0 ||
+    fetched.text.indexOf('ytd-app') >= 0 ||
+    fetched.text.indexOf('ytInitialPlayerResponse') >= 0;
+  // 解析到标题，或明确是 YouTube 结果页（可 0 条），才算抓取成功
+  diag.ok = results.length > 0 || looksLikeYouTube;
+  diag.error = diag.ok ? '' : (fetched.text.length > 500 ? 'unparseable_or_blocked_html' : 'short_or_blocked_html');
+  return {items: results, diag: diag};
 }
 
 function playerAliasSearchSteamCommunity_(query, appId, steamUrl, fetchFn) {
@@ -341,21 +849,46 @@ function playerAliasSearchSteamCommunity_(query, appId, steamUrl, fetchFn) {
   } else {
     urls.push('https://steamcommunity.com/discussions/search/?q=' + encodeURIComponent(query + ' steam'));
   }
+  const diag = {
+    source: 'steam_community',
+    httpStatus: null,
+    empty: true,
+    parseCount: 0,
+    ok: false,
+    error: ''
+  };
   const results = [];
+  let sawSuccessBody = false;
+  let lastBody = '';
   urls.forEach(url => {
-    const html = fetchFn(url);
-    if (!html) return;
+    const fetched = playerAliasInvokeFetch_(fetchFn, url);
+    if (fetched.httpStatus != null) diag.httpStatus = fetched.httpStatus;
+    if (fetched.httpStatus != null && fetched.httpStatus >= 400) {
+      if (!diag.error) diag.error = fetched.error || ('http_' + fetched.httpStatus);
+      return;
+    }
+    if (!fetched.text) {
+      if (!diag.error) diag.error = fetched.error || 'empty_response';
+      return;
+    }
+    diag.empty = false;
+    sawSuccessBody = true;
+    lastBody = fetched.text;
     const titleRegex = /<span class="title">([^<]+)<\/span>/gi;
     let match;
-    while ((match = titleRegex.exec(html)) && results.length < 20) {
+    while ((match = titleRegex.exec(fetched.text)) && results.length < 20) {
       results.push({title: playerAliasDecodeHtml_(match[1]), snippet: '', url: url});
     }
     const topicRegex = /data-tooltip-text="([^"]+)"/gi;
-    while ((match = topicRegex.exec(html)) && results.length < 20) {
+    while ((match = topicRegex.exec(fetched.text)) && results.length < 20) {
       results.push({title: playerAliasDecodeHtml_(match[1]), snippet: '', url: url});
     }
   });
-  return results;
+  diag.parseCount = results.length;
+  const looksLikeSteam = /forum_|discussion|responsive_tab|commentthread/i.test(lastBody);
+  diag.ok = results.length > 0 || (sawSuccessBody && looksLikeSteam);
+  diag.error = diag.ok ? '' : (diag.error || (sawSuccessBody ? 'unparseable_or_blocked_html' : 'all_requests_failed'));
+  return {items: results, diag: diag};
 }
 
 function playerAliasSearchGoogle_(query, appId, fetchFn) {
@@ -363,19 +896,44 @@ function playerAliasSearchGoogle_(query, appId, fetchFn) {
     query + ' steam game',
     'site:store.steampowered.com "' + query + '"'
   ];
+  const diag = {
+    source: 'google',
+    httpStatus: null,
+    empty: true,
+    parseCount: 0,
+    ok: false,
+    error: ''
+  };
   const results = [];
+  let sawSuccessBody = false;
+  let lastError = '';
   searches.forEach(q => {
     const url = 'https://www.google.com/search?q=' + encodeURIComponent(q) + '&num=10';
-    const html = fetchFn(url);
-    if (!html) return;
+    const fetched = playerAliasInvokeFetch_(fetchFn, url);
+    if (fetched.httpStatus != null) diag.httpStatus = fetched.httpStatus;
+    if (fetched.error) lastError = fetched.error;
+    if (fetched.httpStatus != null && fetched.httpStatus >= 400) {
+      if (!diag.error) diag.error = fetched.error || ('http_' + fetched.httpStatus);
+      return;
+    }
+    if (!fetched.text) {
+      if (!diag.error) diag.error = fetched.error || 'empty_response';
+      return;
+    }
+    diag.empty = false;
+    sawSuccessBody = true;
     const blockRegex = /<(?:h3|div)[^>]*>([^<]{4,120})<\/(?:h3|div)>/gi;
     let match;
-    while ((match = blockRegex.exec(html)) && results.length < 20) {
+    while ((match = blockRegex.exec(fetched.text)) && results.length < 20) {
       const title = playerAliasDecodeHtml_(match[1].replace(/<[^>]+>/g, ' '));
       if (title && title.indexOf('http') < 0) results.push({title: title, snippet: '', url: ''});
     }
   });
-  return results;
+  diag.parseCount = results.length;
+  diag.ok = sawSuccessBody;
+  if (diag.ok) diag.error = '';
+  else if (!diag.error) diag.error = lastError || 'all_requests_failed';
+  return {items: results, diag: diag};
 }
 
 function playerAliasRankCandidates_(officialName, patterns, snippets) {

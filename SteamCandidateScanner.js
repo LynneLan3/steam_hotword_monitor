@@ -449,6 +449,24 @@ function doGet(e) {
       .createTextOutput(JSON.stringify(verifyTrendsRecalcProduction_(e && e.parameter || {})))
       .setMimeType(ContentService.MimeType.JSON);
   }
+  if (action === 'repairPlayerAliasFalseNegativesProduction') {
+    const rawAppIds = e && e.parameter ? String(e.parameter.app_ids || e.parameter.appIds || '').trim() : '';
+    const appIds = rawAppIds
+      ? rawAppIds.split(/[,\s]+/).map(id => String(id || '').trim()).filter(Boolean)
+      : [];
+    return ContentService
+      .createTextOutput(JSON.stringify(repairPlayerAliasFalseNegativesProduction_({appIds: appIds})))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+  if (action === 'verifyPlayerAliasDiscoveryProduction') {
+    const rawAppIds = e && e.parameter ? String(e.parameter.app_ids || e.parameter.appIds || '').trim() : '';
+    const appIds = rawAppIds
+      ? rawAppIds.split(/[,\s]+/).map(id => String(id || '').trim()).filter(Boolean)
+      : ['4075620', '4339280', '2445260'];
+    return ContentService
+      .createTextOutput(JSON.stringify(verifyPlayerAliasDiscoveryProduction_({appIds: appIds})))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
   if (action === 'searchProductionCandidateSources') {
     const query = e && e.parameter ? String(e.parameter.name || e.parameter.q || '').trim() : '';
     return ContentService
