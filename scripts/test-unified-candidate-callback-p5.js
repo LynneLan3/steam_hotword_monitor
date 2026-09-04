@@ -1,4 +1,4 @@
-/** G018 P5: UNIFIED_CANDIDATE_UPSERT doPost receiver tests. */
+/** G018 P5: UNIFIED_CANDIDATE_UPSERT doPost receiver tests (Steam-only). */
 var fs = require('fs');
 var path = require('path');
 var vm = require('vm');
@@ -16,11 +16,6 @@ vm.createContext(context);
 vm.runInContext(source, context);
 
 function assert(value, message) { if (!value) throw new Error(message); }
-function cloneRow(row, width) {
-  var next = row.slice(0, width);
-  while (next.length < width) next.push('');
-  return next;
-}
 function FakeRange(sheet, row, column, rowCount, columnCount) {
   this.sheet = sheet; this.row = row; this.column = column;
   this.rowCount = rowCount || 1; this.columnCount = columnCount || 1;
@@ -63,11 +58,19 @@ var sheet = new FakeSheet(oldHeaders, []);
 var ss = new FakeSpreadsheet(sheet);
 context.SpreadsheetApp = {getActiveSpreadsheet: function () { return ss; }};
 
-function twitchCandidate(candidateId, name) {
-  return {candidate_id: candidateId, canonical_name: name, has_steam: false, has_twitch: true,
-    steam_app_ids: [], platform_listings: [{platform: 'TWITCH', platform_game_id: 'tw-' + candidateId}],
-    signals: [{source: 'TWITCH_HELIX_TOP_GAMES', raw_value: 3, observed_at: '2026-09-01T00:00:00Z',
-      signal_id: 'sig-' + candidateId, metadata: {twitch_game_id: 'tw-' + candidateId, igdb_id: 'ig-' + candidateId, run_id: 'run-p5'}}]};
+function steamCandidate(candidateId, name, appId) {
+  return {
+    candidate_id: candidateId,
+    canonical_name: name,
+    has_steam: true,
+    steam_app_ids: [appId],
+    platform_listings: [{
+      platform: 'STEAM',
+      platform_game_id: appId,
+      store_url: 'https://store.steampowered.com/app/' + appId + '/'
+    }],
+    signals: []
+  };
 }
 
 function post(body) {
@@ -81,12 +84,34 @@ var payload = {
   observed_at: '2026-09-01T00:00:00Z',
   execution_status: 'COMPLETED',
   candidate_count: 1,
-  candidates: [twitchCandidate('p5-only', 'P5 Twitch Only')]
+  candidates: [steamCandidate('p5-steam', 'P5 Steam Only', '3393280')]
 };
 var first = post(payload);
 assert(first.ok === true && first.inserted === 1, 'authorized unified upsert accepted');
-assert(sheet.rows[0][col('游戏名称')] === 'P5 Twitch Only', 'candidate row written');
-assert(sheet.rows[0][oldHeaders.length] === 'p5-only', 'candidate id written');
+assert(sheet.rows[0][col('游戏名称')] === 'P5 Steam Only', 'candidate row written');
+assert(sheet.rows[0][col('Steam App ID')] === '3393280', 'steam app id written');
+assert(sheet.rows[0][oldHeaders.length] === 'p5-steam', 'candidate id written');
+
+var twitchOnly = post({
+  token: token,
+  job_type: 'UNIFIED_CANDIDATE_UPSERT',
+  run_id: 'run-p5-twitch',
+  observed_at: '2026-09-01T00:00:00Z',
+  execution_status: 'COMPLETED',
+  candidate_count: 1,
+  candidates: [{
+    candidate_id: 'p5-only',
+    canonical_name: 'P5 Twitch Only',
+    has_steam: false,
+    has_twitch: true,
+    steam_app_ids: [],
+    platform_listings: [{platform: 'TWITCH', platform_game_id: 'tw-p5'}],
+    signals: []
+  }]
+});
+assert(twitchOnly.ok === true && twitchOnly.inserted === 0 && twitchOnly.skippedNoSteam === 1,
+  'Twitch-only payload accepted but skipped');
+assert(sheet.rows.length === 1, 'Twitch-only does not write a master row');
 
 var repeat = post(payload);
 assert(repeat.ok === true && sheet.rows.length === 1, 'repeat upsert is idempotent');
@@ -98,10 +123,12 @@ assert(post(Object.assign({}, payload, {token: 'wrong'})).ok === false, 'unautho
 assert(post(Object.assign({}, payload, {job_type: 'STEAM_CANDIDATE_RESEARCH'})).ok === false, 'research job type rejected on unified route');
 assert(post(Object.assign({}, payload, {candidate_count: 99})).error === 'candidate_count_mismatch', 'candidate_count mismatch rejected');
 assert(post(Object.assign({}, payload, {evidence: []})).error === 'raw_evidence_not_allowed', 'raw evidence rejected');
+assert(post(Object.assign({}, payload, {job_type: 'TWITCH_HISTORICAL_RAW_LEDGER_APPEND'})).ok === false,
+  'retired Twitch ledger job type rejected');
 
 var failed = post({
   token: token, job_type: 'UNIFIED_CANDIDATE_UPSERT', run_id: 'run-p5-fail',
-  observed_at: '2026-09-01T00:00:00Z', execution_status: 'FAILED', error: 'twitch unavailable'
+  observed_at: '2026-09-01T00:00:00Z', execution_status: 'FAILED', error: 'provider unavailable'
 });
 assert(failed.ok === true && failed.execution_status === 'FAILED', 'failed callback accepted without sheet writes');
 assert(sheet.rows.length === 1, 'failed callback does not append rows');

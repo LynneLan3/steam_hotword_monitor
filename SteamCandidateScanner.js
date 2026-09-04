@@ -547,9 +547,6 @@ function doPost(e) {
     if (jobType === UNIFIED_CANDIDATE_UPSERT_JOB_TYPE) {
       return steamCandidateResearchJsonOutput_(handleUnifiedCandidateUpsertCallback_(body));
     }
-    if (jobType === 'TWITCH_HISTORICAL_RAW_LEDGER_APPEND') {
-      return steamCandidateResearchJsonOutput_(handleTwitchHistoricalLedgerCallback_(body));
-    }
     if (jobType === 'PLAYER_ALIAS_DISCOVERY') {
       return steamCandidateResearchJsonOutput_(
         typeof handlePlayerAliasDiscoveryCallback_ === 'function'
@@ -4442,7 +4439,13 @@ function g010EnrichChunk_(ss, records, runId, runTime, warnings, runContext) {
       if (latest && latest.followers && isFiniteNumber_(latest.followers.followers)) {
         rec.followers = Number(latest.followers.followers);
         rec._gpLatestFresh = true;
-      } else rec._gpEnrichmentFailed = true;
+      } else {
+        // Keep classification Followers-empty so missing GP never enters 1B
+        // auto-recommendation. upsertMaster_ preserves last-known display values.
+        rec._gpEnrichmentFailed = true;
+        rec.dataStatus = '待数据';
+        addDataNote_(rec, 'Games Popularity 无当前 Followers；保留历史值（如有）并下次重试');
+      }
     }
   });
   const released = records.filter(rec => rec.releaseStage === '已发售' && isFiniteNumber_(Number(rec.daysToRelease)) &&
@@ -4471,8 +4474,15 @@ function g010EnrichChunk_(ss, records, runId, runTime, warnings, runContext) {
     if (rec._gpDailyCache && isFiniteNumber_(rec.gain7d) && isFiniteNumber_(rec.growthRate)) return;
     const growth = computeFollowerGrowth_(history.get(rec.appId), rec.followers, runTime, rules.FOLLOWER_HISTORY_MIN_DAYS);
     if (!growth.ok) {
-      rec.dataStatus = '待数据'; rec.firstRoundType = '⏳ 等待历史'; rec.currentStage = '1B等待历史';
-      rec._gpEnrichmentFailed = true; return;
+      if (!rec._gpDailyCache) rec._gpEnrichmentFailed = true;
+      rec.dataStatus = '待数据';
+      rec.firstRoundType = '⏳ 等待历史';
+      rec.priority = '待数据';
+      rec.continueNext = '否（本轮）';
+      rec.nextAction = '等待 Followers 历史达到最少天数后自动重算';
+      rec.currentStage = '1B等待历史';
+      rec._gpEnrichmentFailed = true;
+      return;
     }
     Object.assign(rec, {baselineFollowers: growth.baselineFollowers, gain7d: growth.gain,
       growthRate: growth.growthRate, coverageDays: growth.coverageDays, _gpEnrichmentFresh: true});
@@ -4971,8 +4981,8 @@ function runSteamHotword01BLegacy_() {
       }
       const latest = latestMap.get(rec.appId);
       if (!latest) {
-        rec.dataStatus = '⚠ 数据缺失';
-        addDataNote_(rec, 'Games Popularity latest 无数据');
+        rec.dataStatus = '待数据';
+        addDataNote_(rec, 'Games Popularity latest 无数据；保留历史 Followers（如有）并下次重试');
         rec._gpEnrichmentFailed = true;
         continue;
       }
@@ -4981,8 +4991,8 @@ function runSteamHotword01BLegacy_() {
         rec.followers = Number(latest.followers.followers);
         rec._gpLatestFresh = true;
       } else {
-        rec.dataStatus = '⚠ 数据缺失';
-        addDataNote_(rec, '缺少 Followers 当前值');
+        rec.dataStatus = '待数据';
+        addDataNote_(rec, '缺少 Followers 当前值；保留历史值（如有）并下次重试');
         rec._gpEnrichmentFailed = true;
       }
     }
@@ -5219,8 +5229,12 @@ function runSteamHotword01BLegacy_() {
     });
     actionCount = actionRefresh && actionRefresh.afterPendingCount || 0;
 
-    // 使用了 source cache，或有 warnings，但主链路能完成 → PARTIAL（不可伪装 SUCCESS）。
-    if (discovery.usedCache || discovery.partial || warnings.length > 0) status = 'PARTIAL';
+    // Source-cache / discovery partial / infrastructure warnings → PARTIAL.
+    // Per-game Games Popularity 404 / missing data is row-level only and must
+    // not downgrade a completed Steam pipeline to PARTIAL.
+    if (discovery.usedCache || discovery.partial || hasInfrastructureRunWarnings_(warnings)) {
+      status = 'PARTIAL';
+    }
 
     const logMessage = discoveryNotes.concat(warnings).join(' | ');
 
@@ -6319,8 +6333,10 @@ function fetchGamesPopularityLatestBatch_(records, apiKey, warnings, stats, atte
         appendGamesPopularityAttempt_(attemptContext, rec, 'latest', code, 'FAILED', 'JSON_PARSE');
       }
     } else if (code === 404) {
-      warnings.push('GP数据集无此App ' + rec.appId + ' ' + rec.name);
+      // Missing provider coverage is per-game data absence, not a pipeline fault.
+      // Record the attempt; do not raise a run-level warning that forces PARTIAL.
       appendGamesPopularityAttempt_(attemptContext, rec, 'latest', code, 'FAILED', 'NOT_FOUND');
+      addDataNote_(rec, 'Games Popularity latest 404 NOT_FOUND');
     } else {
       if (stats && code === 429) stats.rateLimited += 1;
       warnings.push('GP latest HTTP ' + code + ' ' + rec.appId + ' ' + rec.name);
@@ -6356,8 +6372,8 @@ function fetchGamesPopularityFollowersBatch_(records, apiKey, warnings, stats, a
         appendGamesPopularityAttempt_(attemptContext, rec, 'followers', code, 'FAILED', 'JSON_PARSE');
       }
     } else if (code === 404) {
-      warnings.push('GP followers无历史 ' + rec.appId + ' ' + rec.name);
       appendGamesPopularityAttempt_(attemptContext, rec, 'followers', code, 'FAILED', 'NOT_FOUND');
+      addDataNote_(rec, 'Games Popularity followers 404 NOT_FOUND');
     } else {
       if (stats && code === 429) stats.rateLimited += 1;
       warnings.push('GP followers HTTP ' + code + ' ' + rec.appId + ' ' + rec.name);
@@ -6366,6 +6382,16 @@ function fetchGamesPopularityFollowersBatch_(records, apiKey, warnings, stats, a
   });
 
   return map;
+}
+
+/** Run-level PARTIAL only for infrastructure / discovery faults, not GP 404 gaps. */
+function isGpMissingDataWarning_(message) {
+  return /GP数据集无此App|GP followers无历史|Games Popularity (latest|followers) 404/i
+    .test(String(message || ''));
+}
+
+function hasInfrastructureRunWarnings_(warnings) {
+  return (warnings || []).some(message => !isGpMissingDataWarning_(message));
 }
 
 function appendGamesPopularityAttempt_(context, rec, endpoint, code, result, errorSummary) {
@@ -9286,10 +9312,11 @@ function upsertMaster_(ss, records, runTime, runId, stats) {
 
     // A failed GP request is not a new observation and must not erase a
     // previously successful enrichment in the master table.
+    // Indices: 10 Steam Followers … 14 增速覆盖天数 (never fabricate 0).
     if (existingRow && rec._gpEnrichmentFailed) {
       const existing = sheet.getRange(existingRow, 1, 1, row.length).getValues()[0];
       let preserved = false;
-      [11, 12, 13, 14, 15].forEach(index => {
+      [10, 11, 12, 13, 14].forEach(index => {
         const rowValue = row[index];
         const existingValue = existing[index];
         if ((rowValue === null || rowValue === undefined || String(rowValue).trim() === '') &&
@@ -9299,7 +9326,17 @@ function upsertMaster_(ss, records, runTime, runId, stats) {
           preserved = true;
         }
       });
-      if (preserved && stats) stats.failuresKept += 1;
+      if (preserved) {
+        if (stats) stats.failuresKept += 1;
+        addDataNote_(rec, '保留候选主表 last-known Followers（来源: 候选主表历史值）');
+        const noteCol = HOTWORD_V2.masterHeaders.indexOf('数据备注');
+        if (noteCol >= 0 && Array.isArray(rec.dataNotes) && rec.dataNotes.length) {
+          row[noteCol] = rec.dataNotes.filter(Boolean).join(' | ');
+        }
+      }
+      if (!rec.dataStatus || rec.dataStatus === '⚠ 数据缺失') rec.dataStatus = '待数据';
+      const statusCol = HOTWORD_V2.masterHeaders.indexOf('数据状态');
+      if (statusCol >= 0) row[statusCol] = rec.dataStatus || '待数据';
     }
 
     if (existingRow) {
@@ -9334,12 +9371,11 @@ function stableSteamCandidateId_(appId) {
   return id ? ('steam-' + id) : '';
 }
 
-// G018 P3: additive fields on the existing 候选主表.  These are intentionally
-// separate from masterHeaders so legacy Steam row construction keeps its
-// established width and qualification semantics unchanged.
+// G018 P3: additive Candidate ID on the existing 候选主表.
+// Steam is the only candidate source. Outcome headers remain append-only and
+// never rearrange legacy Steam columns.
 const UNIFIED_CANDIDATE_HEADERS = [
-  'Candidate ID', '候选来源', 'Twitch Game ID', 'IGDB ID',
-  'Twitch排名', 'Twitch观察时间', 'Twitch来源'
+  'Candidate ID'
 ];
 
 // Outcome / research history columns on 候选主表. Append-only; never rearrange
@@ -10011,36 +10047,24 @@ function backfillCandidateOutcomesProduction_(options) {
   return out;
 }
 
-function unifiedCandidateSource_(candidate) {
-  const hasSteam = !!(candidate && (candidate.has_steam ||
-    (Array.isArray(candidate.steam_app_ids) && candidate.steam_app_ids.some(Boolean))));
-  const hasTwitch = !!(candidate && candidate.has_twitch) ||
-    (Array.isArray(candidate && candidate.platform_listings) && candidate.platform_listings.some(item =>
-      String(item && item.platform || '').toUpperCase() === 'TWITCH'));
-  return hasSteam && hasTwitch ? 'STEAM+TWITCH' : hasSteam ? 'STEAM' : hasTwitch ? 'TWITCH' : '';
-}
-
-function unifiedCandidateTwitchFields_(candidate) {
+function steamAppIdsFromUnifiedCandidate_(candidate) {
+  const fromField = Array.isArray(candidate && candidate.steam_app_ids)
+    ? candidate.steam_app_ids.map(String).map(value => value.trim()).filter(Boolean)
+    : [];
+  if (fromField.length) return fromField;
   const listings = Array.isArray(candidate && candidate.platform_listings) ? candidate.platform_listings : [];
-  const twitchListing = listings.find(item => String(item && item.platform || '').toUpperCase() === 'TWITCH') || {};
-  const signals = Array.isArray(candidate && candidate.signals) ? candidate.signals : [];
-  const twitchSignal = signals.find(item => String(item && item.source || '').toUpperCase().indexOf('TWITCH') >= 0) || {};
-  const metadata = twitchSignal.metadata && typeof twitchSignal.metadata === 'object' ? twitchSignal.metadata : {};
-  return {
-    twitchId: String(twitchListing.platform_game_id || metadata.twitch_game_id || '').trim(),
-    igdbId: String(metadata.igdb_id || '').trim(),
-    rank: twitchSignal.raw_value === null || twitchSignal.raw_value === undefined ? '' : twitchSignal.raw_value,
-    observedAt: twitchSignal.observed_at || '',
-    provenance: signals.filter(item => String(item && item.source || '').toUpperCase().indexOf('TWITCH') >= 0)
-      .map(item => ({signal_id: item.signal_id || '', source: item.source || '', observed_at: item.observed_at || '', metadata: item.metadata || {}}))
-  };
+  return listings
+    .filter(item => String(item && item.platform || '').toUpperCase() === 'STEAM')
+    .map(item => String(item && item.platform_game_id || '').trim())
+    .filter(Boolean);
 }
 
 /**
- * Upsert P2 UnifiedCandidate payloads into the existing 候选主表.
+ * Upsert Steam-only UnifiedCandidate payloads into the existing 候选主表.
+ * Candidates without a valid Steam App ID are skipped.
  * Existing rows are matched by Candidate ID, Steam App ID, or exact normalized
- * game name. Only additive identity/source fields and empty legacy identity
- * cells are written; manual decision and 1A/1B fields are never overwritten.
+ * game name. Only Candidate ID / empty legacy identity cells are written;
+ * Steam discovery「候选来源」and manual decision / 1A/1B fields are never overwritten.
  */
 function upsertUnifiedCandidates_(ss, candidates) {
   ss = ss || SpreadsheetApp.getActiveSpreadsheet();
@@ -10064,13 +10088,18 @@ function upsertUnifiedCandidates_(ss, candidates) {
   });
   let inserted = 0;
   let updated = 0;
+  let skippedNoSteam = 0;
   const items = Array.isArray(candidates) ? candidates : [];
   items.forEach(candidate => {
     if (!candidate || typeof candidate !== 'object') return;
     const candidateId = String(candidate.candidate_id || candidate.game_entity_id || '').trim();
     const name = String(candidate.canonical_name || '').trim();
     if (!candidateId || !name) return;
-    const appIds = Array.isArray(candidate.steam_app_ids) ? candidate.steam_app_ids.map(String).filter(Boolean) : [];
+    const appIds = steamAppIdsFromUnifiedCandidate_(candidate);
+    if (!appIds.length) {
+      skippedNoSteam += 1;
+      return;
+    }
     const keyCandidates = ['id:' + candidateId].concat(appIds.map(app => 'app:' + app), ['name:' + normalizeGameName_(name)]);
     let rowIndex = -1;
     for (const key of keyCandidates) {
@@ -10079,26 +10108,18 @@ function upsertUnifiedCandidates_(ss, candidates) {
     const row = rowIndex >= 0 ? rows[rowIndex].slice() : new Array(schema.width).fill('');
     const setIfEmpty = (field, value) => {
       const position = col(field);
-      if (position >= 0 && (row[position] === '' || row[position] === null || row[position] === undefined) && value !== '') row[position] = value;
+      if (position >= 0 && (row[position] === '' || row[position] === null || row[position] === undefined) && value !== '') {
+        row[position] = value;
+      }
     };
     setIfEmpty('Candidate ID', candidateId);
     setIfEmpty('游戏名称', name);
     setIfEmpty('Steam App ID', appIds[0] || '');
-    const steamListing = (candidate.platform_listings || []).find(item => String(item && item.platform || '').toUpperCase() === 'STEAM');
-    setIfEmpty('Steam URL', steamListing && steamListing.store_url || '');
-    const twitch = unifiedCandidateTwitchFields_(candidate);
-    const fields = {
-      '候选来源': unifiedCandidateSource_(candidate),
-      'Twitch Game ID': twitch.twitchId,
-      'IGDB ID': twitch.igdbId,
-      'Twitch排名': twitch.rank,
-      'Twitch观察时间': twitch.observedAt,
-      'Twitch来源': twitch.provenance.length ? JSON.stringify(twitch.provenance) : ''
-    };
-    Object.keys(fields).forEach(field => {
-      const position = col(field);
-      if (position >= 0 && fields[field] !== '') row[position] = fields[field];
-    });
+    const steamListing = (candidate.platform_listings || []).find(item =>
+      String(item && item.platform || '').toUpperCase() === 'STEAM');
+    setIfEmpty('Steam URL', steamListing && steamListing.store_url ||
+      ('https://store.steampowered.com/app/' + appIds[0] + '/'));
+    // Never overwrite Steam discovery「候选来源」with platform tags.
     if (rowIndex >= 0) {
       sheet.getRange(rowIndex + 2, 1, 1, schema.width).setValues([row]);
       rows[rowIndex] = row;
@@ -10113,12 +10134,19 @@ function upsertUnifiedCandidates_(ss, candidates) {
     if (appIds[0]) index.set('app:' + appIds[0], rowIndex);
     index.set('name:' + normalizeGameName_(name), rowIndex);
     const finalCol = col('最终状态');
-    if (finalCol >= 0 && (rows[rowIndex][finalCol] === '' || rows[rowIndex][finalCol] === null || rows[rowIndex][finalCol] === undefined)) {
+    if (finalCol >= 0 && (rows[rowIndex][finalCol] === '' || rows[rowIndex][finalCol] === null ||
+        rows[rowIndex][finalCol] === undefined)) {
       rows[rowIndex][finalCol] = CANDIDATE_MASTER_FINAL_STATUSES.PENDING_RESEARCH;
       sheet.getRange(rowIndex + 2, finalCol + 1).setValue(CANDIDATE_MASTER_FINAL_STATUSES.PENDING_RESEARCH);
     }
   });
-  return {ok: true, inserted: inserted, updated: updated, schemaAppended: schema.appended};
+  return {
+    ok: true,
+    inserted: inserted,
+    updated: updated,
+    skippedNoSteam: skippedNoSteam,
+    schemaAppended: schema.appended
+  };
 }
 
 function masterRow_(rec, runTime, firstSeen, runId, manualNote) {

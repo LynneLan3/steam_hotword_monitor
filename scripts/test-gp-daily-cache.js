@@ -53,6 +53,15 @@ FakeSheet.prototype.getRange = function (row, col, numRows, numCols) {
       return self.rows[row - 1] && self.rows[row - 1][col - 1] !== undefined
         ? self.rows[row - 1][col - 1] : '';
     },
+    getDisplayValue: function () {
+      return this.getValue();
+    },
+    setValue: function (value) {
+      while (self.rows.length < row) self.rows.push([]);
+      while (self.rows[row - 1].length < col) self.rows[row - 1].push('');
+      self.rows[row - 1][col - 1] = value;
+      return this;
+    },
     setValues: function (values) {
       values.forEach(function (value, r) {
         while (self.rows.length < row - 1 + r + 1) self.rows.push([]);
@@ -155,16 +164,33 @@ context.fetchGamesPopularityLatestBatch_([rec], 'key', [], later429Stats);
 context.fetchGamesPopularityFollowersBatch_([rec], 'key', [], later429Stats);
 assertEqual(later429Stats.rateLimited, 2, 'later HTTP 429 is observed on both GP endpoints');
 
-var masterRows = [h.masterHeaders, [dayOne, appId, rec.name, '', '', '', '', '', '', 0, 0, 24559, 24000, 559, 0.023, 7, '', '', '', '', '', '', '', '', '', '', '', '', dayOne, dayOne, 'run-1', '']];
+var masterRows = [h.masterHeaders, [dayOne, appId, rec.name, '', '', '', '', '', '', 0, 24559, 24000, 559, 0.023, 7, '', '', '', '', '', '', '', '', '', '', '', '', dayOne, dayOne, 'run-1', '']];
 var master = new FakeSheet(masterRows);
 var failed = {appId: appId, name: rec.name, url: '', source: '', sourceRank: '', releaseDate: '', releaseRaw: '', releaseStage: '', daysToRelease: 0, followers: null, baselineFollowers: null, gain7d: null, growthRate: null, coverageDays: null, reviews: null, positiveReviews: null, rating: null, result1A: '⚠ 数据异常', reason1A: 'GP 429', firstRoundType: '', priority: '', continueNext: '', nextAction: '', firstRoundReason: '', currentStage: '1A待数据', dataStatus: '⚠ 数据缺失', dataNotes: [], _gpEnrichmentFailed: true};
 var failureStats = {failuresKept: 0};
 context.upsertMaster_(new FakeSpreadsheet({候选主表: master}), [failed], dayTwo, 'run-7', failureStats);
-assertEqual(master.rows[1][11], 24559, '429 must preserve prior master Followers');
+assertEqual(master.rows[1][10], 24559, '429 must preserve prior master Followers');
 assertEqual(failureStats.failuresKept, 1, '429 preservation diagnostic');
+assertEqual(master.rows[1][h.masterHeaders.indexOf('数据状态')], '待数据', 'missing GP marks 待数据');
+
+providerMode = '404';
+var notFoundWarnings = [];
+var notFoundStats = {realtimeRequests: 0, realtimeSuccess: 0, rateLimited: 0};
+context.UrlFetchApp.fetchAll = function (requests) {
+  return requests.map(function () {
+    return response(404, 'NOT_FOUND');
+  });
+};
+var notFoundRec = {appId: appId, name: rec.name, dataNotes: []};
+context.fetchGamesPopularityLatestBatch_([notFoundRec], 'key', notFoundWarnings, notFoundStats);
+context.fetchGamesPopularityFollowersBatch_([notFoundRec], 'key', notFoundWarnings, notFoundStats);
+assertEqual(notFoundWarnings.length, 0, 'GP 404 must not raise run-level warnings');
+assert(context.hasInfrastructureRunWarnings_(notFoundWarnings) === false, 'empty warnings are not infrastructure');
+assert(context.hasInfrastructureRunWarnings_(['GP latest HTTP 429 ' + appId]) === true, '429 remains infrastructure');
+assert(context.hasInfrastructureRunWarnings_(['GP数据集无此App ' + appId]) === false, 'legacy GP missing text is not infrastructure');
 
 var raw = {appId: appId, name: rec.name, _gpEnrichmentFresh: false};
 var updated = context.updateSnapshots_(ss, [raw], dayTwo, 'run-7', {});
 assertEqual(updated.updated, 0, 'failed enrichment must not update a snapshot as enriched');
 
-console.log('PASS scripts/test-gp-daily-cache.js (same-day hit, next-day miss, five-run cap, 429 preservation)');
+console.log('PASS scripts/test-gp-daily-cache.js (same-day hit, next-day miss, five-run cap, 429 preservation, GP 404 non-PARTIAL)');

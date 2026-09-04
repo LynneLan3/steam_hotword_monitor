@@ -69,7 +69,6 @@ context.upsertUnifiedCandidates_(ss, [{
   candidate_id: 'cand-5555',
   canonical_name: 'Trends Guard Demo',
   has_steam: true,
-  has_twitch: false,
   steam_app_ids: ['5555'],
   platform_listings: [{platform: 'STEAM', platform_game_id: '5555', store_url: 'https://store.steampowered.com/app/5555/'}],
   signals: []

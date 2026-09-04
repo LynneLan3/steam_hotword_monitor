@@ -1,4 +1,4 @@
-/** G018 P3: existing 候选主表 compatibility/upsert tests. */
+/** G018 P3: Steam-only 候选主表 compatibility/upsert tests. */
 var fs = require('fs');
 var path = require('path');
 var vm = require('vm');
@@ -8,11 +8,6 @@ vm.createContext(context);
 vm.runInContext(source, context);
 
 function assert(value, message) { if (!value) throw new Error(message); }
-function cloneRow(row, width) {
-  var next = row.slice(0, width);
-  while (next.length < width) next.push('');
-  return next;
-}
 function FakeRange(sheet, row, column, rowCount, columnCount) {
   this.sheet = sheet; this.row = row; this.column = column;
   this.rowCount = rowCount || 1; this.columnCount = columnCount || 1;
@@ -55,53 +50,78 @@ FakeSpreadsheet.prototype.getSheetByName = function () { return this.sheet; };
 
 var oldHeaders = vm.runInContext('HOTWORD_V2.masterHeaders.slice()', context);
 var col = function (name) { return oldHeaders.indexOf(name); };
-function oldRow(appId, name, decision) {
+function oldRow(appId, name, decision, source) {
   var row = new Array(oldHeaders.length).fill('');
   row[col('Steam App ID')] = appId || '';
   row[col('游戏名称')] = name || '';
   row[col('人工备注')] = decision || '';
+  row[col('候选来源')] = source || 'Popular Upcoming';
   return row;
 }
 function steamCandidate(appId, name, candidateId) {
-  return {candidate_id: candidateId || 'steam-' + appId, canonical_name: name, has_steam: true, has_twitch: false,
-    steam_app_ids: [appId], platform_listings: [{platform: 'STEAM', platform_game_id: appId, store_url: 'https://store.steampowered.com/app/' + appId + '/'}], signals: []};
-}
-function twitchCandidate(candidateId, name, appId) {
-  var listings = [{platform: 'TWITCH', platform_game_id: 'tw-' + candidateId}];
-  if (appId) listings.push({platform: 'STEAM', platform_game_id: appId, store_url: 'steam://' + appId});
-  return {candidate_id: candidateId, canonical_name: name, has_steam: !!appId, has_twitch: true,
-    steam_app_ids: appId ? [appId] : [], platform_listings: listings,
-    signals: [{source: 'TWITCH_HELIX_TOP_GAMES', raw_value: 7, observed_at: '2026-09-01T00:00:00Z',
-      signal_id: 'sig-' + candidateId, metadata: {twitch_game_id: 'tw-' + candidateId, igdb_id: 'ig-' + candidateId, run_id: 'run-p3'}}]};
+  return {
+    candidate_id: candidateId || 'steam-' + appId,
+    canonical_name: name,
+    has_steam: true,
+    steam_app_ids: [appId],
+    platform_listings: [{
+      platform: 'STEAM',
+      platform_game_id: appId,
+      store_url: 'https://store.steampowered.com/app/' + appId + '/'
+    }],
+    signals: []
+  };
 }
 
-var historical = oldRow('9001', 'Historical Steam', 'WATCH');
+var historical = oldRow('9001', 'Historical Steam', 'WATCH', 'Popular Upcoming');
 var sheet = new FakeSheet(oldHeaders, [historical]);
 var ss = new FakeSpreadsheet(sheet);
 var first = context.upsertUnifiedCandidates_(ss, [steamCandidate('9001', 'Historical Steam')]);
 assert(first.updated === 1 && sheet.rows.length === 1, 'historical Steam row updated in place');
 assert(sheet.rows[0][oldHeaders.length] === 'steam-9001', 'Candidate ID added without moving legacy columns');
 assert(sheet.rows[0][col('人工备注')] === 'WATCH', 'legacy manual field preserved');
+assert(sheet.rows[0][col('候选来源')] === 'Popular Upcoming', 'Steam discovery source not overwritten');
 
-var twitchOnly = context.upsertUnifiedCandidates_(ss, [twitchCandidate('twitch-only', 'Twitch Only')]);
-assert(twitchOnly.inserted === 1, 'Twitch-only candidate inserted');
-var twitchRow = sheet.rows[1];
-assert(twitchRow[col('候选来源')] === 'TWITCH' && twitchRow[col('Steam App ID')] === '', 'Twitch-only has no Steam App ID and is retained');
-assert(twitchRow[oldHeaders.length] === 'twitch-only', 'Candidate ID written');
-assert(twitchRow[oldHeaders.length + 1] === 'tw-twitch-only', 'Twitch identity written');
+var twitchOnly = context.upsertUnifiedCandidates_(ss, [{
+  candidate_id: 'twitch-only',
+  canonical_name: 'Twitch Only',
+  has_steam: false,
+  has_twitch: true,
+  steam_app_ids: [],
+  platform_listings: [{platform: 'TWITCH', platform_game_id: 'tw-1'}],
+  signals: []
+}]);
+assert(twitchOnly.inserted === 0 && twitchOnly.skippedNoSteam === 1, 'Twitch-only candidate skipped');
+assert(sheet.rows.length === 1, 'Twitch-only does not create a master row');
 
-var dual = context.upsertUnifiedCandidates_(ss, [twitchCandidate('shared', 'Shared Game')]);
-assert(dual.inserted === 1, 'dual source initial row inserted');
-var dualUpdate = context.upsertUnifiedCandidates_(ss, [twitchCandidate('shared', 'Shared Game', '7007')]);
-assert(dualUpdate.updated === 1 && sheet.rows.length === 3, 'Twitch first later Steam updates same row');
-var sharedRow = sheet.rows[2];
-assert(sharedRow[col('候选来源')] === 'STEAM+TWITCH' && sharedRow[col('Steam App ID')] === '7007', 'dual source fields merged');
+var dual = context.upsertUnifiedCandidates_(ss, [{
+  candidate_id: 'shared',
+  canonical_name: 'Shared Game',
+  has_steam: true,
+  has_twitch: true,
+  steam_app_ids: ['7007'],
+  platform_listings: [
+    {platform: 'TWITCH', platform_game_id: 'tw-shared'},
+    {platform: 'STEAM', platform_game_id: '7007', store_url: 'https://store.steampowered.com/app/7007/'}
+  ],
+  signals: []
+}]);
+assert(dual.inserted === 1, 'Steam side of dual payload inserts');
+assert(sheet.rows[1][col('Steam App ID')] === '7007', 'Steam App ID written');
+assert(sheet.rows[1][col('候选来源')] === '', 'platform tag not written into discovery source');
+assert(JSON.stringify(sheet.headers).indexOf('Twitch Game ID') < 0, 'Twitch headers are not auto-appended');
+
 var before = JSON.stringify(sheet.rows);
-context.upsertUnifiedCandidates_(ss, [twitchCandidate('shared', 'Shared Game', '7007')]);
-assert(sheet.rows.length === 3 && JSON.stringify(sheet.rows).indexOf('twitch-only') >= 0, 'rerun does not append duplicate rows');
+context.upsertUnifiedCandidates_(ss, [steamCandidate('7007', 'Shared Game', 'shared')]);
+assert(sheet.rows.length === 2, 'rerun does not append duplicate rows');
 assert(JSON.stringify(sheet.rows).length >= before.length, 'rerun leaves existing data present');
 
 var missingHeadersSheet = new FakeSheet(oldHeaders.concat(['Candidate ID']), []);
-var missingHeadersResult = context.upsertUnifiedCandidates_(new FakeSpreadsheet(missingHeadersSheet), [twitchCandidate('schema', 'Schema Game')]);
-assert(missingHeadersResult.schemaAppended.length === 12, 'missing additive headers auto-appended (5 Twitch + 7 outcome)');
-console.log('PASS scripts/test-unified-candidate-sheet.js (Steam/Twitch source combinations, merge, idempotency, legacy compatibility)');
+var missingHeadersResult = context.upsertUnifiedCandidates_(
+  new FakeSpreadsheet(missingHeadersSheet),
+  [steamCandidate('8008', 'Schema Game')]
+);
+assert(missingHeadersResult.schemaAppended.length === 7, 'missing additive headers auto-appended (7 outcome)');
+assert(missingHeadersResult.schemaAppended.indexOf('Trends结果') >= 0, 'Trends outcome header ensured');
+assert(missingHeadersResult.schemaAppended.indexOf('Twitch Game ID') < 0, 'Twitch headers never ensured');
+console.log('PASS scripts/test-unified-candidate-sheet.js (Steam-only upsert, skip Twitch-only, legacy compatibility)');

@@ -68,6 +68,12 @@ Latest-only or history-failed data remains a miss. Attempts retain Provider,
 endpoint, App ID, Run ID, HTTP status, result, and a safe error summary; API
 keys and request URLs are not persisted.
 
+Per-game Games Popularity `404 NOT_FOUND` / missing coverage is row-level data
+absence (`待数据`, last-known Followers retained when present, attempt ledger
+recorded). It must not by itself mark a completed Steam discovery → raw →
+enrichment pipeline as run-level `PARTIAL`. Infrastructure failures (429/5xx,
+JSON parse, network, discovery/raw write interruption) remain `PARTIAL`.
+
 The existing P1/P2/1A/Today Action and `alreadyHandled` semantics are outside
 this contract's change scope.
 
