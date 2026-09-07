@@ -176,7 +176,9 @@ for (var genericIndex = 0; genericIndex < 140; genericIndex += 1) {
     '人工备注': 'historical note ' + genericIndex
   }));
 }
-assert(decisionRows.length === 148 && masterRows.length === 151, 'fixture includes P2 and lifecycle-only handled candidates');
+masterRows.push(master('4356430', 'NBA 2K27', 1000));
+decisionRows.push(decision('4356430', 'NBA 2K27', {Decision: 'BUILD', PreflightVerdict: 'MANUAL_REVIEW'}));
+assert(decisionRows.length === 149 && masterRows.length === 152, 'fixture includes P2 and lifecycle-only handled candidates');
 var rules = new FakeSheet('规则配置', ['规则Key', '当前值'], [
   ['RECHECK_GAIN_GROWTH_MIN', 0.30], ['WATCH_RECHECK_DAYS_STRONG', 3], ['WATCH_RECHECK_DAYS_NORMAL', 7]
 ]);
@@ -190,10 +192,11 @@ var staleRows = [
 var spreadsheet = new FakeSpreadsheet({
   '候选主表': new FakeSheet('候选主表', masterHeaders, masterRows),
   '候选决策': new FakeSheet('候选决策', decisionHeaders, decisionRows),
-  '站点项目池': new FakeSheet('站点项目池', ['Site ID', '游戏名称', 'Steam App ID', '当前状态', 'Build状态'], [
-    ['twisted-tower', 'Twisted Tower', '1575990', '已建站', 'DONE'],
-    ['sinking-city-2', 'The Sinking City 2', '2825860', '候选', 'BUILD_PENDING'],
-    ['pending-site', 'Pending Site Candidate', '999003', '候选', 'BUILDING']
+  '站点项目池': new FakeSheet('站点项目池', ['Site ID', '游戏名称', 'Steam App ID', '当前状态', 'Build状态', 'Vercel URL', '上线日期', 'ActualLiveAt', 'OpportunityID'], [
+    ['twisted-tower', 'Twisted Tower', '1575990', '已建站', 'DONE', '', '', '', ''],
+    ['sinking-city-2', 'The Sinking City 2', '2825860', '候选', 'BUILD_PENDING', '', '', '', ''],
+    ['pending-site', 'Pending Site Candidate', '999003', '候选', 'BUILDING', '', '', '', ''],
+    ['nba-2k27', 'NBA 2K27', '4356430', 'LIVE', 'LIVE', 'https://nba-2k27-game.vercel.app', '2026-09-03', '2026-09-03', 'opp-nba-2k27-steam-candidate-001']
   ]),
   '历史游戏库': new FakeSheet('历史游戏库', ['Steam App ID', '游戏名称', 'Steam URL', '当前阶段', '备注'], [
     ['4026250', 'Project P.I.T.T.', '', '已进入建站', '历史建站事实'],
@@ -268,6 +271,7 @@ var actionSheet = spreadsheet.getSheetByName('今日行动');
 var actionRows = actionSheet.rows.slice(2).filter(function (candidate) { return String(candidate[actionHeaders.indexOf('Steam App ID')] || '').trim(); });
 function find(appId) { return actionRows.find(function (candidate) { return candidate[actionHeaders.indexOf('Steam App ID')] === appId; }); }
 assert(find('1001'), 'BUILD remains visible in 今日行动 for handoff context');
+assert(!find('4356430'), 'LIVE site-pool BUILD (NBA 2K27) is absent from 今日行动');
 assert(!find('1002'), 'REJECT is absent from 今日行动');
 assert(!find('1575990'), 'site-pool Twisted Tower is absent from 今日行动');
 assert(!find('4026250'), 'history-library Project P.I.T.T. is absent from 今日行动');

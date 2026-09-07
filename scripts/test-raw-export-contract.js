@@ -1,0 +1,11 @@
+'use strict';
+const fs=require('fs'),assert=require('assert'),root=__dirname+'/..',src=fs.readFileSync(root+'/RawExport.gs','utf8'),raw=fs.readFileSync(root+'/MonitoringHistory.gs','utf8');
+assert(/function exportMonitoringRawNow\(\)/.test(src));
+assert(/saveSteamMonitoringRaw_\(runId, new Date\(\)\)/.test(src));
+assert(/Utilities\.getUuid\(\)/.test(src));
+['Steam_每日快照','候选决策','候选主表','外部证据记录','历史游戏库'].forEach(n=>assert(raw.includes("'"+n+"'"),n));
+assert(!/syncSteamMonitoringHistory|History Spreadsheet/.test(src.replace('Does not touch History Spreadsheet','')));
+assert(/saveSteamMonitoringRaw_\(state\.runId, startedAt, ss\.getId\(\)\)/.test(fs.readFileSync(root+'/SteamCandidateScanner.js','utf8')));
+assert(/skipped: true/.test(fs.readFileSync(root+'/MonitoringHistory.gs','utf8')));
+assert(/steamRawSpreadsheet_/.test(raw));
+console.log('PASS Steam RAW export contract');

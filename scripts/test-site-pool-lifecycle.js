@@ -76,11 +76,22 @@ var liveSheet = {
     };
   }
 };
-context.HOTWORD_V2 = {sitePoolHeaders: desired};
+context.HOTWORD_V2 = {sitePoolHeaders: desired.concat(['OpportunityID', 'ExperimentType', 'ActualLiveAt', 'LaunchPageCount'])};
 context.ensureSitePoolSchema_ = function () { return liveSheet; };
 context.upsertGscBindingRecord_ = function () {};
+context.closeCandidateSiteBuildNextAction_ = function () { return {updated: 0}; };
+context.isReliableSteamAppId_ = function (value) { return /^\d{3,}$/.test(String(value || '').trim()); };
 context.Logger = {log: function () {}};
-vm.runInContext(src.slice(src.indexOf('function upsertSitePoolRecord_'), src.indexOf('\nfunction upsertGscBindingRecord_')), context);
+['Date', 'Array', 'Object', 'Map', 'Set', 'JSON', 'RegExp', 'Number', 'Boolean'].forEach(function (name) {
+  context[name] = global[name];
+});
+var helperStart = src.indexOf('function isRealPublishedSiteUrl_');
+var upsertStart = src.indexOf('function upsertSitePoolRecord_');
+var upsertEnd = src.indexOf('\nfunction upsertGscBindingRecord_');
+assert(helperStart >= 0 && upsertStart > helperStart && upsertEnd > upsertStart, 'site pool helper/upsert slice bounds');
+vm.runInContext(src.slice(helperStart, upsertEnd), context);
+assert(typeof context.isSitePoolSiteCreationComplete_ === 'function', 'completion helper loaded');
+assert(typeof context.upsertSitePoolRecord_ === 'function', 'upsert loaded');
 var stable = context.upsertSitePoolRecord_({ }, 'Renamed Demo Game', '123', '2026-08-22');
 assert(stable[0] === 'demo-game' && liveRows.length === 1, 'existing App ID preserves immutable Site ID');
 var collision = context.upsertSitePoolRecord_({ }, 'Demo Game', '456', '2026-08-22');

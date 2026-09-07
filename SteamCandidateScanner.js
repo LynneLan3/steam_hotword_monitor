@@ -363,6 +363,7 @@ function onOpen() {
     .createMenu('Steam 0→1B')
     .addItem('立即运行 0→1B', 'runSteamHotword01B')
     .addItem('刷新今日行动', 'refreshTodayActionsFromCandidateDecisions')
+    .addItem('收口已建站 BUILD', 'reconcileBuildSitePoolConsistency')
     .addSeparator()
     .addItem('系统状态', 'showSteamSystemStatus')
     .addSeparator()
@@ -426,8 +427,30 @@ function doGet(e) {
   }
   if (action === 'refreshTodayActionsProduction') {
     const ss = SpreadsheetApp.openById(QUALIFICATION_ELIGIBILITY_PRODUCTION_SHEET_ID);
+    const reconcile = reconcileBuildSitePoolConsistency_(ss);
+    const refresh = refreshTodayActionsFromCandidateDecisions_(ss);
     return ContentService
-      .createTextOutput(JSON.stringify(refreshTodayActionsFromCandidateDecisions_(ss)))
+      .createTextOutput(JSON.stringify(Object.assign({}, refresh, {reconcile: reconcile})))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+  if (action === 'reconcileBuildSitePoolProduction') {
+    const ss = SpreadsheetApp.openById(QUALIFICATION_ELIGIBILITY_PRODUCTION_SHEET_ID);
+    let existingSiteRecords = [];
+    const rawRecords = e && e.parameter ? String(e.parameter.existing_site_records || e.parameter.records || '').trim() : '';
+    if (rawRecords) {
+      try {
+        const parsed = JSON.parse(rawRecords);
+        if (Array.isArray(parsed)) existingSiteRecords = parsed;
+      } catch (parseErr) {
+        return ContentService
+          .createTextOutput(JSON.stringify({ok: false, error: 'invalid_existing_site_records_json'}))
+          .setMimeType(ContentService.MimeType.JSON);
+      }
+    }
+    const reconcile = reconcileBuildSitePoolConsistency_(ss, {existingSiteRecords: existingSiteRecords});
+    const refresh = refreshTodayActionsFromCandidateDecisions_(ss);
+    return ContentService
+      .createTextOutput(JSON.stringify({ok: true, reconcile: reconcile, refresh: refresh}))
       .setMimeType(ContentService.MimeType.JSON);
   }
   if (action === 'recoverSteamCandidateResearchProduction') {
@@ -546,6 +569,19 @@ function doPost(e) {
     const jobType = String(body.job_type || '').trim().toUpperCase();
     if (jobType === UNIFIED_CANDIDATE_UPSERT_JOB_TYPE) {
       return steamCandidateResearchJsonOutput_(handleUnifiedCandidateUpsertCallback_(body));
+    }
+    if (jobType === 'SITE_POOL_BUILD_RECONCILE_V1') {
+      const ss = SpreadsheetApp.openById(QUALIFICATION_ELIGIBILITY_PRODUCTION_SHEET_ID);
+      const existingSiteRecords = Array.isArray(body.existing_site_records)
+        ? body.existing_site_records
+        : Array.isArray(body.records) ? body.records : [];
+      const reconcile = reconcileBuildSitePoolConsistency_(ss, {
+        existingSiteRecords: existingSiteRecords,
+        includeGscBindings: body.include_gsc_bindings !== false
+      });
+      const refresh = refreshTodayActionsFromCandidateDecisions_(ss);
+      SpreadsheetApp.flush();
+      return steamCandidateResearchJsonOutput_({ok: true, reconcile: reconcile, refresh: refresh});
     }
     if (jobType === 'PLAYER_ALIAS_DISCOVERY') {
       return steamCandidateResearchJsonOutput_(
@@ -7838,6 +7874,314 @@ function logSitePoolIdentityIssue_(message) {
   if (typeof Logger !== 'undefined' && Logger.log) Logger.log(message);
 }
 
+function isRealPublishedSiteUrl_(value) {
+  const url = String(value || '').trim();
+  if (!url) return false;
+  if (/^(MISSING|N\/A|NA|TBD|TODO|NONE|NULL|UNDEFINED|-)$/i.test(url)) return false;
+  return /^https?:\/\/[a-z0-9][a-z0-9.-]*\.[a-z]{2,}([\/?#]|$)/i.test(url);
+}
+
+function hasSiteLaunchCompletionTimestamp_(value) {
+  if (value === null || value === undefined || value === '') return false;
+  if (Object.prototype.toString.call(value) === '[object Date]' && !isNaN(value.getTime())) return true;
+  const text = String(value).trim();
+  if (!text) return false;
+  if (/^(MISSING|N\/A|NA|TBD|TODO|NONE|NULL|UNDEFINED|-)$/i.test(text)) return false;
+  return true;
+}
+
+/**
+ * Explicit Site Creation completion signals for 今日行动 BUILD handoff.
+ * Decision=BUILD alone is not enough; a matching 站点项目池 row must prove
+ * the site already left Site Creation.
+ */
+function isSitePoolSiteCreationComplete_(fields) {
+  if (!fields) return false;
+  const current = String(fields.currentStatus || fields['当前状态'] || '').trim().toUpperCase();
+  const build = String(fields.buildStatus || fields['Build状态'] || '').trim().toUpperCase();
+  if (current === 'LIVE' || build === 'LIVE') return true;
+  const url = fields.vercelUrl || fields['Vercel URL'] || '';
+  const liveAt = fields.actualLiveAt || fields.ActualLiveAt ||
+    fields.liveAt || fields['上线日期'] || '';
+  return isRealPublishedSiteUrl_(url) && hasSiteLaunchCompletionTimestamp_(liveAt);
+}
+
+function sitePoolRowToCompletionFields_(headers, values) {
+  const at = name => {
+    const column = headers.indexOf(name);
+    return column >= 0 ? values[column] : '';
+  };
+  return {
+    siteId: String(at('Site ID') || '').trim(),
+    name: String(at('游戏名称') || '').trim(),
+    appId: String(at('Steam App ID') || '').trim(),
+    opportunityId: String(at('OpportunityID') || '').trim(),
+    currentStatus: at('当前状态'),
+    buildStatus: at('Build状态'),
+    vercelUrl: at('Vercel URL'),
+    liveAt: at('上线日期'),
+    actualLiveAt: at('ActualLiveAt'),
+    '当前状态': at('当前状态'),
+    'Build状态': at('Build状态'),
+    'Vercel URL': at('Vercel URL'),
+    '上线日期': at('上线日期'),
+    ActualLiveAt: at('ActualLiveAt')
+  };
+}
+
+function readSitePoolCompletionIndex_(ss) {
+  const index = {
+    byAppId: new Map(),
+    byOpportunityId: new Map(),
+    rows: []
+  };
+  const sheet = ss && ss.getSheetByName ? ss.getSheetByName(HOTWORD_V2.sheets.sitePool) : null;
+  if (!sheet || sheet.getLastRow() < 2) return index;
+  const width = Math.max(sheet.getLastColumn(), HOTWORD_V2.sitePoolHeaders.length);
+  const headers = sheet.getRange(1, 1, 1, width).getDisplayValues()[0];
+  sheet.getRange(2, 1, sheet.getLastRow() - 1, width).getValues().forEach((values, rowOffset) => {
+    const fields = sitePoolRowToCompletionFields_(headers, values);
+    fields.rowNumber = rowOffset + 2;
+    index.rows.push(fields);
+    if (!isSitePoolSiteCreationComplete_(fields)) return;
+    if (isReliableSteamAppId_(fields.appId) && !index.byAppId.has(fields.appId)) {
+      index.byAppId.set(fields.appId, fields);
+    }
+    if (fields.opportunityId && !index.byOpportunityId.has(fields.opportunityId)) {
+      index.byOpportunityId.set(fields.opportunityId, fields);
+    }
+  });
+  return index;
+}
+
+function findSitePoolSiteCreationComplete_(index, appId, opportunityId) {
+  if (!index) return null;
+  const normalizedAppId = String(appId || '').trim();
+  if (isReliableSteamAppId_(normalizedAppId) && index.byAppId.has(normalizedAppId)) {
+    return index.byAppId.get(normalizedAppId);
+  }
+  const normalizedOpportunityId = String(opportunityId || '').trim();
+  if (normalizedOpportunityId && index.byOpportunityId.has(normalizedOpportunityId)) {
+    return index.byOpportunityId.get(normalizedOpportunityId);
+  }
+  return null;
+}
+
+function nextActionForBuildDecision_(appId, opportunityId, siteCompletionIndex) {
+  return findSitePoolSiteCreationComplete_(siteCompletionIndex, appId, opportunityId)
+    ? 'None'
+    : 'Site Build';
+}
+
+/**
+ * Close stale Site Build todos once Site Creation is already complete.
+ * Keeps Decision=BUILD; only clears Next Action to the existing empty-todo value.
+ */
+function closeCandidateSiteBuildNextAction_(ss, appId, opportunityId) {
+  const sheet = ss && ss.getSheetByName ? ss.getSheetByName(HOTWORD_V2.sheets.decisions) : null;
+  if (!sheet || sheet.getLastRow() < 2) return {updated: 0};
+  const columnMap = candidateDecisionColumnMap_(sheet);
+  const nextActionColumn = columnMap.byName['Next Action'] || 0;
+  if (!nextActionColumn) return {updated: 0};
+  const decisions = readCandidateDecisions_(ss);
+  const normalizedAppId = String(appId || '').trim();
+  const normalizedOpportunityId = String(opportunityId || '').trim();
+  let updated = 0;
+  decisions.forEach(decision => {
+    if (normalizeDecisionStatus_(decision.status) !== 'BUILD') return;
+    const appMatch = isReliableSteamAppId_(normalizedAppId) &&
+      String(decision.appId || '').trim() === normalizedAppId;
+    const opportunityMatch = normalizedOpportunityId &&
+      String(decision.opportunityId || '').trim() === normalizedOpportunityId;
+    if (!appMatch && !opportunityMatch) return;
+    if (String(decision.nextAction || '').trim() !== 'Site Build') return;
+    candidateDecisionSetField_(sheet, decision.rowNumber, 'Next Action', 'None', columnMap);
+    updated += 1;
+  });
+  return {updated: updated};
+}
+
+/**
+ * Write an authentic Site Creation completion into 站点项目池, then close the
+ * matching candidate Next Action=Site Build. Never invents Site ID or URL.
+ */
+function markSitePoolSiteCreationComplete_(ss, siteFacts) {
+  const facts = siteFacts || {};
+  const siteId = String(facts.siteId || facts.site_id || '').trim();
+  const appId = String(facts.appId || facts.steamAppId || facts.steam_app_id || '').trim();
+  const gameName = String(facts.gameName || facts.name || facts['游戏名称'] || '').trim();
+  const vercelUrl = String(facts.vercelUrl || facts['Vercel URL'] || facts.websiteUrl || '').trim();
+  const opportunityId = String(facts.opportunityId || facts.OpportunityID || '').trim();
+  const liveAt = facts.actualLiveAt || facts.ActualLiveAt || facts.liveAt || facts['上线日期'] || new Date();
+  if (!isSiteIdContractValue_(siteId) || !isReliableSteamAppId_(appId)) {
+    logSitePoolIdentityIssue_('Site Creation completion skipped: authentic Site ID and Steam App ID are required.');
+    return null;
+  }
+  if (vercelUrl && !isRealPublishedSiteUrl_(vercelUrl)) {
+    logSitePoolIdentityIssue_('Site Creation completion skipped: Vercel URL is not a real published URL.');
+    return null;
+  }
+  const sheet = ensureSitePoolSchema_(ss);
+  const width = HOTWORD_V2.sitePoolHeaders.length;
+  const values = sheet.getLastRow() < 2 ? [] : sheet.getRange(2, 1, sheet.getLastRow() - 1, width).getValues();
+  const appIdIndex = values.findIndex(row => String(row[2] || '').trim() === appId);
+  const siteIdIndex = values.findIndex(row => String(row[0] || '').trim() === siteId);
+  let index = appIdIndex;
+  if (index < 0 && siteIdIndex >= 0) {
+    const existingAppId = String(values[siteIdIndex][2] || '').trim();
+    if (existingAppId && existingAppId !== appId) {
+      logSitePoolIdentityIssue_('Site Creation completion skipped: Site ID collision for ' + siteId);
+      return null;
+    }
+    index = siteIdIndex;
+  }
+  const existing = index >= 0 ? values[index] : null;
+  const row = [
+    (existing && existing[0]) || siteId,
+    (existing && existing[1]) || gameName,
+    (existing && existing[2]) || appId,
+    'LIVE',
+    (existing && existing[4]) || facts.buildDate || new Date(),
+    'LIVE',
+    (existing && existing[6]) || facts.repoUrl || '',
+    (existing && existing[7]) || vercelUrl || '',
+    (existing && existing[8]) || liveAt,
+    (existing && existing[9]) || facts.templateVersion || '',
+    (existing && existing[10]) || 'NOT_CONNECTED',
+    (existing && existing[11]) || '',
+    (existing && existing[12]) || '',
+    (existing && existing[13]) || '',
+    (existing && existing[14]) || 'WAITING_INDEX',
+    (existing && existing[15]) || 'UNKNOWN',
+    (existing && existing[16]) || '',
+    (existing && existing[17]) || '',
+    (existing && existing[18]) || '',
+    (existing && existing[19]) || '',
+    (existing && existing[20]) || '',
+    (existing && existing[21]) || opportunityId,
+    (existing && existing[22]) || '',
+    (existing && existing[23]) || liveAt,
+    existing && existing[24] !== '' && existing[24] !== null && existing[24] !== undefined
+      ? existing[24]
+      : (facts.launchPageCount === undefined ? '' : facts.launchPageCount)
+  ];
+  if (index >= 0) sheet.getRange(index + 2, 1, 1, row.length).setValues([row]);
+  else sheet.getRange(sheet.getLastRow() + 1, 1, 1, row.length).setValues([row]);
+  upsertGscBindingRecord_(ss, row[0], row[1], row[2], row[7]);
+  closeCandidateSiteBuildNextAction_(ss, appId, opportunityId || row[21]);
+  return row;
+}
+
+function readExistingSiteRecordsFromGscBindings_(ss) {
+  const records = [];
+  const sheet = ss && ss.getSheetByName ? ss.getSheetByName(HOTWORD_V2.sheets.gscBinding) : null;
+  if (!sheet || sheet.getLastRow() < 2) return records;
+  const width = Math.max(sheet.getLastColumn(), HOTWORD_V2.gscBindingHeaders.length);
+  const headers = sheet.getRange(1, 1, 1, width).getDisplayValues()[0];
+  const at = (row, name) => {
+    const column = headers.indexOf(name);
+    return column >= 0 ? row[column] : '';
+  };
+  sheet.getRange(2, 1, sheet.getLastRow() - 1, width).getValues().forEach(row => {
+    const siteId = String(at(row, 'Site ID') || '').trim();
+    const appId = String(at(row, 'Steam App ID') || '').trim();
+    const websiteUrl = String(at(row, '网站URL') || '').trim();
+    if (!isSiteIdContractValue_(siteId) || !isReliableSteamAppId_(appId)) return;
+    if (!isRealPublishedSiteUrl_(websiteUrl)) return;
+    records.push({
+      siteId: siteId,
+      appId: appId,
+      gameName: String(at(row, '游戏名称') || '').trim(),
+      vercelUrl: websiteUrl,
+      source: '项目GSC关联',
+      liveAt: at(row, '首次同步日期') || at(row, '最近同步日期') || new Date()
+    });
+  });
+  return records;
+}
+
+/**
+ * Reconcile Decision=BUILD rows with authentic site records.
+ * Backfills 站点项目池 only from real Site ID + App ID + published URL facts.
+ * Unmatched BUILD candidates are returned in exceptions (no invented rows).
+ */
+function reconcileBuildSitePoolConsistency_(ss, options) {
+  const opts = options || {};
+  const result = {
+    ok: true,
+    scannedBuild: 0,
+    alreadyComplete: 0,
+    nextActionClosed: 0,
+    backfilled: 0,
+    exceptions: []
+  };
+  const decisions = readCandidateDecisions_(ss);
+  const completionIndex = readSitePoolCompletionIndex_(ss);
+  const externalRecords = Array.isArray(opts.existingSiteRecords) ? opts.existingSiteRecords.slice() : [];
+  if (opts.includeGscBindings !== false) {
+    readExistingSiteRecordsFromGscBindings_(ss).forEach(record => externalRecords.push(record));
+  }
+  const recordsByAppId = new Map();
+  externalRecords.forEach(record => {
+    const appId = String(record && (record.appId || record.steamAppId || record.steam_app_id) || '').trim();
+    const siteId = String(record && (record.siteId || record.site_id) || '').trim();
+    const vercelUrl = String(record && (record.vercelUrl || record['Vercel URL'] || record.websiteUrl || record.production_url) || '').trim();
+    if (!isReliableSteamAppId_(appId) || !isSiteIdContractValue_(siteId)) return;
+    if (vercelUrl && !isRealPublishedSiteUrl_(vercelUrl)) return;
+    if (!recordsByAppId.has(appId)) {
+      recordsByAppId.set(appId, {
+        siteId: siteId,
+        appId: appId,
+        gameName: String(record.gameName || record.name || record['游戏名称'] || '').trim(),
+        vercelUrl: vercelUrl,
+        opportunityId: String(record.opportunityId || record.OpportunityID || '').trim(),
+        actualLiveAt: record.actualLiveAt || record.ActualLiveAt || record.liveAt || record['上线日期'] || '',
+        launchPageCount: record.launchPageCount,
+        repoUrl: record.repoUrl || '',
+        templateVersion: record.templateVersion || '',
+        source: record.source || 'existing_site_record'
+      });
+    }
+  });
+
+  decisions.forEach(decision => {
+    if (normalizeDecisionStatus_(decision.status) !== 'BUILD') return;
+    result.scannedBuild += 1;
+    const complete = findSitePoolSiteCreationComplete_(
+      completionIndex, decision.appId, decision.opportunityId);
+    if (complete) {
+      result.alreadyComplete += 1;
+      const closed = closeCandidateSiteBuildNextAction_(ss, decision.appId, decision.opportunityId);
+      result.nextActionClosed += closed.updated || 0;
+      return;
+    }
+    const record = recordsByAppId.get(String(decision.appId || '').trim());
+    if (record) {
+      const written = markSitePoolSiteCreationComplete_(ss, Object.assign({}, record, {
+        opportunityId: record.opportunityId || decision.opportunityId,
+        gameName: record.gameName || decision.name
+      }));
+      if (written) {
+        result.backfilled += 1;
+        result.nextActionClosed += 1;
+        if (isReliableSteamAppId_(record.appId)) {
+          completionIndex.byAppId.set(record.appId, sitePoolRowToCompletionFields_(
+            HOTWORD_V2.sitePoolHeaders, written));
+        }
+        return;
+      }
+    }
+    result.exceptions.push({
+      appId: decision.appId,
+      name: decision.name,
+      opportunityId: decision.opportunityId || '',
+      nextAction: decision.nextAction || '',
+      reason: 'BUILD_WITHOUT_SITE_CREATION_COMPLETE_RECORD'
+    });
+  });
+  return result;
+}
+
 function upsertSitePoolRecord_(ss, gameName, appId, buildDate, siteFacts) {
   const sheet = ensureSitePoolSchema_(ss);
   // Site Pool rows are runtime references; the canonical site_id is supplied
@@ -7884,6 +8228,9 @@ function upsertSitePoolRecord_(ss, gameName, appId, buildDate, siteFacts) {
       existing[22] || experimentType, existing[23] || actualLiveAt, existing[24] === '' || existing[24] === null || existing[24] === undefined ? launchPageCount : existing[24]];
     sheet.getRange(index + 2, 1, 1, row.length).setValues([row]);
     upsertGscBindingRecord_(ss, row[0], row[1], row[2], row[7]);
+    if (isSitePoolSiteCreationComplete_(sitePoolRowToCompletionFields_(HOTWORD_V2.sitePoolHeaders, row))) {
+      closeCandidateSiteBuildNextAction_(ss, normalizedAppId, opportunityId || row[21]);
+    }
     return row;
   }
   const row = [siteId, gameName, normalizedAppId, 'BUILD_PENDING', buildDate, 'BUILD_PENDING', '', '', '', '', 'NOT_CONNECTED', '', '', '', 'WAITING_INDEX', 'UNKNOWN', '', '', '', '', '', opportunityId, experimentType, actualLiveAt, launchPageCount];
@@ -8519,13 +8866,13 @@ function buildTodayActionAlreadyHandled_(ss, decisions) {
   const poolHeaders = poolSheet && poolSheet.getLastColumn() > 0
     ? poolSheet.getRange(1, 1, 1, poolSheet.getLastColumn()).getDisplayValues()[0] : [];
   readRows(poolSheet, 'Steam App ID', '游戏名称').forEach((row, indexNumber) => {
-    const values = poolSheet.getRange(indexNumber + 2, 1, 1, poolHeaders.length).getDisplayValues()[0];
-    const value = name => {
-      const column = poolHeaders.indexOf(name);
-      return column >= 0 ? String(values[column] || '').trim().toUpperCase() : '';
-    };
+    const values = poolSheet.getRange(indexNumber + 2, 1, 1, poolHeaders.length).getValues()[0];
+    const fields = sitePoolRowToCompletionFields_(poolHeaders, values);
     const terminal = ['LIVE', '已建站', '已上线', '已完成', 'BUILD_COMPLETE', 'COMPLETED', 'COMPLETE', 'DONE', 'PUBLISHED'];
-    if (terminal.indexOf(value('当前状态')) >= 0 || terminal.indexOf(value('Build状态')) >= 0) {
+    const current = String(fields.currentStatus || '').trim().toUpperCase();
+    const build = String(fields.buildStatus || '').trim().toUpperCase();
+    if (terminal.indexOf(current) >= 0 || terminal.indexOf(build) >= 0 ||
+        isSitePoolSiteCreationComplete_(fields)) {
       addTodayActionHandledIdentity_(index, 'handledBySitePool', row.appId, row.name, true);
     }
   });
@@ -8834,6 +9181,7 @@ function syncCandidateDecisions_(ss, records, runTime, rules) {
   const sheet = ss.getSheetByName(HOTWORD_V2.sheets.decisions);
   const columnMap = candidateDecisionColumnMap_(sheet);
   const decisions = readCandidateDecisions_(ss);
+  const siteCompletionIndex = readSitePoolCompletionIndex_(ss);
   records.forEach(rec => {
     const appId = String(rec.appId);
     let decision = decisions.get(appId);
@@ -8862,7 +9210,10 @@ function syncCandidateDecisions_(ss, records, runTime, rules) {
     const isHumanStage = decision.currentStage === '1B完成→人工第二轮';
     decision.researchStatus = isHumanStage ? deriveResearchStatus_(decision) : '';
     const actionRec = {gain7d: rec.gain7d, firstRoundType: rec.firstRoundType};
-    if (decision.status === 'BUILD') decision.nextAction = 'Site Build';
+    if (decision.status === 'BUILD') {
+      decision.nextAction = nextActionForBuildDecision_(
+        appId, decision.opportunityId, siteCompletionIndex);
+    }
     else if (decision.status === 'WATCH') decision.nextAction = candidateManualEvidenceNextAction_(actionRec, decision, candidateExternalSignalIsNew_(decision));
     else if (decision.status === 'REJECT' || !isHumanStage) decision.nextAction = 'None';
     else if (STEAM_PREFLIGHT_ENABLED && decision.preflightVerdict === 'MANUAL_REVIEW') decision.nextAction = candidateManualEvidenceNextAction_(actionRec, decision, candidateExternalSignalIsNew_(decision));
@@ -8970,7 +9321,10 @@ function syncCandidateDecisionFromActionEdit_(e) {
     decision.nextRecheckDate = '';
     decision.decisionDate = '';
   }
-  if (decision.status === 'BUILD') decision.nextAction = 'Site Build';
+  if (decision.status === 'BUILD') {
+    decision.nextAction = nextActionForBuildDecision_(
+      appId, decision.opportunityId, readSitePoolCompletionIndex_(e.source));
+  }
   else if (decision.status === 'WATCH') decision.nextAction = 'Recheck';
   else if (decision.status === 'REJECT' || decision.currentStage !== '1B完成→人工第二轮') decision.nextAction = 'None';
   else decision.nextAction = nextActionForResearch_(decision);
@@ -9072,7 +9426,14 @@ function captureCandidateDecisionEdit_(e) {
   const researchStatusColumn = columnMap.byName['研究状态'] || 0;
   if (researchStatusColumn > 0) candidateDecisionSetField_(sheet, e.range.getRow(), '研究状态', '已完成', columnMap);
   if (decisionDateColumn > 0 && (status === 'BUILD' || status === 'REJECT')) candidateDecisionSetField_(sheet, e.range.getRow(), 'Decision日期', checkedAt, columnMap);
-  if (nextActionColumn > 0) candidateDecisionSetField_(sheet, e.range.getRow(), 'Next Action', status === 'BUILD' ? 'Site Build' : status === 'WATCH' ? 'Recheck' : 'None', columnMap);
+  if (nextActionColumn > 0) {
+    const buildNextAction = status === 'BUILD'
+      ? nextActionForBuildDecision_(appId,
+        opportunityIdColumn > 0 ? sheet.getRange(e.range.getRow(), opportunityIdColumn).getDisplayValue() : '',
+        readSitePoolCompletionIndex_(e.source))
+      : status === 'WATCH' ? 'Recheck' : 'None';
+    candidateDecisionSetField_(sheet, e.range.getRow(), 'Next Action', buildNextAction, columnMap);
+  }
   if (status === 'BUILD') upsertSitePoolRecord_(e.source, sheet.getRange(e.range.getRow(), 2).getValue(), appId, checkedAt, {
     opportunityId: opportunityIdColumn > 0 ? sheet.getRange(e.range.getRow(), opportunityIdColumn).getValue() : ''
   });
@@ -9137,7 +9498,33 @@ function onEdit(e) {
   syncCandidateDecisionFromActionEdit_(e);
   captureCandidateTrendsRecalc_(e);
   captureCandidateDecisionEdit_(e);
+  captureSitePoolCompletionEdit_(e);
   if (candidateDecisionEditAffectsTodayAction_(e)) refreshTodayActionsFromCandidateDecisions_(e.source);
+}
+
+/**
+ * When 站点项目池 is edited into an explicit Site Creation completion signal,
+ * close matching Decision=BUILD Next Action=Site Build and refresh 今日行动.
+ */
+function captureSitePoolCompletionEdit_(e) {
+  if (!e || !e.range || !e.range.getSheet) return;
+  const sheet = e.range.getSheet();
+  if (sheet.getName() !== HOTWORD_V2.sheets.sitePool || e.range.getRow() < 2) return;
+  const headers = sheet.getRange(1, 1, 1, Math.max(sheet.getLastColumn(), HOTWORD_V2.sitePoolHeaders.length)).getDisplayValues()[0];
+  const relevant = ['当前状态', 'Build状态', 'Vercel URL', '上线日期', 'ActualLiveAt', 'Steam App ID', 'OpportunityID'];
+  const start = e.range.getColumn();
+  const end = e.range.getLastColumn ? e.range.getLastColumn() : start;
+  const touchesRelevant = relevant.some(name => {
+    const column = headers.indexOf(name) + 1;
+    return column > 0 && column >= start && column <= end;
+  });
+  if (!touchesRelevant) return;
+  const rowNumber = e.range.getRow();
+  const values = sheet.getRange(rowNumber, 1, 1, headers.length).getValues()[0];
+  const fields = sitePoolRowToCompletionFields_(headers, values);
+  if (!isSitePoolSiteCreationComplete_(fields)) return;
+  closeCandidateSiteBuildNextAction_(e.source, fields.appId, fields.opportunityId);
+  refreshTodayActionsFromCandidateDecisions_(e.source);
 }
 
 function captureCandidateTrendsRecalc_(e) {
@@ -10441,13 +10828,15 @@ function todayActionDateText_(value, ss) {
   return date.getFullYear() + '-' + String(date.getMonth() + 1).padStart(2, '0') + '-' + String(date.getDate()).padStart(2, '0');
 }
 
-function todayActionDecisionProjection_(rec, decision) {
+function todayActionDecisionProjection_(rec, decision, siteCompletionIndex) {
   const projected = Object.assign({}, decision || {});
   projected.status = normalizeDecisionStatus_(projected.status);
   const isHumanStage = projected.currentStage === '1B完成→人工第二轮';
   projected.researchStatus = isHumanStage ? deriveResearchStatus_(projected) : '';
-  if (projected.status === 'BUILD') projected.nextAction = 'Site Build';
-  else if (projected.status === 'REJECT' || !isHumanStage) projected.nextAction = 'None';
+  if (projected.status === 'BUILD') {
+    projected.nextAction = nextActionForBuildDecision_(
+      projected.appId || (rec && rec.appId), projected.opportunityId, siteCompletionIndex);
+  } else if (projected.status === 'REJECT' || !isHumanStage) projected.nextAction = 'None';
   else if (projected.status === 'WATCH') projected.nextAction = 'Recheck';
   else if (projected.preflightVerdict === 'MANUAL_REVIEW') {
     projected.nextAction = candidateManualEvidenceNextAction_(rec, projected, candidateExternalSignalIsNew_(projected));
@@ -10455,10 +10844,29 @@ function todayActionDecisionProjection_(rec, decision) {
   return projected;
 }
 
-function decideTodayActionProjection_(rec, decision, today, rules, ss) {
+function decideTodayActionProjection_(rec, decision, today, rules, ss, siteCompletionIndex) {
   const status = normalizeDecisionStatus_(decision && decision.status);
   if (status === 'REJECT') return {include: false, reason: 'Decision=REJECT，只保留在候选决策历史账本'};
-  if (status === 'BUILD') return {include: true, isCompleted: true, type: 'BUILD', humanAction: '进入 Site Creation', reason: 'Decision=BUILD，展示机器决定与推荐域名'};
+  if (status === 'BUILD') {
+    const complete = findSitePoolSiteCreationComplete_(
+      siteCompletionIndex,
+      decision && (decision.appId || (rec && rec.appId)),
+      decision && decision.opportunityId
+    );
+    if (complete) {
+      return {
+        include: false,
+        reason: 'Site Creation已完成（站点项目池），不再进入今日行动 BUILD 队列'
+      };
+    }
+    return {
+      include: true,
+      isCompleted: true,
+      type: 'BUILD',
+      humanAction: '进入 Site Creation',
+      reason: 'Decision=BUILD，展示机器决定与推荐域名'
+    };
+  }
   const action = decideTodayAction_(rec, decision, today, rules);
   if (action.include) return action;
 
@@ -10497,17 +10905,20 @@ function refreshTodayActionsFromCandidateDecisions_(spreadsheet, runTime, runId,
   const rules = loadRules_(ss);
   const decisions = readCandidateDecisions_(ss);
   const alreadyHandled = buildTodayActionAlreadyHandled_(ss, decisions);
+  const siteCompletionIndex = readSitePoolCompletionIndex_(ss);
   const masterRecords = readCandidateMasterRecordsForTodayAction_(ss);
   const manualContent = readTodayActionManualContent_(actionSheet);
   const before = countTodayActionRows_(actionSheet);
   const actions = [];
   let handledExcludedCount = 0;
+  let buildCompletedExcludedCount = 0;
   const handledReasonBreakdown = {
     handledByDecision: 0,
     handledByTrendsResearch: 0,
     handledBySitePool: 0,
     handledByHistory: 0,
-    handledByBuildPlan: 0
+    handledByBuildPlan: 0,
+    handledBySiteCreationComplete: 0
   };
 
   masterRecords.forEach(rec => {
@@ -10534,9 +10945,16 @@ function refreshTodayActionsFromCandidateDecisions_(spreadsheet, runTime, runId,
       });
       return;
     }
-    const projectedDecision = todayActionDecisionProjection_(rec, decision);
-    const projection = decideTodayActionProjection_(rec, projectedDecision, now, rules, ss);
-    if (!projection.include) return;
+    const projectedDecision = todayActionDecisionProjection_(rec, decision, siteCompletionIndex);
+    const projection = decideTodayActionProjection_(rec, projectedDecision, now, rules, ss, siteCompletionIndex);
+    if (!projection.include) {
+      if (normalizeDecisionStatus_(projectedDecision.status) === 'BUILD' &&
+          findSitePoolSiteCreationComplete_(siteCompletionIndex, projectedDecision.appId || rec.appId, projectedDecision.opportunityId)) {
+        buildCompletedExcludedCount += 1;
+        handledReasonBreakdown.handledBySiteCreationComplete += 1;
+      }
+      return;
+    }
     const preserved = manualContent.get(projectedDecision.appId);
     if (preserved && preserved.manualNote !== '') projectedDecision.manualNote = preserved.manualNote;
     rec.todayAction = projection;
@@ -10562,8 +10980,11 @@ function refreshTodayActionsFromCandidateDecisions_(spreadsheet, runTime, runId,
     anomalyCount: 0
   }, counts || {});
   refreshTodayAction_(ss, sampledActions, now, runId || todayActionRefreshRunId_(ss, now), summaryCounts);
-  if (typeof Logger !== 'undefined' && Logger.log && handledExcludedCount) {
-    Logger.log(JSON.stringify({todayActionHandledReasonBreakdown: handledReasonBreakdown}));
+  if (typeof Logger !== 'undefined' && Logger.log && (handledExcludedCount || buildCompletedExcludedCount)) {
+    Logger.log(JSON.stringify({
+      todayActionHandledReasonBreakdown: handledReasonBreakdown,
+      buildCompletedExcludedCount: buildCompletedExcludedCount
+    }));
   }
   const after = countTodayActionRows_(actionSheet);
   return {
@@ -10573,7 +10994,8 @@ function refreshTodayActionsFromCandidateDecisions_(spreadsheet, runTime, runId,
     beforePendingCount: before.pending,
     afterPendingCount: after.pending,
     waitingCount: after.waiting,
-    handledReasonBreakdown
+    handledReasonBreakdown,
+    buildCompletedExcludedCount
   };
 }
 
@@ -10654,10 +11076,32 @@ function todayActionRecordPriority_(rec) {
   return (isBuild ? 4 : 0) + (hasDomain ? 2 : 0) + (action.isCompleted ? 1 : 0);
 }
 
-// Public Apps Script API wrapper; the implementation remains the single
-// underscore-suffixed entry used by the menu, callbacks, and onEdit.
+// Public Apps Script API wrapper; reconcile completed Site Creation first so
+// stale BUILD handoffs and Next Action=Site Build close before projection.
 function refreshTodayActionsFromCandidateDecisions() {
-  return refreshTodayActionsFromCandidateDecisions_();
+  const ss = typeof SpreadsheetApp !== 'undefined' ? SpreadsheetApp.getActiveSpreadsheet() : null;
+  const reconcile = reconcileBuildSitePoolConsistency_(ss);
+  const refresh = refreshTodayActionsFromCandidateDecisions_(ss);
+  return Object.assign({}, refresh, {reconcile: reconcile});
+}
+
+function reconcileBuildSitePoolConsistency() {
+  const ss = typeof SpreadsheetApp !== 'undefined' ? SpreadsheetApp.getActiveSpreadsheet() : null;
+  const reconcile = reconcileBuildSitePoolConsistency_(ss);
+  const refresh = refreshTodayActionsFromCandidateDecisions_(ss);
+  if (typeof SpreadsheetApp !== 'undefined' && SpreadsheetApp.getUi) {
+    try {
+      SpreadsheetApp.getUi().alert(
+        'BUILD / 站点项目池收口\n' +
+        '扫描 BUILD: ' + reconcile.scannedBuild +
+        '\n已完成: ' + reconcile.alreadyComplete +
+        '\n关闭 Site Build: ' + reconcile.nextActionClosed +
+        '\nbackfill: ' + reconcile.backfilled +
+        '\n异常: ' + (reconcile.exceptions || []).length
+      );
+    } catch (uiErr) { /* non-interactive */ }
+  }
+  return Object.assign({}, reconcile, {refresh: refresh});
 }
 
 /**
