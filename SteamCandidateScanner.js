@@ -689,6 +689,31 @@ function validateSteamCandidateResearchCallback_(body) {
       Object.prototype.hasOwnProperty.call(body, 'organic_results')) {
     return {ok: false, error: 'raw_evidence_not_allowed'};
   }
+  if (executionStatus === 'PARTIAL') {
+    const machine = body.machine_fields;
+    if (!machine || Object.prototype.toString.call(machine) !== '[object Object]') {
+      return {ok: false, error: 'missing_machine_fields'};
+    }
+    const allowed = {
+      trends_result: CANDIDATE_DECISION_ENUMS_['Google Trends结果'].allowed,
+      social_result: CANDIDATE_DECISION_ENUMS_['Social结果'].allowed,
+      serp_competition: CANDIDATE_DECISION_ENUMS_['SERP竞争'].allowed,
+      keyword_opportunity: CANDIDATE_DECISION_ENUMS_['关键词机会'].allowed
+    };
+    Object.keys(machine).forEach(function (key) {
+      if (allowed[key] && (allowed[key].indexOf(steamCandidateResearchCallbackString_(machine[key])) < 0 ||
+          steamCandidateResearchCallbackString_(machine[key]) === '未检查')) {
+        throw new Error('invalid_machine_' + key);
+      }
+    });
+    if (body.recommendation && !STEAM_CANDIDATE_RECOMMENDATIONS[steamCandidateResearchCallbackString_(body.recommendation)]) {
+      return {ok: false, error: 'invalid_recommendation'};
+    }
+    if (body.recommendation && !STEAM_CANDIDATE_RESEARCH_CONFIDENCES[steamCandidateResearchCallbackString_(body.confidence)]) {
+      return {ok: false, error: 'invalid_confidence'};
+    }
+    return {ok: true, executionStatus: executionStatus, partial: true};
+  }
   // V1 preflight callback: deterministic queue verdict only. It intentionally
   // does not require the older M7B recommendation/social contract.
   if (steamCandidateResearchCallbackString_(body.preflight_verdict) &&
@@ -1056,6 +1081,30 @@ function handleSteamCandidateResearchCallback_(body) {
   const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(HOTWORD_V2.sheets.decisions);
   if (!sheet) return {ok: false, error: 'candidate_sheet_missing'};
   const status = validation.executionStatus;
+  if (validation.partial) {
+    const machine = body.machine_fields || {};
+    const partialFields = {
+      trends_result: ['Google Trends结果', 'trends_result'],
+      social_result: ['Social结果', 'social_result'],
+      serp_competition: ['SERP竞争', 'serp_competition'],
+      keyword_opportunity: ['关键词机会', 'keyword_opportunity']
+    };
+    Object.keys(partialFields).forEach(function (key) {
+      if (Object.prototype.hasOwnProperty.call(machine, key) && !hasCompletedManualResearchValue_(decision[key === 'trends_result' ? 'trendsResult' : key === 'social_result' ? 'socialResult' : key === 'serp_competition' ? 'serpCompetition' : 'keywordOpportunity'])) {
+        steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, partialFields[key][0], machine[key]);
+      }
+    });
+    if (body.social_summary) steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动Social摘要', steamCandidateResearchSocialSummary_(body.social_summary));
+    if (body.serp_summary) steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动SERP摘要', steamCandidateResearchSerpSummary_(body.serp_summary));
+    if (body.recommendation) {
+      steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动Recommendation', body.recommendation);
+      steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动Recommendation置信度', body.confidence);
+      steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动Recommendation理由', steamCandidateResearchJoin_(body.reasons) || steamCandidateResearchJoin_(body.blocking_reasons));
+      steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动缺失证据', steamCandidateResearchJoin_(body.missing_evidence));
+      steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动Recommendation结果路径', body.recommendation_result_path || '');
+    }
+    return {ok: true, job_id: body.job_id, execution_status: status, partial: true};
+  }
   if (validation.preflight) {
     steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动研究状态', status === STEAM_CANDIDATE_RESEARCH_EXEC_FAILED ? status : 'COMPLETED');
     steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动研究时间', body.preflight_checked_at);
