@@ -294,7 +294,10 @@ const HOTWORD_V2 = {
 const STEAM_CANDIDATE_RESEARCH_JOB_TYPE = 'STEAM_CANDIDATE_RESEARCH';
 const UNIFIED_CANDIDATE_UPSERT_JOB_TYPE = 'UNIFIED_CANDIDATE_UPSERT';
 const STEAM_CANDIDATE_RESEARCH_PENDING = 'PENDING';
-const STEAM_CANDIDATE_RESEARCH_CHECKS = ['GAME_WIDE_SOCIAL', 'GOOGLE_ORGANIC_SERP'];
+const STEAM_CANDIDATE_RESEARCH_CHECKS = [
+  'GOOGLE_TRENDS', 'GAME_WIDE_SOCIAL', 'GOOGLE_ORGANIC_SERP',
+  'KEYWORD_OPPORTUNITY', 'RECOMMENDATION'
+];
 const STEAM_CANDIDATE_RESEARCH_WRITE_TOKEN_PROP = 'STEAM_CANDIDATE_RESEARCH_WRITE_TOKEN';
 const STEAM_CANDIDATE_RESEARCH_EXEC_COMPLETED = 'COMPLETED';
 const STEAM_CANDIDATE_RESEARCH_EXEC_FAILED = 'FAILED';
@@ -464,9 +467,10 @@ function doGet(e) {
       const masterRepair = repairMasterAppIdsFromSteamUrl_(ss);
       const snapshotRepair = repairProductionCandidatesFromSnapshot_(ss, ['Anime Shop Simulator']);
       const staleRepair = repairStalePendingResearchJobs_(ss);
+      if (SpreadsheetApp.flush) SpreadsheetApp.flush();
       const reasonBackfill = backfillMachineRecommendationReasons_(ss);
       const queue = enqueueSteamCandidateResearchJobs_(ss, new Date());
-      const forceQueue = forceEnqueueProductionResearch_(ss, ['3393280'], new Date());
+      const forceQueue = forceEnqueueProductionResearch_(ss, ['2825860', '1890310', '3393280', '2530470'], new Date());
       const refresh = refreshTodayActionsFromCandidateDecisions_(ss);
       SpreadsheetApp.flush();
       return ContentService.createTextOutput(JSON.stringify({
@@ -753,6 +757,24 @@ function validateSteamCandidateResearchCallback_(body) {
     const text = steamCandidateResearchCallbackString_(topic);
     return !text || /^https?:\/\//i.test(text);
   })) return {ok: false, error: 'invalid_top_topics'};
+  const machine = body.machine_fields;
+  if (!machine || Object.prototype.toString.call(machine) !== '[object Object]') {
+    return {ok: false, error: 'missing_machine_fields'};
+  }
+  const requiredMachineFields = {
+    trends_result: CANDIDATE_DECISION_ENUMS_['Google Trends结果'].allowed,
+    social_result: CANDIDATE_DECISION_ENUMS_['Social结果'].allowed,
+    serp_competition: CANDIDATE_DECISION_ENUMS_['SERP竞争'].allowed,
+    keyword_opportunity: CANDIDATE_DECISION_ENUMS_['关键词机会'].allowed
+  };
+  const machineKeys = Object.keys(requiredMachineFields);
+  for (let k = 0; k < machineKeys.length; k++) {
+    const key = machineKeys[k];
+    if (requiredMachineFields[key].indexOf(steamCandidateResearchCallbackString_(machine[key])) < 0 ||
+        steamCandidateResearchCallbackString_(machine[key]) === '未检查') {
+      return {ok: false, error: 'invalid_machine_' + key};
+    }
+  }
   return {ok: true, executionStatus: executionStatus};
 }
 
@@ -853,6 +875,7 @@ function deriveFinalStatus_(decision) {
 }
 
 function machineResearchPending_(decision) {
+  if (!decision) return false;
   const status = steamCandidateResearchCallbackString_(decision && decision.autoResearchStatus).toUpperCase();
   return !status || status === 'PENDING' || status === 'RUNNING';
 }
@@ -862,7 +885,18 @@ function machineResearchFailed_(decision) {
 }
 
 function machineResearchComplete_(decision) {
-  return steamCandidateResearchCallbackString_(decision && decision.autoResearchStatus).toUpperCase() === 'COMPLETED';
+  return steamCandidateResearchCallbackString_(decision && decision.autoResearchStatus).toUpperCase() === 'COMPLETED' &&
+    machineResearchOutputsComplete_(decision);
+}
+
+function machineResearchOutputsComplete_(decision) {
+  if (!decision) return false;
+  return [
+    decision.trendsResult, decision.socialResult, decision.serpCompetition,
+    decision.keywordOpportunity, decision.autoRecommendation,
+    decision.autoRecommendationConfidence, decision.autoResearchResultPath,
+    decision.autoRecommendationResultPath
+  ].every(value => hasCompletedManualResearchValue_(value));
 }
 
 function formatMachineSocialDisplay_(decision) {
@@ -1057,20 +1091,21 @@ function handleSteamCandidateResearchCallback_(body) {
       today_action_refresh: refreshTodayActionsFromCandidateDecisions_()
     };
   }
-  steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动研究状态', status);
   steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动研究时间', body.completed_at);
   steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, 'PreflightVerdict', body.preflight_verdict || '');
   steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, 'PreflightCheckedAt', body.preflight_checked_at || body.completed_at);
   steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, 'PreflightReason', body.preflight_reason || '');
-  const machine = body.machine_fields && Object.prototype.toString.call(body.machine_fields) === '[object Object]'
-    ? body.machine_fields : {};
-  if (machine.social_result) {
+  const machine = body.machine_fields;
+  if (!hasCompletedManualResearchValue_(decision.trendsResult)) {
+    steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, 'Google Trends结果', machine.trends_result);
+  }
+  if (!hasCompletedManualResearchValue_(decision.socialResult)) {
     steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, 'Social结果', machine.social_result);
   }
-  if (machine.serp_competition) {
+  if (!hasCompletedManualResearchValue_(decision.serpCompetition)) {
     steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, 'SERP竞争', machine.serp_competition);
   }
-  if (machine.keyword_opportunity) {
+  if (!hasCompletedManualResearchValue_(decision.keywordOpportunity)) {
     steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '关键词机会', machine.keyword_opportunity);
   }
   steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动Social摘要', steamCandidateResearchSocialSummary_(body.social_summary));
@@ -1096,8 +1131,9 @@ function handleSteamCandidateResearchCallback_(body) {
   ['RecommendedDomain', 'DomainTLD', 'DomainFirstYearPrice', 'DomainRegistrar', 'DomainPurchaseURL', 'DomainCheckedAt',
     'DomainAlternative1', 'DomainAlternative1Price', 'DomainAlternative1PurchaseURL', 'DomainAlternative2',
     'DomainAlternative2Price', 'DomainAlternative2PurchaseURL'].forEach(function (field) {
-      steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, field, body[field] == null ? '' : body[field]);
+    steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, field, body[field] == null ? '' : body[field]);
     });
+  steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动研究状态', status);
   const ss = SpreadsheetApp.getActiveSpreadsheet() ||
     SpreadsheetApp.openById(QUALIFICATION_ELIGIBILITY_PRODUCTION_SHEET_ID);
   const masterWrite = writeResearchCallbackToCandidateMaster_(ss, body, decision);
@@ -2268,13 +2304,28 @@ function recoverSteamCandidateResearch() {
     const schema = ensureCandidateDecisionSchema_(ss);
     const repair = repairCandidateDecisionSchemaData_(ss);
     setupCandidateDecisionUi_(ss);
+    const backlog = repairStalePendingResearchJobs_(ss);
+    if (SpreadsheetApp.flush) SpreadsheetApp.flush();
     const queue = enqueueSteamCandidateResearchJobs_(ss, new Date());
     const refresh = refreshTodayActionsFromCandidateDecisions_(ss);
     SpreadsheetApp.flush();
-    return {ok: true, schema, repair, queue, refresh};
+    return {ok: true, schema, repair, backlog, queue, refresh};
   } finally {
     lock.releaseLock();
   }
+}
+
+/** Production backfill for the existing Candidate Research worker queue. */
+function backfillSteamCandidateResearchClosureProduction() {
+  const ss = SpreadsheetApp.openById(QUALIFICATION_ELIGIBILITY_PRODUCTION_SHEET_ID);
+  const schema = ensureCandidateDecisionSchema_(ss);
+  const decisionBackfill = ensureEligibleCandidateResearchDecisions_(ss);
+  const backlog = repairStalePendingResearchJobs_(ss);
+  if (SpreadsheetApp.flush) SpreadsheetApp.flush();
+  const queue = enqueueSteamCandidateResearchJobs_(ss, new Date());
+  const refresh = refreshTodayActionsFromCandidateDecisions_(ss);
+  SpreadsheetApp.flush();
+  return {ok: true, schema, decisionBackfill, backlog, queue, refresh};
 }
 
 /** Production smoke readback for inbox verification; read-only. */
@@ -2587,8 +2638,6 @@ function forceEnqueueProductionResearch_(ss, appIds, createdAt) {
     candidateDecisionSetField_(decisionSheet, decision.rowNumber, '自动研究状态', STEAM_CANDIDATE_RESEARCH_PENDING, decisionCol);
     candidateDecisionSetField_(decisionSheet, decision.rowNumber, '自动研究时间', now, decisionCol);
     candidateDecisionSetField_(decisionSheet, decision.rowNumber, 'PreflightVerdict', STEAM_PREFLIGHT_ENABLED ? 'PENDING' : '', decisionCol);
-    candidateDecisionSetField_(decisionSheet, decision.rowNumber, 'Decision', '', decisionCol);
-    candidateDecisionSetField_(decisionSheet, decision.rowNumber, '决策状态', '', decisionCol);
   result.enqueued += 1;
   result.rows.push({appId: appId, job_id: job.job_id});
   });
@@ -2596,21 +2645,29 @@ function forceEnqueueProductionResearch_(ss, appIds, createdAt) {
 }
 
 function repairStalePendingResearchJobs_(ss) {
-  const result = {repaired: 0, rows: []};
+  const result = {repaired: 0, stalePending: 0, incompleteCompleted: 0, rows: []};
   const decisionSheet = ss.getSheetByName(HOTWORD_V2.sheets.decisions);
   if (!decisionSheet || decisionSheet.getLastRow() < 2) return result;
   const columnMap = candidateDecisionColumnMap_(decisionSheet);
-  const cycleDate = steamCandidateResearchDateString_(new Date(), ss).replace(/-/g, '');
+  const now = new Date();
+  const cycleDate = steamCandidateResearchDateString_(now, ss).replace(/-/g, '');
+  const today = dateAtStart_(now);
   readCandidateDecisions_(ss).forEach(decision => {
-  const status = String(decision.autoResearchStatus || '').trim();
-  if (status && status !== STEAM_CANDIDATE_RESEARCH_PENDING) return;
-  const jobId = String(decision.researchJobId || '').trim();
-  if (!jobId || jobId.indexOf(cycleDate) >= 0) return;
-  candidateDecisionSetField_(decisionSheet, decision.rowNumber, 'ResearchJobID', '', columnMap);
-  candidateDecisionSetField_(decisionSheet, decision.rowNumber, '自动研究状态', STEAM_CANDIDATE_RESEARCH_PENDING, columnMap);
-  candidateDecisionSetField_(decisionSheet, decision.rowNumber, 'PreflightVerdict', STEAM_PREFLIGHT_ENABLED ? 'PENDING' : '', columnMap);
-  result.repaired += 1;
-  result.rows.push({appId: decision.appId, name: decision.name, clearedJobId: jobId});
+    const status = String(decision.autoResearchStatus || '').trim().toUpperCase();
+    const jobId = String(decision.researchJobId || '').trim();
+    const queuedAt = dateAtStart_(decision.autoResearchTime);
+    const stalePending = status === STEAM_CANDIDATE_RESEARCH_PENDING && jobId &&
+      (jobId.indexOf(cycleDate) < 0 || !queuedAt || queuedAt.getTime() < today.getTime());
+    const incompleteCompleted = status === STEAM_CANDIDATE_RESEARCH_EXEC_COMPLETED && !machineResearchOutputsComplete_(decision);
+    if (!stalePending && !incompleteCompleted) return;
+    candidateDecisionSetField_(decisionSheet, decision.rowNumber, 'ResearchJobID', '', columnMap);
+    candidateDecisionSetField_(decisionSheet, decision.rowNumber, '自动研究状态', STEAM_CANDIDATE_RESEARCH_PENDING, columnMap);
+    candidateDecisionSetField_(decisionSheet, decision.rowNumber, 'PreflightVerdict', STEAM_PREFLIGHT_ENABLED ? 'PENDING' : '', columnMap);
+    result.repaired += 1;
+    if (stalePending) result.stalePending += 1;
+    if (incompleteCompleted) result.incompleteCompleted += 1;
+    result.rows.push({appId: decision.appId, name: decision.name, clearedJobId: jobId,
+      reason: stalePending ? 'STALE_PENDING' : 'INCOMPLETE_COMPLETED'});
   });
   return result;
 }
@@ -9031,6 +9088,7 @@ function enqueueSteamCandidateResearchJobs_(ss, createdAt) {
     return { created: 0, skipped: 0, error: 'candidate_sheet_missing' };
   }
 
+  ensureEligibleCandidateResearchDecisions_(ss);
   const decisionCol = candidateDecisionColumnMap_(decisionSheet);
   const masterCol = {};
   HOTWORD_V2.masterHeaders.forEach((name, index) => { masterCol[name] = index; });
@@ -9065,8 +9123,8 @@ function enqueueSteamCandidateResearchJobs_(ss, createdAt) {
     // re-enter using the existing recheck date semantics.
     const persistedStatus = normalizeDecisionStatus_(decision.status);
     if (persistedStatus === 'BUILD' || persistedStatus === 'REJECT' ||
-        (persistedStatus === 'WATCH' && !steamCandidatePreflightDue_(decision, now) &&
-          machineResearchComplete_(decision))) {
+        (persistedStatus === 'WATCH' && machineResearchComplete_(decision) &&
+          !steamCandidatePreflightDue_(decision, now))) {
       skipped += 1;
       return;
     }
@@ -9119,6 +9177,41 @@ function enqueueSteamCandidateResearchJobs_(ss, createdAt) {
   return { created: created.length, skipped: skipped, jobs: created };
 }
 
+/** Create the missing ledger row only for an already eligible master candidate. */
+function ensureEligibleCandidateResearchDecisions_(ss) {
+  const result = {created: 0, rows: []};
+  const decisionSheet = ss && ss.getSheetByName ? ss.getSheetByName(HOTWORD_V2.sheets.decisions) : null;
+  const masterSheet = ss && ss.getSheetByName ? ss.getSheetByName(HOTWORD_V2.sheets.master) : null;
+  if (!decisionSheet || !masterSheet || masterSheet.getLastRow() < 2) return result;
+  const columnMap = candidateDecisionColumnMap_(decisionSheet);
+  const masterCol = {};
+  HOTWORD_V2.masterHeaders.forEach((name, index) => { masterCol[name] = index; });
+  const decisions = readCandidateDecisions_(ss);
+  masterSheet.getRange(2, 1, masterSheet.getLastRow() - 1, HOTWORD_V2.masterHeaders.length).getValues().forEach(row => {
+    const appId = String(row[masterCol['Steam App ID']] || '').trim();
+    const name = String(row[masterCol['游戏名称']] || '').trim();
+    const stage = String(row[masterCol['当前筛选阶段']] || '').trim();
+    const oneAResult = String(row[masterCol['1A结果']] || '').trim();
+    if (!isReliableSteamAppId_(appId) || !name || decisions.has(appId) ||
+        String(row[masterCol['进入下一步']] || '').trim() !== '是' ||
+        (oneAResult && !STEAM_CANDIDATE_1A_PASS_RESULTS[oneAResult]) ||
+        stage !== '1B完成→人工第二轮') return;
+    const decision = {
+      appId: appId, name: name, firstSeen: row[masterCol['首次发现日期']] || '',
+      source: row[masterCol['候选来源']] || '', firstType: row[masterCol['第一轮类型']] || '',
+      currentStage: stage, researchStatus: '待研究', trendsResult: '未检查',
+      socialResult: '未检查', serpCompetition: '未检查', keywordOpportunity: '未检查',
+      nextAction: 'Automatic Preflight', opportunityId: opportunityIdFromSteamCandidate_(name, appId)
+    };
+    decisionSheet.getRange(decisionSheet.getLastRow() + 1, 1, 1, columnMap.width)
+      .setValues([candidateDecisionRow_(decision, columnMap)]);
+    decisions.set(appId, decision);
+    result.created += 1;
+    result.rows.push({appId: appId, name: name});
+  });
+  return result;
+}
+
 function loadPendingSteamCandidateResearchJobs_(spreadsheet) {
   const ss = spreadsheet || SpreadsheetApp.getActiveSpreadsheet();
   if (!ss) return [];
@@ -9148,13 +9241,13 @@ function loadPendingSteamCandidateResearchJobs_(spreadsheet) {
     if (String(masterRow[masterCol['进入下一步']] || '').trim() !== '是') return;
     const status = normalizeDecisionStatus_(decision.status);
     if (status === 'REJECT' || status === 'BUILD') return;
-    if (status === 'WATCH' && !steamCandidatePreflightDue_(decision, new Date()) &&
-        machineResearchComplete_(decision)) return;
+    if (status === 'WATCH' && machineResearchComplete_(decision) &&
+        !steamCandidatePreflightDue_(decision, new Date())) return;
     const candidateRec = {
       gain7d: masterRow[masterCol['Steam 7d Gain']],
       firstRoundType: masterRow[masterCol['第一轮类型']]
     };
-    if (status === 'WATCH' && machineResearchComplete_(decision)) {
+    if (status === 'WATCH') {
       const watchGate = candidateWatchRecheckGate_(candidateRec, decision, new Date(), rules);
       if (watchGate.due && !watchGate.allowed) return;
     }
@@ -9880,8 +9973,12 @@ function updateCandidateMasterOutcome_(ss, keys, fields, options) {
       onlyIfEmpty: !!(options && options.trendsOnlyIfEmpty)
     });
   }
-  if (source['Social结果'] !== undefined) write('Social结果', source['Social结果']);
-  if (source['SERP竞争'] !== undefined) write('SERP竞争', source['SERP竞争']);
+  if (source['Social结果'] !== undefined) {
+    write('Social结果', source['Social结果'], {onlyIfEmpty: !!(options && options.outcomesOnlyIfEmpty)});
+  }
+  if (source['SERP竞争'] !== undefined) {
+    write('SERP竞争', source['SERP竞争'], {onlyIfEmpty: !!(options && options.outcomesOnlyIfEmpty)});
+  }
   if (source['机器推荐'] !== undefined) {
     write('机器推荐', normalizeMasterMachineRecommendation_(source['机器推荐']) || source['机器推荐']);
   }
@@ -9933,11 +10030,13 @@ function writeResearchCallbackToCandidateMaster_(ss, body, decision) {
   const fields = {};
   const social = masterOutcome.social_result || machine.social_result;
   const serp = masterOutcome.serp_competition || machine.serp_competition;
+  const trends = masterOutcome.trends_result || machine.trends_result;
   const recommendation = masterOutcome.machine_recommendation ||
     body.machine_recommendation || body.recommendation;
   const confidence = masterOutcome.machine_confidence || body.confidence;
   if (social) fields['Social结果'] = social;
   if (serp) fields['SERP竞争'] = serp;
+  if (trends) fields['Trends结果'] = trends;
   if (recommendation) fields['机器推荐'] = normalizeMasterMachineRecommendation_(recommendation);
   if (confidence !== undefined && confidence !== null && String(confidence).trim() !== '') {
     fields['机器置信度'] = confidence;
@@ -9947,7 +10046,7 @@ function writeResearchCallbackToCandidateMaster_(ss, body, decision) {
     candidateId: body && (body.candidate_id || body.CandidateID),
     steamAppId: body && body.steam_app_id || (decision && decision.appId),
     gameName: body && body.game_name || (decision && decision.name)
-  }, fields);
+  }, fields, {outcomesOnlyIfEmpty: true, trendsOnlyIfEmpty: true});
 }
 
 // ---------------------------------------------------------------------------
@@ -10865,6 +10964,16 @@ function decideTodayActionProjection_(rec, decision, today, rules, ss, siteCompl
       type: 'BUILD',
       humanAction: '进入 Site Creation',
       reason: 'Decision=BUILD，展示机器决定与推荐域名'
+    };
+  }
+  // A WATCH decision remains visible as research in progress until the
+  // callback has written every required machine result.
+  if (machineResearchPending_(decision) || machineResearchFailed_(decision)) {
+    return {
+      include: true,
+      type: 'RESEARCHING',
+      humanAction: machineResearchPending_(decision) ? '机器研究中' : '机器研究失败，待复查',
+      reason: machineResearchPending_(decision) ? '机器研究进行中' : '机器研究失败'
     };
   }
   const action = decideTodayAction_(rec, decision, today, rules);

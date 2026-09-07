@@ -14,6 +14,9 @@ var context = {
   normalizeDecisionStatus_: function (v) { var s = String(v || '').trim().toUpperCase(); return ['WATCH', 'BUILD', 'REJECT'].indexOf(s) >= 0 ? s : ''; },
   dateAtStart_: function (v) { var d = new Date(v); if (isNaN(d.getTime())) return null; d.setHours(0, 0, 0, 0); return d; },
   deriveHumanAction_: function () { return '继续验证'; },
+  machineResearchPending_: function (d) { return !!d && (!d.autoResearchStatus || d.autoResearchStatus === 'PENDING' || d.autoResearchStatus === 'RUNNING'); },
+  machineResearchFailed_: function (d) { return !!d && d.autoResearchStatus === 'FAILED'; },
+  machineResearchComplete_: function () { return false; },
   Number: Number, String: String, Date: Date, Math: Math
 };
 vm.createContext(context);

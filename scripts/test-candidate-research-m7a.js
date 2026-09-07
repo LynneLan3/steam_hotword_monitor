@@ -15,7 +15,10 @@ var spreadsheet;
 
 var sandbox = {
   console: console,
-  SpreadsheetApp: { getActiveSpreadsheet: function () { return spreadsheet; } },
+  SpreadsheetApp: {
+    getActiveSpreadsheet: function () { return spreadsheet; },
+    openById: function () { return spreadsheet; }
+  },
   Utilities: {
     formatDate: function (date) {
       var d = new Date(date);
@@ -96,6 +99,7 @@ function candidateMaster(appId, name, continueNext) {
   candidate[index(masterHeaders, '第一轮类型')] = '🔥 趋势候选';
   candidate[index(masterHeaders, '第一轮优先级')] = 'P1 高';
   candidate[index(masterHeaders, '进入下一步')] = continueNext;
+  candidate[index(masterHeaders, '当前筛选阶段')] = '1B完成→人工第二轮';
   return candidate;
 }
 
@@ -111,7 +115,10 @@ function candidateDecision(appId, name, options) {
 
 var excluded = candidateMaster('4026251', 'Excluded Game', '否');
 var completedDecision = candidateDecision('4026252', 'Completed Game', {
-  ResearchJobID: 'steam-research-4026252-20260823', '自动研究状态': 'COMPLETED'
+  ResearchJobID: 'steam-research-4026252-20260823', '自动研究状态': 'COMPLETED',
+  'Google Trends结果': '强', 'Social结果': '中', 'SERP竞争': '低', '关键词机会': '有',
+  '自动研究结果路径': 'jobs/completed/research.json', '自动Recommendation': 'RECOMMEND_WATCH',
+  '自动Recommendation置信度': 'HIGH', '自动Recommendation结果路径': 'jobs/completed/recommendation.json'
 });
 var failedDecision = candidateDecision('4026253', 'Failed Game', {
   ResearchJobID: 'steam-research-4026253-20260823', '自动研究状态': 'FAILED'
@@ -144,7 +151,10 @@ function makeSheet(rows, headers) {
           writes += 1;
           rows[rowNumber - 2][columnNumber - 1] = value;
         },
-        setValues: function () { writes += 1; throw new Error('unexpected bulk write'); }
+        setValues: function (values) {
+          writes += 1;
+          values.forEach(function (valueRow, offset) { rows[rowNumber - 2 + offset] = valueRow.slice(); });
+        }
       };
     }
   };
@@ -173,13 +183,13 @@ spreadsheet = {
 };
 
 var first = sandbox.enqueueSteamCandidateResearchJobs_(spreadsheet, new Date('2026-08-23T01:00:00Z'));
-assert(first.created === 1, 'eligible candidate creates one job');
+assert(first.created === 2, 'eligible candidates and incomplete WATCH create jobs');
 assert(first.jobs[0].job_id === 'steam-research-4026250-20260823', 'deterministic job id');
 assert(first.jobs[0].job_type === 'STEAM_CANDIDATE_RESEARCH', 'independent job type');
 assert(first.jobs[0].steam_signals.followers_gain_7d === 1100, 'steam signals retained');
 assert(first.jobs[0].manual_signals.trends_result === '未检查', 'manual trends copied as input only');
 assert(first.jobs[0].serp_queries.join('|') === 'Project P.I.T.T.', 'brand query only');
-assert(first.jobs[0].requested_checks.join('|') === 'GAME_WIDE_SOCIAL|GOOGLE_ORGANIC_SERP', 'checks');
+assert(first.jobs[0].requested_checks.join('|') === 'GOOGLE_TRENDS|GAME_WIDE_SOCIAL|GOOGLE_ORGANIC_SERP|KEYWORD_OPPORTUNITY|RECOMMENDATION', 'checks');
 assert(decision[14] === '未检查' && decision[15] === '人工Social' && decision[16] === '未检查' && decision[17] === '人工关键词' && decision[19] === '', 'manual fields untouched');
 assert(decision[23] === 'steam-research-4026250-20260823', 'ResearchJobID stored');
 assert(decision[24] === 'PENDING', 'automatic status stored');
@@ -208,8 +218,12 @@ assert(completedDecision[index(decisionHeaders, 'ResearchJobID')] !== '', 'compl
 assert(failedDecision[index(decisionHeaders, 'ResearchJobID')] !== '', 'failed job has ResearchJobID');
 assert(next.created === 0, 'PENDING/COMPLETED/FAILED jobs are never auto-retried');
 assert(buildDecision[index(decisionHeaders, 'ResearchJobID')] === '', 'manual BUILD is not enqueued');
-assert(watchDecision[index(decisionHeaders, 'ResearchJobID')] === '', 'manual WATCH is not enqueued');
+assert(watchDecision[index(decisionHeaders, 'ResearchJobID')] !== '', 'incomplete WATCH is enqueued');
 assert(rejectDecision[index(decisionHeaders, 'ResearchJobID')] === '', 'manual REJECT is not enqueued');
+
+var forced = sandbox.forceEnqueueProductionResearch_(spreadsheet, ['4026257'], new Date('2026-08-24T01:00:00Z'));
+assert(forced.enqueued === 1, 'force recovery requeues the requested candidate');
+assert(pendingManualDecision[index(decisionHeaders, 'Decision')] === 'WATCH', 'force recovery preserves manual decision');
 
 var weakManualMaster = candidateMaster('4026260', 'Weak Manual Evidence', '是');
 weakManualMaster[index(masterHeaders, 'Steam 7d Gain')] = 1100;
@@ -233,14 +247,14 @@ decisionRows.push(weakManualDecision, watchNoGrowthDecision, watchGrowthDecision
 
 var beforeGetWrites = writes;
 var pending = sandbox.loadPendingSteamCandidateResearchJobs_();
-assert(pending.length === 2, 'GET loader suppresses manual evidence and WATCH without new signal');
+assert(pending.length === 5, 'GET loader keeps incomplete WATCH research but suppresses final WATCH without a new signal');
 assert(pending[0].steam_app_id === '4026250', 'GET contract AppID');
-assert(pending[1].steam_app_id === '4026262', 'GET allows WATCH with 30 percent growth');
+assert(pending.some(function (job) { return job.steam_app_id === '4026262'; }), 'GET allows WATCH with 30 percent growth');
 assert(pending[0].steam_url.indexOf('/4026250/') >= 0, 'GET contract Steam URL');
 assert(pending[0].steam_signals.steam_score === null, 'missing facts remain null');
 assert(pending[0].manual_signals.keyword_opportunity === '人工关键词', 'GET preserves manual input');
 var getResponse = sandbox.doGet({parameter: {action: 'pendingSteamCandidateResearchJobs'}});
-assert(JSON.parse(getResponse.text).jobs.length === 2, 'GET endpoint returns the gated pending contract');
+assert(JSON.parse(getResponse.text).jobs.length === 5, 'GET endpoint returns the gated pending contract');
 assert(JSON.parse(getResponse.text).jobs[0].steam_app_id === '4026250', 'GET excludes manually decided and no-longer-eligible jobs');
 assert(writes === beforeGetWrites, 'GET loader is read-only');
 
@@ -282,4 +296,29 @@ assert(gateDecisionRows[1][index(decisionHeaders, 'ResearchJobID')] !== '', '对
 assert(gateDecisionRows[2][index(decisionHeaders, 'ResearchJobID')] === '', '排除 is not enqueued');
 assert(gateDecisionRows[3][index(decisionHeaders, 'ResearchJobID')] === '', '数据异常 is not enqueued');
 assert(gateDecisionRows[4][index(decisionHeaders, 'ResearchJobID')] !== '', 'historical 通过 remains accepted');
+
+var staleMaster = candidateMaster('4026263', 'Stale Pending Game', '是');
+var staleDecision = candidateDecision('4026263', 'Stale Pending Game', {
+  ResearchJobID: 'steam-research-4026263-20200101', '自动研究状态': 'PENDING'
+});
+var incompleteMaster = candidateMaster('4026264', 'Incomplete Completed Game', '是');
+var incompleteDecision = candidateDecision('4026264', 'Incomplete Completed Game', {
+  ResearchJobID: 'steam-research-4026264-20200101', '自动研究状态': 'COMPLETED'
+});
+var staleCurrentCycleMaster = candidateMaster('4026266', 'Stale Current Cycle Game', '是');
+var staleCurrentCycleDecision = candidateDecision('4026266', 'Stale Current Cycle Game', {
+  ResearchJobID: 'steam-research-4026266-20260907', '自动研究状态': 'PENDING',
+  '自动研究时间': '2026-08-27T08:00:00Z'
+});
+var rogueMaster = candidateMaster('4026265', 'No Research Job Game', '是');
+masterRows.push(staleMaster, incompleteMaster, staleCurrentCycleMaster, rogueMaster);
+decisionRows.push(staleDecision, incompleteDecision, staleCurrentCycleDecision);
+var repaired = sandbox.repairStalePendingResearchJobs_(spreadsheet);
+assert(repaired.stalePending >= 1 && repaired.incompleteCompleted >= 1, 'stale PENDING and empty COMPLETED are reopened');
+var repairedQueue = sandbox.enqueueSteamCandidateResearchJobs_(spreadsheet, new Date());
+assert(repairedQueue.jobs.some(function (job) { return job.steam_app_id === '4026263'; }), 'stale PENDING gets a new job');
+assert(repairedQueue.jobs.some(function (job) { return job.steam_app_id === '4026266'; }), 'old PENDING is retried despite a current-cycle Job ID');
+assert(repairedQueue.jobs.some(function (job) { return job.steam_app_id === '4026264'; }), 'empty COMPLETED gets a new job');
+assert(repairedQueue.jobs.some(function (job) { return job.steam_app_id === '4026265'; }), 'eligible candidate without a decision gets a job');
+assert(decisionRows.filter(function (item) { return item[index(decisionHeaders, 'Steam App ID')] === '4026265'; }).length === 1, 'missing decision is created once by Steam App ID');
 console.log('PASS scripts/test-candidate-research-m7a.js');

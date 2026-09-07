@@ -30,13 +30,21 @@ var context = {
     date.setHours(0, 0, 0, 0);
     return date;
   },
+  machineResearchPending_: function (decision) {
+    return !!decision && (!decision.autoResearchStatus || decision.autoResearchStatus === 'PENDING' || decision.autoResearchStatus === 'RUNNING');
+  },
+  machineResearchFailed_: function (decision) { return !!decision && decision.autoResearchStatus === 'FAILED'; },
+  machineResearchComplete_: function () { return false; },
   Number: Number
 };
 vm.runInNewContext(
   'var STEAM_PREFLIGHT_ENABLED = true;\n' +
   'var isFiniteNumber_ = this.isFiniteNumber_;\n' +
   'var normalizeDecisionStatus_ = this.normalizeDecisionStatus_;\n' +
-  'var dateAtStart_ = this.dateAtStart_;\n' + helperSource + '\n' + match[0],
+  'var dateAtStart_ = this.dateAtStart_;\n' +
+  'var machineResearchPending_ = this.machineResearchPending_;\n' +
+  'var machineResearchFailed_ = this.machineResearchFailed_;\n' +
+  'var machineResearchComplete_ = this.machineResearchComplete_;\n' + helperSource + '\n' + match[0],
   context
 );
 var decideTodayAction_ = context.decideTodayAction_;
@@ -48,14 +56,14 @@ function assert(value, label) { if (!value) throw new Error(label); }
 function check(decision, expected, label) {
   var result = decideTodayAction_(base, decision, today, rules);
   assert(result.include === expected, label + ' include');
-  if (expected) assert(result.humanAction === '检查 Google Trends' || result.humanAction === '重新验证趋势变化', label + ' action');
+  if (expected) assert(['检查 Google Trends', '重新验证趋势变化', '机器研究中'].indexOf(result.humanAction) >= 0, label + ' action');
 }
 
 check(null, false, 'missing preflight');
 check({preflightVerdict: 'PENDING'}, false, 'pending preflight');
 check({preflightVerdict: 'AUTO_REJECT'}, false, 'auto reject');
 check({preflightVerdict: 'MANUAL_REVIEW', status: ''}, true, 'manual review');
-check({preflightVerdict: 'MANUAL_REVIEW', status: '', trendsResult: '弱'}, false, 'existing weak Trends does not repeat');
+check({preflightVerdict: 'MANUAL_REVIEW', status: '', trendsResult: '弱'}, true, 'automatic research completes remaining evidence');
 check({preflightVerdict: 'WATCH', status: 'WATCH', lastGain: 1000, nextRecheckDate: '2026-08-24'}, false, 'due watch without new signal');
 check({preflightVerdict: 'WATCH', status: 'WATCH', nextRecheckDate: '2026-08-30'}, false, 'future watch');
 check({preflightVerdict: 'WATCH', lastGain: 1000, nextRecheckDate: '2026-08-24'}, false, 'due automatic watch without new signal');

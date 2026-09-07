@@ -214,6 +214,7 @@ var completedPayload = function () {
       guide_density: 'LOW', high_video_ugc: true, contamination: true
     },
     machine_fields: {
+      trends_result: '强',
       social_result: '强',
       social_verdict: '强',
       social_one_liner: 'reddit/youtube；主题:automation',
@@ -240,12 +241,16 @@ assert(decision[index(decisionHeaders, '自动研究状态')] === 'COMPLETED', '
 assert(decision[index(decisionHeaders, '自动Recommendation')] === 'RECOMMEND_BUILD', 'recommendation written');
 assert(decision[index(decisionHeaders, '自动Recommendation置信度')] === 'HIGH', 'confidence written');
 assert(decision[index(decisionHeaders, '自动Social摘要')] === '强 | reddit/youtube；主题:automation', 'social summary written');
-assert(decision[index(decisionHeaders, 'Social结果')] === '强', 'machine social result written');
+assert(decision[index(decisionHeaders, 'Social结果')] === '人工Social', 'manual social result preserved');
 assert(decision[index(decisionHeaders, 'SERP竞争')] === '低', 'machine serp competition written');
 assert(decision[index(decisionHeaders, '关键词机会')] === '有', 'machine keyword opportunity written');
 assert(decision[index(decisionHeaders, 'MachineDecision')] === 'BUILD', 'machine recommendation normalized');
 assert(decision[index(decisionHeaders, '自动SERP摘要')] === 'AVAILABLE | organic=10 | guide=LOW | video_ugc=yes | contamination=yes', 'SERP summary written');
-assert(decision[index(decisionHeaders, 'Google Trends结果')] === '强' && decision[index(decisionHeaders, 'Social结果')] === '强' && decision[index(decisionHeaders, 'SERP竞争')] === '低' && decision[index(decisionHeaders, '关键词机会')] === '有' && decision[index(decisionHeaders, 'Decision')] === 'WATCH' && decision[index(decisionHeaders, '人工备注')] === '人工备注', 'manual trends/decision preserved; machine overwrites social/serp/keyword');
+assert(decision[index(decisionHeaders, 'Google Trends结果')] === '强' && decision[index(decisionHeaders, 'Social结果')] === '人工Social' && decision[index(decisionHeaders, 'SERP竞争')] === '低' && decision[index(decisionHeaders, '关键词机会')] === '有' && decision[index(decisionHeaders, 'Decision')] === 'WATCH' && decision[index(decisionHeaders, '人工备注')] === '人工备注', 'manual research and decision fields are preserved');
+
+var incomplete = completedPayload();
+delete incomplete.machine_fields.trends_result;
+assert(post(incomplete).ok === false, 'callback without all research outputs cannot complete');
 
 var beforeRepeat = JSON.stringify(decision);
 var repeat = post(completedPayload());

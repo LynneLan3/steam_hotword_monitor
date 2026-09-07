@@ -219,7 +219,7 @@ sandbox.setupCandidateDecisionUi_(spreadsheet);
 assert(!decisionSheet.validations['2:24'], 'stale ResearchJobID validation cleared');
 
 var queued = sandbox.enqueueSteamCandidateResearchJobs_(spreadsheet, new Date('2026-08-26T01:00:00Z'));
-assert(queued.created === 1, 'eligible candidate enqueued');
+assert(queued.created === 2, 'eligible candidate and incomplete WATCH enqueued');
 assert(at(migratedHeaders, decisionSheet.rows[0], 'Next Action') === '合法旧动作', 'Next Action unchanged');
 assert(at(migratedHeaders, decisionSheet.rows[1], 'ResearchJobID') === 'steam-research-4948001-20260826', 'ResearchJobID written by header');
 assert(at(migratedHeaders, decisionSheet.rows[1], '自动研究状态') === 'PENDING', 'automatic status written by header');
@@ -247,8 +247,9 @@ assert(at(migratedHeaders, decisionSheet.rows[1], 'PreflightReason') === 'SERP r
 
 var rules = {RECHECK_GAIN_GROWTH_MIN: 0.30};
 var rec = {continueNext: '是', gain7d: 1000};
-assert(sandbox.decideTodayActionProjection_(rec, {status: 'BUILD'}, new Date('2026-08-26'), rules, spreadsheet).include === false, 'BUILD absent from Today Action');
+assert(sandbox.decideTodayActionProjection_(rec, {status: 'BUILD'}, new Date('2026-08-26'), rules, spreadsheet).type === 'BUILD', 'unfinished BUILD remains in Today Action');
 assert(sandbox.decideTodayActionProjection_(rec, {status: 'REJECT'}, new Date('2026-08-26'), rules, spreadsheet).include === false, 'REJECT absent from Today Action');
-assert(sandbox.decideTodayActionProjection_(rec, {status: 'WATCH', nextRecheckDate: '2026-09-01'}, new Date('2026-08-26'), rules, spreadsheet).type === 'WATCH_WAITING', 'WATCH_WAITING retained');
+assert(sandbox.decideTodayActionProjection_(rec, {status: 'WATCH', autoResearchStatus: 'PENDING'}, new Date('2026-08-26'), rules, spreadsheet).type === 'RESEARCHING', 'pending machine research overrides WATCH waiting');
+assert(sandbox.decideTodayActionProjection_(rec, {status: 'WATCH', autoResearchStatus: 'COMPLETED', nextRecheckDate: '2026-09-01'}, new Date('2026-08-26'), rules, spreadsheet).type === 'WATCH_WAITING', 'WATCH_WAITING retained');
 
 console.log('PASS scripts/test-candidate-schema-regression.js (migration, validation, header writes, repair, projection, idempotency)');

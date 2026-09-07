@@ -35,12 +35,20 @@ var context = {
     date.setHours(0, 0, 0, 0);
     return date;
   },
+  machineResearchPending_: function (decision) {
+    return !!decision && (!decision.autoResearchStatus || decision.autoResearchStatus === 'PENDING' || decision.autoResearchStatus === 'RUNNING');
+  },
+  machineResearchFailed_: function (decision) { return !!decision && decision.autoResearchStatus === 'FAILED'; },
+  machineResearchComplete_: function () { return false; },
   Number: Number
 };
 vm.runInNewContext(
   'var isFiniteNumber_ = this.isFiniteNumber_;\n' +
   'var normalizeDecisionStatus_ = this.normalizeDecisionStatus_;\n' +
-  'var dateAtStart_ = this.dateAtStart_;\n' + helperSource + '\n' + match[0],
+  'var dateAtStart_ = this.dateAtStart_;\n' +
+  'var machineResearchPending_ = this.machineResearchPending_;\n' +
+  'var machineResearchFailed_ = this.machineResearchFailed_;\n' +
+  'var machineResearchComplete_ = this.machineResearchComplete_;\n' + helperSource + '\n' + match[0],
   context
 );
 var decideTodayAction_ = context.decideTodayAction_;
