@@ -30,7 +30,7 @@ var today = new Date('2026-08-21T08:00:00+08:00');
 var rules = { RECHECK_GAIN_GROWTH_MIN: 0.30 };
 function action(rec, decision) { return decide(rec, decision, today, rules); }
 var base = { continueNext: '是', gain7d: 1000 };
-assert(action(base, null).humanAction === '检查 Google Trends', 'NEW action');
+assert(action(base, null).include === false, 'non-terminal NEW stays in candidate queue');
 assert(action(base, { status: 'BUILD' }).include === false, 'BUILD hidden');
 assert(action(base, { status: 'REJECT' }).include === false, 'REJECT hidden');
 assert(action(base, { status: 'WATCH', lastGain: 1000, nextRecheckDate: '2026-08-21' }).include === false, 'WATCH without new signal hidden');
@@ -49,7 +49,7 @@ assert(src.indexOf("decision.researchStatus = isHumanStage ? deriveResearchStatu
 assert(src.indexOf("decision.nextAction = 'None'") >= 0, 'excluded candidates next action None');
 assert(src.indexOf("candidateManualEvidenceNextAction_") >= 0, 'manual evidence determines next action');
 assert(src.indexOf("decision.nextAction = 'Recheck'") >= 0, 'WATCH next action Recheck');
-assert(src.indexOf("decision.nextAction = 'Site Build'") >= 0, 'BUILD next action Site Build');
+assert(src.indexOf('nextActionForBuildDecision_') >= 0, 'BUILD next action Site Build');
 assert(src.indexOf("decision.nextAction = 'None'") >= 0, 'REJECT next action None');
 assert(src.indexOf('function deriveResearchStatus_') >= 0, 'automatic research status');
 assert(src.indexOf('function deriveResearchCompletion_') >= 0, 'automatic research completion');
@@ -61,8 +61,8 @@ assert(actionBlock.indexOf("'今日动作'") < 0, 'no duplicate 今日动作');
 assert(actionBlock.indexOf("'Decision状态'") < 0, 'no duplicate Decision状态');
 assert(src.indexOf("row[0] || '').trim() === siteId") >= 0, 'Site ID dedupe');
 assert(src.indexOf("row[2] || '').trim() === normalizedAppId") >= 0, 'App ID dedupe');
-assert(src.indexOf('sheet.getRange(4, 1, Math.max(sheet.getMaxRows() - 3, 1), sheet.getMaxColumns()).clearDataValidations()') >= 0, 'old action validations cleared');
-assert(src.indexOf("const decisionCol = col('Decision')") >= 0, 'Decision validation follows header');
+assert(src.indexOf('const validationRange = sheet.getRange(4, 1') >= 0 && src.indexOf('validationRange.clearDataValidations()') >= 0, 'old action validations cleared');
+assert(src.indexOf("const decisionCol = column('Decision')") >= 0, 'Decision validation follows header');
 // Simulate the reported V3.3 migration: a stale W4 rule is cleared before the current Decision rule is applied.
 var actionHeaders = ['行动类型', '优先级', '游戏名称', 'Steam App ID', '第一轮类型', 'Steam Followers', 'Steam 7d Gain', '近似增长率', '发布阶段', 'Steam发布日期', '距发售天数', '评论数', 'Steam评分', '搜索别名', 'Google Trends链接', 'Trends结果', 'Social结果', 'SERP竞争', '关键词机会', 'Decision', '人工备注'];
 var validations = {23: ['BUILD', 'WATCH', 'REJECT']};

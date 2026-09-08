@@ -35,12 +35,12 @@ function assert(v, msg) { if (!v) throw new Error(msg); }
 function action(rec, decision) { return decide(rec, decision, today, rules); }
 var base = { continueNext: '是', gain7d: 1000 };
 
-assert(action(base, null).type === 'NEW', 'NEW enters action');
+assert(!action(base, null).include, 'non-terminal NEW stays in candidate queue');
 assert(!action(base, { status: 'BUILD' }).include, 'BUILD suppressed');
 assert(!action(base, { status: 'REJECT' }).include, 'REJECT suppressed');
 assert(!action(base, { status: 'WATCH', lastGain: 1000, nextRecheckDate: '2026-08-25' }).include, 'WATCH not due');
 assert(!action(base, { status: 'WATCH', lastGain: 1000, nextRecheckDate: '2026-08-21' }).include, 'WATCH due without trigger remains hidden');
-assert(action(base, { status: '', researchStatus: '已完成' }).type === 'RESEARCHING', 'researching enters');
+assert(!action(base, { status: '', researchStatus: '已完成' }).include, 'incomplete machine research stays out');
 assert(siteId('Twisted Tower™') === 'twisted-tower', 'stable Site ID');
 assert(siteId('Mortal Shell II') === 'mortal-shell-ii', 'stable Site ID 2');
 

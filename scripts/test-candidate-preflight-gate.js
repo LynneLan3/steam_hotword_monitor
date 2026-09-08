@@ -62,8 +62,8 @@ function check(decision, expected, label) {
 check(null, false, 'missing preflight');
 check({preflightVerdict: 'PENDING'}, false, 'pending preflight');
 check({preflightVerdict: 'AUTO_REJECT'}, false, 'auto reject');
-check({preflightVerdict: 'MANUAL_REVIEW', status: ''}, true, 'manual review');
-check({preflightVerdict: 'MANUAL_REVIEW', status: '', trendsResult: '弱'}, true, 'automatic research completes remaining evidence');
+check({preflightVerdict: 'MANUAL_REVIEW', status: ''}, false, 'manual review without terminal machine outputs');
+check({preflightVerdict: 'MANUAL_REVIEW', status: '', trendsResult: '弱'}, false, 'partial machine research remains queued');
 check({preflightVerdict: 'WATCH', status: 'WATCH', lastGain: 1000, nextRecheckDate: '2026-08-24'}, false, 'due watch without new signal');
 check({preflightVerdict: 'WATCH', status: 'WATCH', nextRecheckDate: '2026-08-30'}, false, 'future watch');
 check({preflightVerdict: 'WATCH', lastGain: 1000, nextRecheckDate: '2026-08-24'}, false, 'due automatic watch without new signal');

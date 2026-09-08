@@ -7892,11 +7892,18 @@ function decideTodayAction_(rec, decision, today, rules) {
   }
   const status = normalizeDecisionStatus_(decision && decision.status);
   if (!status) {
+    const autoResearchStatus = String(decision && decision.autoResearchStatus || '').trim().toUpperCase();
+    const pendingResearch = typeof machineResearchPending_ === 'function'
+      ? machineResearchPending_(decision)
+      : (!autoResearchStatus || autoResearchStatus === 'PENDING' || autoResearchStatus === 'RUNNING');
+    const failedResearch = typeof machineResearchFailed_ === 'function'
+      ? machineResearchFailed_(decision)
+      : autoResearchStatus === 'FAILED';
     const isManualReview = String(decision && decision.preflightVerdict || '').trim().toUpperCase() === 'MANUAL_REVIEW';
-    if (machineResearchPending_(decision)) {
+    if (pendingResearch) {
       return {include: false, reason: '机器研究未完成，继续留在候选队列'};
     }
-    if (machineResearchFailed_(decision)) {
+    if (failedResearch) {
       return {include: true, isWaiting: true, isTerminalFailure: true, type: 'RESEARCH_FAILED', reason: '机器研究失败', humanAction: candidateInboxHumanAction_(rec, decision)};
     }
     if (!isManualReview && candidateManualEvidenceNeedsNoProvider_(rec, decision, candidateExternalSignalIsNew_(decision))) return {include: false};
@@ -7956,12 +7963,21 @@ function isUnfinishedResearchValue_(value) {
 function deriveResearchStatus_(decision) {
   const status = normalizeDecisionStatus_(decision && decision.status);
   if (status) return '已完成';
-  if (machineResearchPending_(decision)) return '研究中';
-  if (machineResearchComplete_(decision)) {
-    return hasCompletedManualResearchValue_(decision && decision.trendsResult) ? '研究中' : '待研究';
+  const autoStatus = String(decision && decision.autoResearchStatus || '').trim().toUpperCase();
+  if (!autoStatus) {
+    const manualFields = [decision && decision.trendsResult, decision && decision.socialResult,
+      decision && decision.serpCompetition, decision && decision.keywordOpportunity];
+    return manualFields.every(isUnfinishedResearchValue_) ? '待研究' : '研究中';
   }
-  const fields = [decision && decision.trendsResult];
-  return fields.every(isUnfinishedResearchValue_) ? '待研究' : '研究中';
+  if (autoStatus === 'PENDING' || autoStatus === 'RUNNING') return '研究中';
+  const terminalFields = [
+    decision && decision.trendsResult, decision && decision.socialResult,
+    decision && decision.serpCompetition, decision && decision.keywordOpportunity,
+    decision && decision.autoRecommendation, decision && decision.autoRecommendationConfidence,
+    decision && decision.autoResearchResultPath, decision && decision.autoRecommendationResultPath
+  ];
+  if (autoStatus === 'COMPLETED' && terminalFields.every(hasCompletedManualResearchValue_)) return '已完成';
+  return '研究中';
 }
 
 function deriveResearchCompletion_(decision) {
