@@ -939,8 +939,11 @@ function formatMachineSocialDisplay_(decision) {
 }
 
 function candidateInboxHumanAction_(rec, decision) {
-  if (machineResearchPending_(decision)) return '机器研究中';
-  if (machineResearchFailed_(decision)) return '机器研究失败，待复查';
+  if (machineResearchPending_(decision)) return '机器研究未完成，留在候选队列';
+  if (machineResearchFailed_(decision)) {
+    const error = steamCandidateResearchCallbackString_(decision && decision.autoResearchError);
+    return error ? '机器研究失败：' + error : '机器研究失败：需要重试';
+  }
   if (!hasCompletedManualResearchValue_(decision && decision.trendsResult)) return '检查 Google Trends';
   if (!normalizeDecisionStatus_(decision && decision.status)) return '选择 BUILD / WATCH / REJECT';
   return '';
@@ -7891,27 +7894,24 @@ function decideTodayAction_(rec, decision, today, rules) {
   if (!status) {
     const isManualReview = String(decision && decision.preflightVerdict || '').trim().toUpperCase() === 'MANUAL_REVIEW';
     if (machineResearchPending_(decision)) {
-      return {include: true, type: 'RESEARCHING', reason: '机器研究进行中', humanAction: '机器研究中'};
+      return {include: false, reason: '机器研究未完成，继续留在候选队列'};
     }
     if (machineResearchFailed_(decision)) {
-      return {include: true, type: 'RESEARCHING', reason: '机器研究失败', humanAction: '机器研究失败，待复查'};
+      return {include: true, isWaiting: true, isTerminalFailure: true, type: 'RESEARCH_FAILED', reason: '机器研究失败', humanAction: candidateInboxHumanAction_(rec, decision)};
     }
     if (!isManualReview && candidateManualEvidenceNeedsNoProvider_(rec, decision, candidateExternalSignalIsNew_(decision))) return {include: false};
     const manualEvidenceAction = candidateManualEvidenceNextAction_(rec, decision, candidateExternalSignalIsNew_(decision));
     if (manualEvidenceAction === 'Recheck') return {include: false};
-    if (machineResearchComplete_(decision) || (decision && (decision.researchStatus === '研究中' || decision.researchStatus === '已完成'))) {
+    if (machineResearchComplete_(decision)) {
       const humanAction = candidateInboxHumanAction_(rec, decision);
       return {
         include: true,
-        type: machineResearchComplete_(decision) ? 'RESEARCHING' : 'RESEARCHING',
-        reason: machineResearchComplete_(decision) ? '机器研究完成，等待人工决定' : '人工研究尚未完成',
+        type: 'READY',
+        reason: '机器研究已完成，等待人工决定',
         humanAction: humanAction || '继续完成研究'
       };
     }
-    if (isManualReview && hasCompletedManualResearchValue_(decision && decision.trendsResult)) {
-      return {include: true, type: 'RESEARCHING', reason: 'Preflight要求人工继续研究', humanAction: candidateInboxHumanAction_(rec, decision)};
-    }
-    return {include: true, type: 'NEW', reason: '首次进入1B，尚无人工复查记录', humanAction: '检查 Google Trends'};
+    return {include: false, reason: isManualReview ? '机器研究未达到 terminal 输出要求' : '候选仍在机器研究队列'};
   }
   if (status === 'BUILD' || status === 'REJECT') return {include: false};
 
@@ -11077,14 +11077,19 @@ function decideTodayActionProjection_(rec, decision, today, rules, ss, siteCompl
       reason: 'Decision=BUILD，展示机器决定与推荐域名'
     };
   }
-  // A WATCH decision remains visible as research in progress until the
-  // callback has written every required machine result.
-  if (machineResearchPending_(decision) || machineResearchFailed_(decision)) {
+  // Pending work stays in the candidate queue. A real provider failure remains
+  // visible as an explicit terminal failure, never as an unchecked task.
+  if (machineResearchPending_(decision)) {
+    return {include: false, reason: '机器研究未完成，继续留在候选队列'};
+  }
+  if (machineResearchFailed_(decision)) {
     return {
       include: true,
-      type: 'RESEARCHING',
-      humanAction: machineResearchPending_(decision) ? '机器研究中' : '机器研究失败，待复查',
-      reason: machineResearchPending_(decision) ? '机器研究进行中' : '机器研究失败'
+      isWaiting: true,
+      isTerminalFailure: true,
+      type: 'RESEARCH_FAILED',
+      humanAction: candidateInboxHumanAction_(rec, decision),
+      reason: '机器研究失败'
     };
   }
   const action = decideTodayAction_(rec, decision, today, rules);

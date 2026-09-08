@@ -251,7 +251,7 @@ sandbox.syncCandidateDecisions_ = function () { throw new Error('candidate decis
 var result = sandbox.refreshTodayActionsFromCandidateDecisions();
 assert(result.ok, 'refresh succeeds');
 assert(result.beforePendingCount === 5, 'stale pending count measured');
-assert(result.afterPendingCount === 6, 'P2 master-only candidate, two manual reviews, and three pending machine jobs remain pending');
+assert(result.afterPendingCount === 0, 'pending machine jobs stay out of Today Action until terminal');
 assert(result.waitingCount === 0, 'unstarted machine-research WATCH rows are not shown as waiting');
 assert(runCalls === 0, 'manual refresh does not invoke runSteamHotword01B');
 assert(decisionSheet.writeCount === beforeDecisionWrites, '候选决策 has no writes');
@@ -275,26 +275,24 @@ assert(!find('4356430'), 'LIVE site-pool BUILD (NBA 2K27) is absent from 今日�
 assert(!find('1002'), 'REJECT is absent from 今日行动');
 assert(!find('1575990'), 'site-pool Twisted Tower is absent from 今日行动');
 assert(!find('4026250'), 'history-library Project P.I.T.T. is absent from 今日行动');
-['1003', '1004', '1005'].forEach(function (appId) {
-  var researching = find(appId);
-  assert(researching && researching[actionHeaders.indexOf('行动类型')] === 'RESEARCHING', appId + ' is researching');
-  assert(researching[actionHeaders.indexOf('人工决定')] === 'WATCH', appId + ' 人工决定 is authoritative');
-  assert(researching[actionHeaders.indexOf('人工动作')] === '机器研究中', appId + ' does not ask for Trends');
+['1003', '1004', '1005', '1006', '1007', '2825860'].forEach(function (appId) {
+  assert(!find(appId), appId + ' remains outside Today Action until terminal machine research');
 });
-var newManual = find('1006');
-assert(newManual[actionHeaders.indexOf('行动类型')] === 'RESEARCHING', 'new MANUAL_REVIEW waits for machine research');
-assert(newManual[actionHeaders.indexOf('人工动作')] === '机器研究中', 'new MANUAL_REVIEW shows machine research status');
-assert(newManual[actionHeaders.indexOf('人工决定')] === '', 'new MANUAL_REVIEW has no final 人工决定');
-var sinkingCity = find('2825860');
-assert(sinkingCity && sinkingCity[actionHeaders.indexOf('行动类型')] === 'RESEARCHING', 'P2 master-only candidate enters Today Action as machine research');
-assert(sinkingCity[actionHeaders.indexOf('游戏名称')] === 'The Sinking City 2', 'P2 real case name is preserved');
-assert(sinkingCity[actionHeaders.indexOf('第一轮类型')] === '🟡 Trend Watch', 'P2 type is preserved');
-assert(sinkingCity[actionHeaders.indexOf('人工动作')] === '机器研究中', 'P2 master-only candidate waits for machine research');
-var existingTrends = find('1007');
-assert(existingTrends[actionHeaders.indexOf('人工动作')] === '机器研究中', 'existing Trends still waits for machine research');
-assert(existingTrends[actionHeaders.indexOf('Trends结果')] === '强', 'existing Trends result is synchronized');
-assert(existingTrends[actionHeaders.indexOf('Trends结果')] !== '未检查', 'existing Trends is not reset');
-assert(find('1003')[actionHeaders.indexOf('人工备注')] === 'keep manual note', 'manual note is preserved');
+var terminalRec = {appId: 'terminal-1', continueNext: '是', firstRoundType: '🔥 趋势候选'};
+var terminalDecision = {
+  appId: 'terminal-1', currentStage: '1B完成→人工第二轮', status: '', autoResearchStatus: 'COMPLETED',
+  preflightVerdict: 'MANUAL_REVIEW',
+  trendsResult: '强', socialResult: '中', serpCompetition: '低', keywordOpportunity: '有',
+  autoRecommendation: 'RECOMMEND_BUILD', autoRecommendationConfidence: 'HIGH',
+  autoResearchResultPath: 'jobs/terminal/research.json', autoRecommendationResultPath: 'jobs/terminal/recommendation.json'
+};
+var readyProjection = sandbox.decideTodayActionProjection_(terminalRec, terminalDecision, new Date('2026-09-08T00:00:00Z'), {}, spreadsheet, new Map());
+assert(readyProjection.include && readyProjection.type === 'READY', 'terminal machine outputs become READY decision rows');
+var failedProjection = sandbox.decideTodayActionProjection_(terminalRec, Object.assign({}, terminalDecision, {
+  autoResearchStatus: 'FAILED', autoResearchError: 'searchapi_http_error'
+}), new Date('2026-09-08T00:00:00Z'), {}, spreadsheet, new Map());
+assert(failedProjection.include && failedProjection.isTerminalFailure, 'provider failure remains explicit terminal row');
+assert(failedProjection.humanAction.indexOf('searchapi_http_error') >= 0, 'terminal failure reason is visible');
 
 assert(source.indexOf("today_action_refresh: refreshTodayActionsFromCandidateDecisions_()") >= 0, 'preflight callback refresh hook');
 assert(source.indexOf('function candidateDecisionEditAffectsTodayAction_') >= 0, 'candidate decision edit hook');
