@@ -212,6 +212,9 @@ const HOTWORD_V2 = {
     '来源页码', '原始观察状态'
   ],
 
+  // G037 P1：append-only first-seen opportunity preflight fields.
+  opportunityPreflightHeaders: ['机会预检状态', '机会预检原因'],
+
   anomalyHeaders: [
     '运行时间', 'Run ID', 'Steam App ID', '游戏名称', '阶段', '异常类型', '异常详情', '建议动作', 'Steam URL'
   ],
@@ -1861,6 +1864,7 @@ function setupSteamHotwordV2On_(ss, options) {
   ensureSheetWithHeaders_(ss, HOTWORD_V2.sheets.master, HOTWORD_V2.masterHeaders);
   ensureSheetWithHeaders_(ss, HOTWORD_V2.sheets.candidateSnapshot, HOTWORD_V2.candidateSnapshotHeaders);
   ensureSheetWithHeaders_(ss, HOTWORD_V2.sheets.snapshot, HOTWORD_V2.snapshotHeaders);
+  ensureOpportunityPreflightColumns_(ss.getSheetByName(HOTWORD_V2.sheets.snapshot));
   ensureSheetWithHeaders_(ss, HOTWORD_V2.sheets.anomalies, HOTWORD_V2.anomalyHeaders);
   ensureSheetWithHeaders_(ss, HOTWORD_V2.sheets.log, HOTWORD_V2.logHeaders);
   ensureSheetWithHeaders_(ss, HOTWORD_V2.sheets.externalDataAttempts, HOTWORD_V2.externalDataAttemptHeaders);
@@ -4386,6 +4390,8 @@ function g010RawRecordsForRun_(ss, runId) {
       firstRoundReason: '', currentStage: '', dataStatus: 'OK', dataNotes: [],
       observationDataStatus: '', observationDataNotes: [], controlOnly: false,
       qualificationEligible: true, eligibilityReason: '', qualificationStatus: '',
+      opportunityPreflightStatus: field(row, '机会预检状态') || '',
+      opportunityPreflightReason: field(row, '机会预检原因') || '',
       _g010RawRowNumber: offset + 2
     });
   });
@@ -4529,8 +4535,33 @@ function g010AppendHistoricalRawLedger_(records, runTime, runId) {
   return {appended: rows.length, duplicates: duplicates, spreadsheetId: ledger.id, spreadsheetUrl: ledger.url};
 }
 
+function ensureOpportunityPreflightColumns_(sheet) {
+  if (!sheet) throw new Error('Steam_每日快照 不存在');
+  const fields = HOTWORD_V2.opportunityPreflightHeaders;
+  const width = Math.max(sheet.getLastColumn(), HOTWORD_V2.snapshotHeaders.length);
+  const headers = sheet.getRange(1, 1, 1, width).getDisplayValues()[0];
+  let lastColumn = width;
+  fields.forEach(field => {
+    if (headers.indexOf(field) >= 0) return;
+    lastColumn += 1;
+    if (sheet.getMaxColumns && lastColumn > sheet.getMaxColumns() && sheet.insertColumnsAfter) {
+      sheet.insertColumnsAfter(sheet.getMaxColumns(), 1);
+    }
+    sheet.getRange(1, lastColumn).setValue(field);
+    headers.push(field);
+  });
+  return {headers: headers, width: lastColumn};
+}
+
 function g010AppendRawPage_(ss, records, runTime, runId) {
   const sheet = ss.getSheetByName(HOTWORD_V2.sheets.snapshot);
+  ensureOpportunityPreflightColumns_(sheet);
+  const previousRaw = g010PreviousRawIndex_(ss, runId);
+  (records || []).forEach(rec => {
+    const preflight = firstSeenOpportunityPreflight_(rec, previousRaw.get(String(rec.appId)));
+    rec.opportunityPreflightStatus = preflight.status;
+    rec.opportunityPreflightReason = preflight.reason;
+  });
   const width = Math.max(sheet.getLastColumn(), HOTWORD_V2.snapshotHeaders.length);
   const headers = sheet.getRange(1, 1, 1, width).getDisplayValues()[0];
   const runCol = headers.indexOf('Run ID');
@@ -4549,7 +4580,7 @@ function g010AppendRawPage_(ss, records, runTime, runId) {
   });
   if (!unique.length) return {persisted: 0, rowByAppId: {}};
   const firstRow = sheet.getLastRow() + 1;
-  sheet.getRange(firstRow, 1, unique.length, HOTWORD_V2.snapshotHeaders.length)
+  sheet.getRange(firstRow, 1, unique.length, snapshotRow_(unique[0], runTime, runId).length)
     .setValues(unique.map(rec => snapshotRow_(rec, runTime, runId)));
   const rowByAppId = {};
   unique.forEach((rec, index) => { rowByAppId[String(rec.appId)] = firstRow + index; });
@@ -5053,6 +5084,11 @@ function runSteamHotword01BLegacy_() {
     // Read the prior ledger before appending this run, otherwise every item
     // would look historical and NEW_IN_SCOPE could never fire.
     const previousRaw = readLatestRawObservationIndex_(ss);
+    observations.forEach(rec => {
+      const preflight = firstSeenOpportunityPreflight_(rec, previousRaw.get(String(rec.appId)));
+      rec.opportunityPreflightStatus = preflight.status;
+      rec.opportunityPreflightReason = preflight.reason;
+    });
     const rawPersistence = appendSnapshots_(ss, observations, startedAt, runId);
     rawUniqueAppIdCount = rawPersistence.uniqueAppIds;
     rawPersistedCount = rawPersistence.persisted;
@@ -6340,6 +6376,28 @@ function evaluateQualificationEligibility_(rec, context) {
     return {eligible: true, reason: 'RECHECK'};
   }
   return {eligible: false, reason: 'UNCHANGED_SKIP'};
+}
+
+function firstSeenOpportunityPreflight_(rec, previousRaw) {
+  const scope = qualificationScopeStatus_(rec);
+  if (scope === 'SCOPE_UNKNOWN') {
+    return {status: 'SCOPE_UNKNOWN', reason: 'release stage/date unavailable'};
+  }
+  const inScope = scope === 'IN_SCOPE';
+  if (!previousRaw) {
+    return {
+      status: inScope ? 'FIRST_SEEN_IN_SCOPE' : 'FIRST_SEEN_OUT_OF_SCOPE',
+      reason: inScope ? 'first observation is inside qualification window' : 'first observation is outside qualification window'
+    };
+  }
+  const previousInScope = qualificationInScopeWindow_(previousRaw);
+  if (inScope && !previousInScope) {
+    return {status: 'ENTERED_SCOPE', reason: 'existing observation entered qualification window'};
+  }
+  return {
+    status: inScope ? 'IN_SCOPE_REPEAT' : 'OUT_OF_SCOPE_REPEAT',
+    reason: inScope ? 'repeat observation remains inside qualification window' : 'repeat observation remains outside qualification window'
+  };
 }
 
 function readLatestRawObservationIndex_(ss) {
@@ -10727,6 +10785,7 @@ function masterRow_(rec, runTime, firstSeen, runId, manualNote) {
 
 function appendSnapshots_(ss, records, runTime, runId) {
   const sheet = ss.getSheetByName(HOTWORD_V2.sheets.snapshot);
+  ensureOpportunityPreflightColumns_(sheet);
   const uniqueRecords = [];
   const seenAppIds = new Set();
   (records || []).forEach(rec => {
@@ -10746,7 +10805,7 @@ function appendSnapshots_(ss, records, runTime, runId) {
 
   const rows = uniqueRecords.map(rec => snapshotRow_(rec, runTime, runId));
   const firstRow = sheet.getLastRow() + 1;
-  sheet.getRange(firstRow, 1, rows.length, HOTWORD_V2.snapshotHeaders.length).setValues(rows);
+  sheet.getRange(firstRow, 1, rows.length, rows[0].length).setValues(rows);
   const rowByAppId = {};
   uniqueRecords.forEach((rec, index) => {
     rowByAppId[String(rec.appId)] = firstRow + index;
@@ -10872,16 +10931,19 @@ function snapshotRow_(rec, runTime, runId) {
     rec.observationDataStatus || rec.dataStatus,
     rec.dataNotes.concat(rec.observationDataNotes || []).join(' | '),
     rec.sourcePage || '',
-    rec.rawStatus || 'RAW_ONLY'
+    rec.rawStatus || 'RAW_ONLY',
+    rec.opportunityPreflightStatus || '',
+    rec.opportunityPreflightReason || ''
   ];
 }
 
 function updateSnapshots_(ss, records, runTime, runId, rowByAppId, skipIdentityCheck) {
   const sheet = ss.getSheetByName(HOTWORD_V2.sheets.snapshot);
+  ensureOpportunityPreflightColumns_(sheet);
   const updated = [];
   const skipped = [];
   const refs = rowByAppId || {};
-  const width = HOTWORD_V2.snapshotHeaders.length;
+  const width = Math.max(sheet.getLastColumn(), HOTWORD_V2.snapshotHeaders.length);
 
   records.forEach(rec => {
     const rowNumber = Number(refs[String(rec.appId)] || 0);
