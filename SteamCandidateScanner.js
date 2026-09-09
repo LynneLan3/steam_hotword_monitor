@@ -940,10 +940,7 @@ function formatMachineSocialDisplay_(decision) {
 
 function candidateInboxHumanAction_(rec, decision) {
   if (machineResearchPending_(decision)) return '机器研究未完成，留在候选队列';
-  if (machineResearchFailed_(decision)) {
-    const error = steamCandidateResearchCallbackString_(decision && decision.autoResearchError);
-    return error ? '机器研究失败：' + error : '机器研究失败：需要重试';
-  }
+  if (machineResearchFailed_(decision)) return '';
   if (!hasCompletedManualResearchValue_(decision && decision.trendsResult)) return '检查 Google Trends';
   if (!normalizeDecisionStatus_(decision && decision.status)) return '选择 BUILD / WATCH / REJECT';
   return '';
@@ -7904,7 +7901,7 @@ function decideTodayAction_(rec, decision, today, rules) {
       return {include: false, reason: '机器研究未完成，继续留在候选队列'};
     }
     if (failedResearch) {
-      return {include: true, isWaiting: true, isTerminalFailure: true, type: 'RESEARCH_FAILED', reason: '机器研究失败', humanAction: candidateInboxHumanAction_(rec, decision)};
+      return {include: false, reason: '机器研究失败，保留候选决策并等待自动重试'};
     }
     if (!isManualReview && candidateManualEvidenceNeedsNoProvider_(rec, decision, candidateExternalSignalIsNew_(decision))) return {include: false};
     const manualEvidenceAction = candidateManualEvidenceNextAction_(rec, decision, candidateExternalSignalIsNew_(decision));
@@ -9238,6 +9235,7 @@ function enqueueSteamCandidateResearchJobs_(ss, createdAt) {
     // M7E V1 is one-shot per Steam App ID. An existing ResearchJobID means
     // this candidate has already entered the paid research lifecycle.
     if (String(decision.researchJobId || '').trim() &&
+        !machineResearchFailed_(decision) &&
         !(STEAM_PREFLIGHT_ENABLED && steamCandidatePreflightDue_(decision, now))) {
       skipped += 1;
       return;
@@ -11093,20 +11091,13 @@ function decideTodayActionProjection_(rec, decision, today, rules, ss, siteCompl
       reason: 'Decision=BUILD，展示机器决定与推荐域名'
     };
   }
-  // Pending work stays in the candidate queue. A real provider failure remains
-  // visible as an explicit terminal failure, never as an unchecked task.
+  // Pending and failed work stay in the candidate queue; only completed
+  // machine research can become a human decision task.
   if (machineResearchPending_(decision)) {
     return {include: false, reason: '机器研究未完成，继续留在候选队列'};
   }
   if (machineResearchFailed_(decision)) {
-    return {
-      include: true,
-      isWaiting: true,
-      isTerminalFailure: true,
-      type: 'RESEARCH_FAILED',
-      humanAction: candidateInboxHumanAction_(rec, decision),
-      reason: '机器研究失败'
-    };
+    return {include: false, reason: '机器研究失败，保留候选决策并等待自动重试'};
   }
   const action = decideTodayAction_(rec, decision, today, rules);
   if (action.include) return action;

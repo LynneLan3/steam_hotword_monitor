@@ -179,6 +179,10 @@ for (var genericIndex = 0; genericIndex < 140; genericIndex += 1) {
 masterRows.push(master('4356430', 'NBA 2K27', 1000));
 decisionRows.push(decision('4356430', 'NBA 2K27', {Decision: 'BUILD', PreflightVerdict: 'MANUAL_REVIEW'}));
 assert(decisionRows.length === 149 && masterRows.length === 152, 'fixture includes P2 and lifecycle-only handled candidates');
+masterRows.push(master('1009', 'Failed Machine Research', 1000));
+decisionRows.push(decision('1009', 'Failed Machine Research', {
+  autoResearchStatus: 'FAILED', autoResearchError: 'searchapi_http_429'
+}));
 var rules = new FakeSheet('规则配置', ['规则Key', '当前值'], [
   ['RECHECK_GAIN_GROWTH_MIN', 0.30], ['WATCH_RECHECK_DAYS_STRONG', 3], ['WATCH_RECHECK_DAYS_NORMAL', 7]
 ]);
@@ -278,6 +282,7 @@ assert(!find('4026250'), 'history-library Project P.I.T.T. is absent from 今日
 ['1003', '1004', '1005', '1006', '1007', '2825860'].forEach(function (appId) {
   assert(!find(appId), appId + ' remains outside Today Action until terminal machine research');
 });
+assert(!find('1009'), 'FAILED machine research remains outside Today Action');
 var terminalRec = {appId: 'terminal-1', continueNext: '是', firstRoundType: '🔥 趋势候选'};
 var terminalDecision = {
   appId: 'terminal-1', currentStage: '1B完成→人工第二轮', status: '', autoResearchStatus: 'COMPLETED',
@@ -291,8 +296,10 @@ assert(readyProjection.include && readyProjection.type === 'READY', 'terminal ma
 var failedProjection = sandbox.decideTodayActionProjection_(terminalRec, Object.assign({}, terminalDecision, {
   autoResearchStatus: 'FAILED', autoResearchError: 'searchapi_http_error'
 }), new Date('2026-09-08T00:00:00Z'), {}, spreadsheet, new Map());
-assert(failedProjection.include && failedProjection.isTerminalFailure, 'provider failure remains explicit terminal row');
-assert(failedProjection.humanAction.indexOf('searchapi_http_error') >= 0, 'terminal failure reason is visible');
+assert(!failedProjection.include, 'provider failure remains outside Today Action');
+assert(sandbox.candidateInboxHumanAction_(terminalRec, {
+  autoResearchStatus: 'FAILED', autoResearchError: 'searchapi_http_error'
+}) === '', 'FAILED machine research has no human task');
 
 assert(source.indexOf("today_action_refresh: refreshTodayActionsFromCandidateDecisions_()") >= 0, 'preflight callback refresh hook');
 assert(source.indexOf('function candidateDecisionEditAffectsTodayAction_') >= 0, 'candidate decision edit hook');

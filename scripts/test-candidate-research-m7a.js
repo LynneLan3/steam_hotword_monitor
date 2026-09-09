@@ -208,7 +208,9 @@ var second = sandbox.enqueueSteamCandidateResearchJobs_(spreadsheet, new Date('2
 assert(second.created === 0, 'same AppID does not create a second job');
 
 var next = sandbox.enqueueSteamCandidateResearchJobs_(spreadsheet, new Date('2026-08-24T01:00:00Z'));
-assert(next.created === 0, 'cross-day scan does not create a new one-shot job');
+assert(next.created === 1, 'FAILED candidate is eligible for a next-cycle retry');
+assert(next.jobs[0].steam_app_id === '4026253', 'retry preserves failed candidate identity');
+assert(next.jobs[0].job_id === 'steam-research-4026253-20260824', 'retry receives the next cycle job id');
 assert(decision[23] === 'steam-research-4026250-20260823', 'original job id remains across days');
 assert(decision[15] === '人工Social' && decision[19] === '', 'manual fields remain unchanged');
 assert(decision[26] === 'existing social summary', 'automatic Social field is preserved');
@@ -216,7 +218,8 @@ assert(decision[27] === 'existing serp summary', 'automatic SERP field is preser
 assert(decision[29] === 'RECOMMEND_WATCH' && decision[33] === 'existing recommendation path', 'automatic recommendation fields are preserved');
 assert(completedDecision[index(decisionHeaders, 'ResearchJobID')] !== '', 'completed job has ResearchJobID');
 assert(failedDecision[index(decisionHeaders, 'ResearchJobID')] !== '', 'failed job has ResearchJobID');
-assert(next.created === 0, 'PENDING/COMPLETED/FAILED jobs are never auto-retried');
+assert(failedDecision[index(decisionHeaders, 'ResearchJobID')] === 'steam-research-4026253-20260824', 'failed job id is replaced for retry');
+assert(failedDecision[index(decisionHeaders, '自动研究状态')] === 'PENDING', 'retry reopens automatic research');
 assert(buildDecision[index(decisionHeaders, 'ResearchJobID')] === '', 'manual BUILD is not enqueued');
 assert(watchDecision[index(decisionHeaders, 'ResearchJobID')] !== '', 'incomplete WATCH is enqueued');
 assert(rejectDecision[index(decisionHeaders, 'ResearchJobID')] === '', 'manual REJECT is not enqueued');
@@ -247,14 +250,14 @@ decisionRows.push(weakManualDecision, watchNoGrowthDecision, watchGrowthDecision
 
 var beforeGetWrites = writes;
 var pending = sandbox.loadPendingSteamCandidateResearchJobs_();
-assert(pending.length === 5, 'GET loader keeps incomplete WATCH research but suppresses final WATCH without a new signal');
+assert(pending.length === 6, 'GET loader keeps retried and incomplete WATCH research but suppresses final WATCH without a new signal');
 assert(pending[0].steam_app_id === '4026250', 'GET contract AppID');
 assert(pending.some(function (job) { return job.steam_app_id === '4026262'; }), 'GET allows WATCH with 30 percent growth');
 assert(pending[0].steam_url.indexOf('/4026250/') >= 0, 'GET contract Steam URL');
 assert(pending[0].steam_signals.steam_score === null, 'missing facts remain null');
 assert(pending[0].manual_signals.keyword_opportunity === '人工关键词', 'GET preserves manual input');
 var getResponse = sandbox.doGet({parameter: {action: 'pendingSteamCandidateResearchJobs'}});
-assert(JSON.parse(getResponse.text).jobs.length === 5, 'GET endpoint returns the gated pending contract');
+assert(JSON.parse(getResponse.text).jobs.length === 6, 'GET endpoint returns the gated pending contract');
 assert(JSON.parse(getResponse.text).jobs[0].steam_app_id === '4026250', 'GET excludes manually decided and no-longer-eligible jobs');
 assert(writes === beforeGetWrites, 'GET loader is read-only');
 

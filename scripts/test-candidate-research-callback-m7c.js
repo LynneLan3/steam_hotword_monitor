@@ -284,6 +284,20 @@ assert(decision[index(decisionHeaders, '自动研究错误')] === 'provider unav
 assert(decision[index(decisionHeaders, 'Decision')] === 'WATCH', 'failed callback does not modify Decision');
 assert(JSON.stringify(decisionRows).indexOf(token) < 0, 'token never written to Sheet');
 
+var retryQueue = sandbox.enqueueSteamCandidateResearchJobs_(spreadsheet, new Date('2026-08-24T02:00:00Z'));
+assert(retryQueue.created === 1, 'FAILED callback candidate is retry-eligible next cycle');
+assert(decision[index(decisionHeaders, 'ResearchJobID')] === 'steam-research-4026250-20260824', 'retry gets a new job id');
+assert(decision[index(decisionHeaders, '自动研究状态')] === 'PENDING', 'retry returns candidate to PENDING');
+var retryCompleted = completedPayload();
+retryCompleted.job_id = 'steam-research-4026250-20260824';
+retryCompleted.research_cycle_date = '2026-08-24';
+retryCompleted.research_result_path = 'jobs/steam-research-4026250-20260824/steam_candidate_research_result.json';
+retryCompleted.recommendation_result_path = 'jobs/steam-research-4026250-20260824/steam_candidate_recommendation.json';
+retryCompleted.completed_at = '2026-08-24T03:00:00Z';
+assert(post(retryCompleted).ok === true, 'retry completed callback accepted');
+assert(decision[index(decisionHeaders, '自动研究状态')] === 'COMPLETED', 'retry completed callback restores terminal success');
+assert(decision[index(decisionHeaders, '自动Recommendation')] === 'RECOMMEND_BUILD', 'retry completed callback restores machine fields');
+
 var beforeGetWrites = writes;
 var getResponse = sandbox.doGet({parameter: {action: 'pendingSteamCandidateResearchJobs'}});
 assert(JSON.parse(getResponse.text).jobs.length === 0, 'GET does not return failed callback as pending');
