@@ -314,14 +314,81 @@ var staleCurrentCycleDecision = candidateDecision('4026266', 'Stale Current Cycl
   '自动研究时间': '2026-08-27T08:00:00Z'
 });
 var rogueMaster = candidateMaster('4026265', 'No Research Job Game', '是');
-masterRows.push(staleMaster, incompleteMaster, staleCurrentCycleMaster, rogueMaster);
-decisionRows.push(staleDecision, incompleteDecision, staleCurrentCycleDecision);
+var excludedPendingMaster = candidateMaster('4026267', '1A Excluded Pending', '否');
+excludedPendingMaster[index(masterHeaders, '1A结果')] = '❌ 排除';
+var excludedPendingDecision = candidateDecision('4026267', '1A Excluded Pending', {
+  ResearchJobID: 'steam-research-4026267-20200101', '自动研究状态': 'PENDING'
+});
+var buildPendingMaster = candidateMaster('4026268', 'Build Pending', '是');
+var buildPendingDecision = candidateDecision('4026268', 'Build Pending', {
+  ResearchJobID: 'steam-research-4026268-20200101', '自动研究状态': 'PENDING', Decision: 'BUILD'
+});
+var rejectPendingMaster = candidateMaster('4026269', 'Reject Pending', '是');
+var rejectPendingDecision = candidateDecision('4026269', 'Reject Pending', {
+  ResearchJobID: 'steam-research-4026269-20200101', '自动研究状态': 'PENDING', Decision: 'REJECT'
+});
+masterRows.push(
+  staleMaster, incompleteMaster, staleCurrentCycleMaster, rogueMaster,
+  excludedPendingMaster, buildPendingMaster, rejectPendingMaster
+);
+decisionRows.push(
+  staleDecision, incompleteDecision, staleCurrentCycleDecision,
+  excludedPendingDecision, buildPendingDecision, rejectPendingDecision
+);
+
 var repaired = sandbox.repairStalePendingResearchJobs_(spreadsheet);
-assert(repaired.stalePending >= 1 && repaired.incompleteCompleted >= 1, 'stale PENDING and empty COMPLETED are reopened');
+assert(repaired.preservedEligiblePending >= 2, 'stale eligible PENDING rows are preserved');
+assert(repaired.incompleteCompleted >= 1, 'empty COMPLETED still reopens for eligible candidates');
+assert(repaired.closedIneligible >= 3, '1A excluded / BUILD / REJECT pending are closed');
+assert(staleDecision[index(decisionHeaders, 'ResearchJobID')] === 'steam-research-4026263-20200101',
+  'stale eligible PENDING keeps original ResearchJobID');
+assert(staleDecision[index(decisionHeaders, '自动研究状态')] === 'PENDING',
+  'stale eligible PENDING stays PENDING');
+assert(staleCurrentCycleDecision[index(decisionHeaders, 'ResearchJobID')] === 'steam-research-4026266-20260907',
+  'date-stale eligible PENDING keeps original ResearchJobID');
+assert(excludedPendingDecision[index(decisionHeaders, '自动研究状态')] === '',
+  '1A excluded leaves active research pending');
+assert(excludedPendingDecision[index(decisionHeaders, 'ResearchJobID')] === 'steam-research-4026267-20200101',
+  '1A excluded keeps historical ResearchJobID');
+assert(buildPendingDecision[index(decisionHeaders, '自动研究状态')] === '',
+  'BUILD leaves active research pending');
+assert(rejectPendingDecision[index(decisionHeaders, '自动研究状态')] === '',
+  'REJECT leaves active research pending');
+
 var repairedQueue = sandbox.enqueueSteamCandidateResearchJobs_(spreadsheet, new Date());
-assert(repairedQueue.jobs.some(function (job) { return job.steam_app_id === '4026263'; }), 'stale PENDING gets a new job');
-assert(repairedQueue.jobs.some(function (job) { return job.steam_app_id === '4026266'; }), 'old PENDING is retried despite a current-cycle Job ID');
-assert(repairedQueue.jobs.some(function (job) { return job.steam_app_id === '4026264'; }), 'empty COMPLETED gets a new job');
-assert(repairedQueue.jobs.some(function (job) { return job.steam_app_id === '4026265'; }), 'eligible candidate without a decision gets a job');
-assert(decisionRows.filter(function (item) { return item[index(decisionHeaders, 'Steam App ID')] === '4026265'; }).length === 1, 'missing decision is created once by Steam App ID');
+assert(!repairedQueue.jobs.some(function (job) { return job.steam_app_id === '4026263'; }),
+  'eligible stale PENDING is not rebuilt with a new job');
+assert(!repairedQueue.jobs.some(function (job) { return job.steam_app_id === '4026266'; }),
+  'date-stale eligible PENDING is not re-enqueued');
+assert(!repairedQueue.jobs.some(function (job) { return job.steam_app_id === '4026267'; }),
+  '1A excluded is not enqueued into active research');
+assert(!repairedQueue.jobs.some(function (job) { return job.steam_app_id === '4026268'; }),
+  'BUILD is not enqueued into active research');
+assert(!repairedQueue.jobs.some(function (job) { return job.steam_app_id === '4026269'; }),
+  'REJECT is not enqueued into active research');
+assert(repairedQueue.jobs.some(function (job) { return job.steam_app_id === '4026264'; }),
+  'empty COMPLETED gets a new job');
+assert(repairedQueue.jobs.some(function (job) { return job.steam_app_id === '4026265'; }),
+  'eligible candidate without a decision gets a job');
+assert(decisionRows.filter(function (item) { return item[index(decisionHeaders, 'Steam App ID')] === '4026265'; }).length === 1,
+  'missing decision is created once by Steam App ID');
+
+sandbox.refreshTodayActionsFromCandidateDecisions_ = function () {
+  return {ok: true, stubbed: true};
+};
+var beforeReconcileJobId = staleDecision[index(decisionHeaders, 'ResearchJobID')];
+var beforeReconcileStatus = staleDecision[index(decisionHeaders, '自动研究状态')];
+var reconcile = sandbox.reconcileSteamCandidateResearchPendingBacklog_(spreadsheet);
+assert(reconcile.ok === true, 'reconciliation succeeds');
+assert(reconcile.preview && reconcile.preview.ok === true, 'reconciliation includes read-only preview');
+assert(reconcile.backlog.preservedEligiblePending >= 1, 'reconciliation reports preserved eligible pending');
+assert(staleDecision[index(decisionHeaders, 'ResearchJobID')] === beforeReconcileJobId,
+  'reconciliation does not mint a new ResearchJobID for eligible pending');
+assert(staleDecision[index(decisionHeaders, '自动研究状态')] === beforeReconcileStatus,
+  'reconciliation leaves eligible PENDING untouched');
+assert(reconcile.refresh && reconcile.refresh.ok === true, 'reconciliation rebuilds Today Action');
+var afterReconcileQueue = sandbox.enqueueSteamCandidateResearchJobs_(spreadsheet, new Date());
+assert(!afterReconcileQueue.jobs.some(function (job) { return job.steam_app_id === '4026263'; }),
+  'reconciliation does not cause duplicate enqueue of eligible pending');
+
 console.log('PASS scripts/test-candidate-research-m7a.js');

@@ -2741,32 +2741,204 @@ function forceEnqueueProductionResearch_(ss, appIds, createdAt) {
   return result;
 }
 
+/**
+ * Reasons a PENDING research row must leave the active queue. Reuses the same
+ * master / Decision gates as enqueue and the pending loader — not date stale.
+ * @return {string} empty when the row may remain active PENDING
+ */
+function candidateActiveResearchPendingCloseReason_(decision, masterRow, masterCol) {
+  if (!decision) return 'decision_missing';
+  if (!masterRow || !masterCol) return 'master_missing';
+  const continueNext = String(masterRow[masterCol['进入下一步']] || '').trim();
+  if (continueNext !== '是') return 'continue_next_not_yes';
+  const oneAResult = String(masterRow[masterCol['1A结果']] || '').trim();
+  if (oneAResult && !STEAM_CANDIDATE_1A_PASS_RESULTS[oneAResult]) return 'one_a_excluded';
+  const persistedStatus = normalizeDecisionStatus_(decision.status);
+  if (persistedStatus === 'BUILD') return 'decision_build';
+  if (persistedStatus === 'REJECT') return 'decision_reject';
+  return '';
+}
+
+function buildMasterRowIndexByAppId_(ss) {
+  const masterSheet = ss && ss.getSheetByName ? ss.getSheetByName(HOTWORD_V2.sheets.master) : null;
+  const masterCol = {};
+  HOTWORD_V2.masterHeaders.forEach((name, index) => { masterCol[name] = index; });
+  const byAppId = new Map();
+  if (!masterSheet || masterSheet.getLastRow() < 2) return {masterCol: masterCol, byAppId: byAppId};
+  masterSheet.getRange(2, 1, masterSheet.getLastRow() - 1, HOTWORD_V2.masterHeaders.length).getValues()
+    .forEach(row => {
+      const appId = String(row[masterCol['Steam App ID']] || '').trim();
+      if (appId) byAppId.set(appId, row);
+    });
+  return {masterCol: masterCol, byAppId: byAppId};
+}
+
+/**
+ * Minimal close: leave ResearchJobID history, clear active PENDING vocabulary
+ * so workers / enqueue stop treating the row as live research.
+ */
+function closeIneligibleActiveResearchPendingRow_(decisionSheet, decision, columnMap, reason) {
+  const jobId = String(decision.researchJobId || '').trim();
+  candidateDecisionSetField_(decisionSheet, decision.rowNumber, '自动研究状态', '', columnMap);
+  if (String(decision.preflightVerdict || '').trim().toUpperCase() === 'PENDING') {
+    candidateDecisionSetField_(decisionSheet, decision.rowNumber, 'PreflightVerdict', '', columnMap);
+    decision.preflightVerdict = '';
+  }
+  decision.autoResearchStatus = '';
+  return {appId: decision.appId, name: decision.name, researchJobId: jobId, reason: reason};
+}
+
+/**
+ * Close PENDING rows that fail the existing eligibility gates. Does not mint
+ * new ResearchJobIDs and does not touch still-eligible PENDING rows.
+ */
+function closeIneligibleActiveResearchPending_(ss) {
+  const result = {closed: 0, rows: []};
+  const decisionSheet = ss && ss.getSheetByName ? ss.getSheetByName(HOTWORD_V2.sheets.decisions) : null;
+  if (!decisionSheet || decisionSheet.getLastRow() < 2) return result;
+  const columnMap = candidateDecisionColumnMap_(decisionSheet);
+  const masterIndex = buildMasterRowIndexByAppId_(ss);
+  readCandidateDecisions_(ss).forEach(decision => {
+    const status = String(decision.autoResearchStatus || '').trim().toUpperCase();
+    if (status !== STEAM_CANDIDATE_RESEARCH_PENDING) return;
+    const masterRow = masterIndex.byAppId.get(String(decision.appId || '').trim());
+    const reason = candidateActiveResearchPendingCloseReason_(decision, masterRow, masterIndex.masterCol);
+    if (!reason) return;
+    result.rows.push(closeIneligibleActiveResearchPendingRow_(decisionSheet, decision, columnMap, reason));
+    result.closed += 1;
+  });
+  return result;
+}
+
 function repairStalePendingResearchJobs_(ss) {
-  const result = {repaired: 0, stalePending: 0, incompleteCompleted: 0, rows: []};
+  const result = {
+    repaired: 0,
+    stalePending: 0,
+    incompleteCompleted: 0,
+    closedIneligible: 0,
+    preservedEligiblePending: 0,
+    rows: []
+  };
   const decisionSheet = ss.getSheetByName(HOTWORD_V2.sheets.decisions);
   if (!decisionSheet || decisionSheet.getLastRow() < 2) return result;
   const columnMap = candidateDecisionColumnMap_(decisionSheet);
+  const masterIndex = buildMasterRowIndexByAppId_(ss);
   const now = new Date();
   const cycleDate = steamCandidateResearchDateString_(now, ss).replace(/-/g, '');
   const today = dateAtStart_(now);
+  // Always drop clearly invalid PENDING before any stale / reopen logic.
+  const closed = closeIneligibleActiveResearchPending_(ss);
+  result.closedIneligible = closed.closed;
+  closed.rows.forEach(row => {
+    result.rows.push(Object.assign({action: 'CLOSED_INELIGIBLE'}, row));
+  });
   readCandidateDecisions_(ss).forEach(decision => {
     const status = String(decision.autoResearchStatus || '').trim().toUpperCase();
     const jobId = String(decision.researchJobId || '').trim();
-    const queuedAt = dateAtStart_(decision.autoResearchTime);
+    const masterRow = masterIndex.byAppId.get(String(decision.appId || '').trim());
+    const closeReason = candidateActiveResearchPendingCloseReason_(decision, masterRow, masterIndex.masterCol);
     const stalePending = status === STEAM_CANDIDATE_RESEARCH_PENDING && jobId &&
-      (jobId.indexOf(cycleDate) < 0 || !queuedAt || queuedAt.getTime() < today.getTime());
-    const incompleteCompleted = status === STEAM_CANDIDATE_RESEARCH_EXEC_COMPLETED && !machineResearchOutputsComplete_(decision);
-    if (!stalePending && !incompleteCompleted) return;
+      (jobId.indexOf(cycleDate) < 0 || !dateAtStart_(decision.autoResearchTime) ||
+        dateAtStart_(decision.autoResearchTime).getTime() < today.getTime());
+    const incompleteCompleted = status === STEAM_CANDIDATE_RESEARCH_EXEC_COMPLETED &&
+      !machineResearchOutputsComplete_(decision);
+    if (status === STEAM_CANDIDATE_RESEARCH_PENDING && jobId && !closeReason) {
+      // Still-eligible PENDING keeps its ResearchJobID for the existing worker.
+      if (stalePending) {
+        result.preservedEligiblePending += 1;
+        result.rows.push({
+          appId: decision.appId,
+          name: decision.name,
+          researchJobId: jobId,
+          action: 'PRESERVED_ELIGIBLE_PENDING',
+          reason: 'STALE_PENDING'
+        });
+      }
+      return;
+    }
+    if (!incompleteCompleted || closeReason) return;
+    // Only eligible incomplete COMPLETED rows reopen into PENDING for enqueue.
     candidateDecisionSetField_(decisionSheet, decision.rowNumber, 'ResearchJobID', '', columnMap);
     candidateDecisionSetField_(decisionSheet, decision.rowNumber, '自动研究状态', STEAM_CANDIDATE_RESEARCH_PENDING, columnMap);
     candidateDecisionSetField_(decisionSheet, decision.rowNumber, 'PreflightVerdict', STEAM_PREFLIGHT_ENABLED ? 'PENDING' : '', columnMap);
+    decision.researchJobId = '';
+    decision.autoResearchStatus = STEAM_CANDIDATE_RESEARCH_PENDING;
     result.repaired += 1;
-    if (stalePending) result.stalePending += 1;
-    if (incompleteCompleted) result.incompleteCompleted += 1;
-    result.rows.push({appId: decision.appId, name: decision.name, clearedJobId: jobId,
-      reason: stalePending ? 'STALE_PENDING' : 'INCOMPLETE_COMPLETED'});
+    result.incompleteCompleted += 1;
+    result.rows.push({
+      appId: decision.appId,
+      name: decision.name,
+      clearedJobId: jobId,
+      action: 'REOPEN_INCOMPLETE_COMPLETED',
+      reason: 'INCOMPLETE_COMPLETED'
+    });
   });
   return result;
+}
+
+/**
+ * Idempotent one-shot backlog reconciliation: close invalid PENDING, preserve
+ * eligible ResearchJobIDs, rebuild 今日行动. Does not enqueue new jobs.
+ */
+function inspectSteamCandidateResearchPendingBacklog_(ss) {
+  ss = ss || SpreadsheetApp.getActiveSpreadsheet();
+  const result = {
+    ok: true,
+    pendingTotal: 0,
+    wouldClose: 0,
+    wouldPreserve: 0,
+    closeReasons: {},
+    rows: []
+  };
+  if (!ss) return {ok: false, error: 'spreadsheet_missing'};
+  const masterIndex = buildMasterRowIndexByAppId_(ss);
+  readCandidateDecisions_(ss).forEach(decision => {
+    const status = String(decision.autoResearchStatus || '').trim().toUpperCase();
+    if (status !== STEAM_CANDIDATE_RESEARCH_PENDING) return;
+    const jobId = String(decision.researchJobId || '').trim();
+    result.pendingTotal += 1;
+    const masterRow = masterIndex.byAppId.get(String(decision.appId || '').trim());
+    const reason = candidateActiveResearchPendingCloseReason_(decision, masterRow, masterIndex.masterCol);
+    if (reason) {
+      result.wouldClose += 1;
+      result.closeReasons[reason] = (result.closeReasons[reason] || 0) + 1;
+      result.rows.push({
+        appId: decision.appId,
+        name: decision.name,
+        researchJobId: jobId,
+        action: 'WOULD_CLOSE',
+        reason: reason
+      });
+      return;
+    }
+    result.wouldPreserve += 1;
+    result.rows.push({
+      appId: decision.appId,
+      name: decision.name,
+      researchJobId: jobId,
+      action: 'WOULD_PRESERVE'
+    });
+  });
+  return result;
+}
+
+function reconcileSteamCandidateResearchPendingBacklog_(ss) {
+  ss = ss || SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) return {ok: false, error: 'spreadsheet_missing'};
+  const preview = inspectSteamCandidateResearchPendingBacklog_(ss);
+  const backlog = repairStalePendingResearchJobs_(ss);
+  if (typeof SpreadsheetApp !== 'undefined' && SpreadsheetApp.flush) SpreadsheetApp.flush();
+  const refresh = refreshTodayActionsFromCandidateDecisions_(ss);
+  if (typeof SpreadsheetApp !== 'undefined' && SpreadsheetApp.flush) SpreadsheetApp.flush();
+  return {ok: true, preview: preview, backlog: backlog, refresh: refresh};
+}
+
+function reconcileSteamCandidateResearchPendingBacklog() {
+  return reconcileSteamCandidateResearchPendingBacklog_(SpreadsheetApp.getActiveSpreadsheet());
+}
+
+function inspectSteamCandidateResearchPendingBacklog() {
+  return inspectSteamCandidateResearchPendingBacklog_(SpreadsheetApp.getActiveSpreadsheet());
 }
 
 function backfillMachineRecommendationReasons_(ss) {
@@ -9258,6 +9430,7 @@ function enqueueSteamCandidateResearchJobs_(ss, createdAt) {
     return { created: 0, skipped: 0, error: 'candidate_sheet_missing' };
   }
 
+  const closedIneligible = closeIneligibleActiveResearchPending_(ss);
   ensureEligibleCandidateResearchDecisions_(ss);
   const decisionCol = candidateDecisionColumnMap_(decisionSheet);
   const masterCol = {};
@@ -9345,7 +9518,13 @@ function enqueueSteamCandidateResearchJobs_(ss, createdAt) {
     created.push(job);
   });
 
-  return { created: created.length, skipped: skipped, jobs: created };
+  return {
+    created: created.length,
+    skipped: skipped,
+    jobs: created,
+    closedIneligible: closedIneligible.closed,
+    closedIneligibleRows: closedIneligible.rows
+  };
 }
 
 /** Create the missing ledger row only for an already eligible master candidate. */
