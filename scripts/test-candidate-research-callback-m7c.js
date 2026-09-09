@@ -298,6 +298,35 @@ assert(post(retryCompleted).ok === true, 'retry completed callback accepted');
 assert(decision[index(decisionHeaders, '自动研究状态')] === 'COMPLETED', 'retry completed callback restores terminal success');
 assert(decision[index(decisionHeaders, '自动Recommendation')] === 'RECOMMEND_BUILD', 'retry completed callback restores machine fields');
 
+var manualHandoff = completedPayload();
+manualHandoff.job_id = 'steam-research-4026250-20260824';
+manualHandoff.research_cycle_date = '2026-08-24';
+manualHandoff.execution_status = 'COMPLETED';
+manualHandoff.recommendation = undefined;
+manualHandoff.confidence = undefined;
+manualHandoff.reasons = undefined;
+manualHandoff.blocking_reasons = undefined;
+manualHandoff.missing_evidence = undefined;
+manualHandoff.completed_at = undefined;
+manualHandoff.research_result_path = undefined;
+manualHandoff.recommendation_result_path = undefined;
+manualHandoff.preflight_verdict = 'MANUAL_REVIEW';
+manualHandoff.preflight_reason = 'Free-first complete; manual Trends / SERP required';
+manualHandoff.preflight_checked_at = '2026-08-24T04:00:00Z';
+manualHandoff.machine_fields = {
+  trends_result: '未检查', social_result: '中', serp_competition: '未检查', keyword_opportunity: '有'
+};
+manualHandoff.social_summary = {
+  status: 'AVAILABLE', evidence_count: 5, cluster_count: 1,
+  actionable_cluster_count: 1, watch_cluster_count: 0, top_topics: ['guide'],
+  verdict: '中', one_liner: 'free evidence'
+};
+manualHandoff.free_evidence = {autocomplete: {status: 'AVAILABLE', guide_intent: true}};
+assert(post(manualHandoff).ok === true, 'MANUAL_REVIEW free-first callback accepted');
+assert(decision[index(decisionHeaders, '自动研究状态')] === 'COMPLETED', 'MANUAL_REVIEW callback writes completed status');
+assert(decision[index(decisionHeaders, 'Social结果')] === '人工Social', 'manual social result remains authoritative');
+assert(decision[index(decisionHeaders, '自动Social摘要')] === '中 | free evidence', 'free social summary is preserved');
+
 var beforeGetWrites = writes;
 var getResponse = sandbox.doGet({parameter: {action: 'pendingSteamCandidateResearchJobs'}});
 assert(JSON.parse(getResponse.text).jobs.length === 0, 'GET does not return failed callback as pending');

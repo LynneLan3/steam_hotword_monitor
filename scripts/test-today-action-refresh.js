@@ -293,6 +293,19 @@ var terminalDecision = {
 };
 var readyProjection = sandbox.decideTodayActionProjection_(terminalRec, terminalDecision, new Date('2026-09-08T00:00:00Z'), {}, spreadsheet, new Map());
 assert(readyProjection.include && readyProjection.type === 'READY', 'terminal machine outputs become READY decision rows');
+var manualHandoffDecision = {
+  appId: 'manual-1', currentStage: '1B完成→人工第二轮', status: '', autoResearchStatus: 'COMPLETED',
+  preflightVerdict: 'MANUAL_REVIEW', trendsResult: '未检查', socialResult: '中',
+  serpCompetition: '未检查', keywordOpportunity: '有'
+};
+var manualHandoff = sandbox.decideTodayActionProjection_(
+  {appId: 'manual-1', continueNext: '是', firstRoundType: '🔥 趋势候选'},
+  manualHandoffDecision, new Date('2026-09-08T00:00:00Z'), {}, spreadsheet, new Map()
+);
+assert(manualHandoff.include && manualHandoff.humanAction === '检查 Google Trends / SERP', 'MANUAL_REVIEW handoff enters Today Action with both manual checks');
+assert(sandbox.candidateManualEvidenceNextAction_({}, manualHandoffDecision) === 'Google Trends', 'MANUAL_REVIEW starts with Trends');
+manualHandoffDecision.trendsResult = '强';
+assert(sandbox.candidateManualEvidenceNextAction_({}, manualHandoffDecision) === 'SERP检查', 'MANUAL_REVIEW advances to manual SERP');
 var failedProjection = sandbox.decideTodayActionProjection_(terminalRec, Object.assign({}, terminalDecision, {
   autoResearchStatus: 'FAILED', autoResearchError: 'searchapi_http_error'
 }), new Date('2026-09-08T00:00:00Z'), {}, spreadsheet, new Map());

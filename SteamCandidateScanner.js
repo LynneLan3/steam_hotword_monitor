@@ -723,6 +723,19 @@ function validateSteamCandidateResearchCallback_(body) {
       !steamCandidateResearchCallbackString_(body.recommendation)) {
     const verdict = steamCandidateResearchCallbackString_(body.preflight_verdict).toUpperCase();
     if (!STEAM_PREFLIGHT_VERDICTS[verdict]) return {ok: false, error: 'invalid_preflight_verdict'};
+    if (body.machine_fields && Object.prototype.toString.call(body.machine_fields) === '[object Object]') {
+      const allowedMachineFields = {
+        trends_result: CANDIDATE_DECISION_ENUMS_['Google Trends结果'].allowed,
+        social_result: CANDIDATE_DECISION_ENUMS_['Social结果'].allowed,
+        serp_competition: CANDIDATE_DECISION_ENUMS_['SERP竞争'].allowed,
+        keyword_opportunity: CANDIDATE_DECISION_ENUMS_['关键词机会'].allowed
+      };
+      Object.keys(body.machine_fields).forEach(function (key) {
+        if (allowedMachineFields[key] && allowedMachineFields[key].indexOf(steamCandidateResearchCallbackString_(body.machine_fields[key])) < 0) {
+          throw new Error('invalid_machine_' + key);
+        }
+      });
+    }
     if (!steamCandidateResearchCallbackString_(body.preflight_checked_at)) return {ok: false, error: 'missing_preflight_checked_at'};
     if (!steamCandidateResearchCallbackString_(body.preflight_reason)) return {ok: false, error: 'missing_preflight_reason'};
     if (verdict === 'WATCH' && !steamCandidateResearchCallbackString_(body.next_review_date)) return {ok: false, error: 'missing_next_review_date'};
@@ -917,6 +930,11 @@ function machineResearchComplete_(decision) {
     machineResearchOutputsComplete_(decision);
 }
 
+function machineResearchManualReviewReady_(decision) {
+  return steamCandidateResearchCallbackString_(decision && decision.autoResearchStatus).toUpperCase() === 'COMPLETED' &&
+    steamCandidateResearchCallbackString_(decision && decision.preflightVerdict).toUpperCase() === 'MANUAL_REVIEW';
+}
+
 function machineResearchOutputsComplete_(decision) {
   if (!decision) return false;
   return [
@@ -941,6 +959,11 @@ function formatMachineSocialDisplay_(decision) {
 function candidateInboxHumanAction_(rec, decision) {
   if (machineResearchPending_(decision)) return '机器研究未完成，留在候选队列';
   if (machineResearchFailed_(decision)) return '';
+  if (machineResearchManualReviewReady_(decision) &&
+      (!hasCompletedManualResearchValue_(decision && decision.trendsResult) ||
+       !hasCompletedManualResearchValue_(decision && decision.serpCompetition))) {
+    return '检查 Google Trends / SERP';
+  }
   if (!hasCompletedManualResearchValue_(decision && decision.trendsResult)) return '检查 Google Trends';
   if (!normalizeDecisionStatus_(decision && decision.status)) return '选择 BUILD / WATCH / REJECT';
   return '';
@@ -1115,6 +1138,27 @@ function handleSteamCandidateResearchCallback_(body) {
     steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, 'PreflightCheckedAt', body.preflight_checked_at);
     steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, 'PreflightReason', body.preflight_reason);
     steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动研究错误', status === STEAM_CANDIDATE_RESEARCH_EXEC_FAILED ? body.error : '');
+    const machine = body.machine_fields && Object.prototype.toString.call(body.machine_fields) === '[object Object]'
+      ? body.machine_fields : {};
+    const machineFields = {
+      trends_result: ['Google Trends结果', 'trendsResult'],
+      social_result: ['Social结果', 'socialResult'],
+      serp_competition: ['SERP竞争', 'serpCompetition'],
+      keyword_opportunity: ['关键词机会', 'keywordOpportunity']
+    };
+    Object.keys(machineFields).forEach(function (key) {
+      const value = steamCandidateResearchCallbackString_(machine[key]);
+      const current = decision[machineFields[key][1]];
+      if (value && value !== '未检查' && !hasCompletedManualResearchValue_(current)) {
+        steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, machineFields[key][0], value);
+      }
+    });
+    if (body.social_summary) {
+      steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动Social摘要', steamCandidateResearchSocialSummary_(body.social_summary));
+    }
+    if (body.free_evidence) {
+      steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '自动BUILD依据', JSON.stringify({free_evidence: body.free_evidence}));
+    }
     if (validation.verdict === 'WATCH' && steamCandidateResearchCallbackString_(body.next_review_date)) {
       steamCandidateResearchSetAutomaticField_(sheet, decision.rowNumber, '下次复查日', body.next_review_date);
     }
@@ -7829,7 +7873,10 @@ function candidateManualEvidenceNextAction_(rec, decision, allowWeakTrendRecheck
   if (machineResearchFailed_(decision)) return 'Automatic Preflight';
   const trends = String(decision && decision.trendsResult || '').trim();
   const trendsDone = hasCompletedManualResearchValue_(trends);
+  const manualReviewReady = typeof machineResearchManualReviewReady_ === 'function' && machineResearchManualReviewReady_(decision);
   if (!trendsDone) return 'Google Trends';
+  if (manualReviewReady &&
+      !hasCompletedManualResearchValue_(decision && decision.serpCompetition)) return 'SERP检查';
   if (!normalizeDecisionStatus_(decision && decision.status)) return 'Decision';
   const trendWeak = trends === '弱' || trends === '无';
   if (trendWeak && !allowWeakTrendRecheck) return 'Recheck';
@@ -7906,12 +7953,15 @@ function decideTodayAction_(rec, decision, today, rules) {
     if (!isManualReview && candidateManualEvidenceNeedsNoProvider_(rec, decision, candidateExternalSignalIsNew_(decision))) return {include: false};
     const manualEvidenceAction = candidateManualEvidenceNextAction_(rec, decision, candidateExternalSignalIsNew_(decision));
     if (manualEvidenceAction === 'Recheck') return {include: false};
-    if (machineResearchComplete_(decision)) {
+    const manualReviewReady = typeof machineResearchManualReviewReady_ === 'function' && machineResearchManualReviewReady_(decision);
+    if (machineResearchComplete_(decision) || manualReviewReady) {
       const humanAction = candidateInboxHumanAction_(rec, decision);
       return {
         include: true,
         type: 'READY',
-        reason: '机器研究已完成，等待人工决定',
+        reason: manualReviewReady
+          ? '免费研究完成，等待人工 Trends / SERP 与最终决定'
+          : '机器研究已完成，等待人工决定',
         humanAction: humanAction || '继续完成研究'
       };
     }
