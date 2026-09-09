@@ -1,0 +1,55 @@
+schema_version: 1
+project: game-search-opportunity-engine
+goal_id: G040-human-ready-today-action-automation-v1
+repo: LynneLan3/steam_hotword_monitor
+branch: codex/fix-candidate-research-closure
+commit: c028235e43df4104d2dd96fc3bcaeaa90a8ecaeb
+status: COMPLETE
+completed_at: '2026-09-09T06:30:00Z'
+scope:
+  product_mode: MANUAL
+  summary: >-
+    Free/existing/cache-first candidate research and preliminary ranking select
+    at most three candidates; paid SearchApi verification is not a daily
+    dependency. Top-3 candidates enter Today Action as MANUAL_REVIEW and the
+    user completes Google Trends, SERP, and BUILD/WATCH/REJECT.
+production:
+  verified: true
+  run_id: 34300055737
+  engine_commit: 48c7fc0a386f2528f931ac43cb0ea043b07ad0b7
+  steam_commit: c028235e43df4104d2dd96fc3bcaeaa90a8ecaeb
+  deployment_id: AKfycbxKVxbb7ueWQqIgDaCMsTVLWY6Yn-ddr4nMdAvotbmRJT04yb6oKM6UiWoaSLjFJWKV
+  deployment_version: 78
+  free_first_processed: 85
+  top_3:
+    - app_id: 1648360
+      name: Luminary
+      preliminary_score: 72.0
+    - app_id: 3636770
+      name: Servant of the Lake
+      preliminary_score: 72.0
+    - app_id: 4315040
+      name: Hearth and Hamlet
+      preliminary_score: 70.0
+  selected_candidate_count: 3
+  searchapi_calls: 0
+  non_top3_paid_calls: 0
+  callback_status: 3/3 SUCCESS after endpoint correction to deployment @78
+  today_action:
+    top3_rows: 3
+    top3_action_type: READY
+    top3_verdict: MANUAL_REVIEW
+    human_action: 检查 Google Trends / SERP
+    human_decision: blank pending BUILD/WATCH/REJECT
+    existing_build_row_preserved: true
+validation:
+  free_first_and_ranking: PASS
+  manual_handoff_writeback: PASS
+  failed_or_pending_normal_queue_exclusion: PASS
+  candidate_id_raw_ledger_g037_regression: PASS
+  build_watch_reject_regression: PASS
+  no_searchapi_dependency: PASS
+next_action: >-
+  Human completes Google Trends and SERP fields for the three MANUAL_REVIEW
+  rows, then records BUILD, WATCH, or REJECT. No automatic SearchApi call is
+  required for the daily production path; AUTO remains an optional future mode.
