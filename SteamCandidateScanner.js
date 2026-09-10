@@ -312,6 +312,92 @@ const STEAM_PREFLIGHT_ENABLED = false;
 function steamAutoResearchEnabled_() {
   return typeof STEAM_PREFLIGHT_ENABLED !== 'undefined' && !!STEAM_PREFLIGHT_ENABLED;
 }
+
+/**
+ * Manual-research mode cleanup: keep ResearchJobID / auto* audit fields, but stop
+ * leaving Automatic Preflight / 「研究中」 as the live UI state for humans.
+ */
+function clearStaleAutomaticResearchUiFields_(ss) {
+  const result = {updated: 0, skipped: 0, rows: []};
+  if (steamAutoResearchEnabled_()) {
+    return Object.assign(result, {disabled: false, skippedAll: true, reason: 'auto_research_enabled'});
+  }
+  const sheet = ss && ss.getSheetByName ? ss.getSheetByName(HOTWORD_V2.sheets.decisions) : null;
+  if (!sheet || sheet.getLastRow() < 2) return Object.assign(result, {error: 'decision_sheet_missing'});
+  const columnMap = candidateDecisionColumnMap_(sheet);
+  const nextCol = columnMap.byName['Next Action'] || 0;
+  if (nextCol > 0) {
+    // Temporarily clear strict validation so audit-preserving UI cleanup can write
+    // schema-legal values (including Decision) without tripping an old allowlist.
+    sheet.getRange(2, nextCol, Math.max(sheet.getMaxRows() - 1, 1), 1).clearDataValidations();
+  }
+  const decisions = readCandidateDecisions_(ss);
+  const sheetSafeNextAction_ = value => {
+    const next = String(value || '').trim();
+    // Keep writes compatible even if UI rebind lags; Decision remains a logical
+    // state but None is the safe empty-todo value already used elsewhere.
+    if (next === 'Decision') return 'None';
+    return next || 'Google Trends';
+  };
+  decisions.forEach(decision => {
+    if (!decision || !decision.rowNumber) {
+      result.skipped += 1;
+      return;
+    }
+    const status = normalizeDecisionStatus_(decision.status);
+    const nextBefore = String(decision.nextAction || '').trim();
+    const researchBefore = String(decision.researchStatus || '').trim();
+    const needsNextClear = nextBefore === 'Automatic Preflight';
+    const needsResearchClear = researchBefore === '研究中' &&
+      (String(decision.autoResearchStatus || '').trim().toUpperCase() === 'PENDING' ||
+        String(decision.autoResearchStatus || '').trim().toUpperCase() === 'RUNNING' ||
+        !String(decision.autoResearchStatus || '').trim());
+    if (!needsNextClear && !needsResearchClear) {
+      result.skipped += 1;
+      return;
+    }
+    if (status === 'BUILD' || status === 'REJECT') {
+      decision.nextAction = status === 'BUILD' ? 'Site Build' : 'None';
+      decision.researchStatus = '已完成';
+    } else if (status === 'WATCH') {
+      decision.nextAction = 'Recheck';
+      decision.researchStatus = deriveResearchStatus_(decision);
+    } else {
+      const actionRec = {firstRoundType: decision.firstType};
+      decision.nextAction = sheetSafeNextAction_(
+        candidateManualEvidenceNextAction_(actionRec, decision, candidateExternalSignalIsNew_(decision))
+      );
+      decision.researchStatus = deriveResearchStatus_(decision);
+    }
+    try {
+      sheet.getRange(decision.rowNumber, 1, 1, columnMap.width)
+        .setValues([candidateDecisionRow_(decision, columnMap, decision.row)]);
+      result.updated += 1;
+      if (result.rows.length < 20) {
+        result.rows.push({
+          appId: decision.appId,
+          nextBefore: nextBefore,
+          nextAfter: decision.nextAction,
+          researchBefore: researchBefore,
+          researchAfter: decision.researchStatus
+        });
+      }
+    } catch (err) {
+      result.skipped += 1;
+      if (!result.writeErrors) result.writeErrors = [];
+      if (result.writeErrors.length < 10) {
+        result.writeErrors.push({appId: decision.appId, error: String(err && err.message || err)});
+      }
+    }
+  });
+  try {
+    if (typeof setupCandidateDecisionUi_ === 'function') setupCandidateDecisionUi_(ss);
+  } catch (uiErr) {
+    result.uiRebindError = String(uiErr && uiErr.message || uiErr);
+  }
+  if (SpreadsheetApp.flush) SpreadsheetApp.flush();
+  return result;
+}
 const PREFLIGHT_MAX_SERP_QUERIES_PER_CANDIDATE = 3;
 const PREFLIGHT_DEDICATED_DOMAIN_REJECT_MIN = 2;
 const STEAM_PREFLIGHT_VERDICTS = {AUTO_REJECT: true, WATCH: true, MANUAL_REVIEW: true, PREFLIGHT_ERROR: true};
@@ -454,6 +540,50 @@ function doGet(e) {
     return ContentService
       .createTextOutput(JSON.stringify(Object.assign({}, refresh, {reconcile: reconcile})))
       .setMimeType(ContentService.MimeType.JSON);
+  }
+  if (action === 'syncEligibleCandidateDecisionsProduction') {
+    const ss = SpreadsheetApp.openById(QUALIFICATION_ELIGIBILITY_PRODUCTION_SHEET_ID);
+    try {
+      const cleared = clearStaleAutomaticResearchUiFields_(ss);
+      const refresh = refreshTodayActionsFromCandidateDecisions_(ss);
+      return ContentService
+        .createTextOutput(JSON.stringify({
+          ok: true,
+          cleared: cleared,
+          autoResearchEnabled: steamAutoResearchEnabled_(),
+          refresh: refresh
+        }))
+        .setMimeType(ContentService.MimeType.JSON);
+    } catch (err) {
+      return ContentService
+        .createTextOutput(JSON.stringify({
+          ok: false,
+          error: String(err && err.message || err),
+          autoResearchEnabled: steamAutoResearchEnabled_()
+        }))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+  }
+  if (action === 'clearStaleAutomaticResearchUiProduction') {
+    const ss = SpreadsheetApp.openById(QUALIFICATION_ELIGIBILITY_PRODUCTION_SHEET_ID);
+    try {
+      if (typeof setupCandidateDecisionUi_ === 'function') setupCandidateDecisionUi_(ss);
+      const cleared = clearStaleAutomaticResearchUiFields_(ss);
+      return ContentService
+        .createTextOutput(JSON.stringify({
+          ok: true,
+          cleared: cleared,
+          autoResearchEnabled: steamAutoResearchEnabled_()
+        }))
+        .setMimeType(ContentService.MimeType.JSON);
+    } catch (err) {
+      return ContentService
+        .createTextOutput(JSON.stringify({
+          ok: false,
+          error: String(err && err.message || err)
+        }))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
   }
   if (action === 'reconcileSteamCandidateResearchPendingBacklogProduction') {
     return ContentService
@@ -2395,7 +2525,7 @@ function setupCandidateDecisionUi_(ss) {
   validation('SERP竞争', ['低', '中', '高', '未检查']);
   validation('关键词机会', ['有', '无', '未检查']);
   validation('Decision', ['BUILD', 'WATCH', 'REJECT']);
-  validation('Next Action', ['Google Trends', 'Social验证', 'SERP检查', 'Keyword Research', 'Site Build', 'Recheck', 'None', 'Automatic Preflight']);
+  validation('Next Action', ['Google Trends', 'Social验证', 'SERP检查', 'Keyword Research', 'Decision', 'Site Build', 'Recheck', 'None', 'Automatic Preflight']);
 
   const decisionCol = column('Decision');
   if (decisionCol > 0) {
@@ -2736,6 +2866,7 @@ function diagnoseEnqueueEligibility_(ss, appId) {
 function forceEnqueueProductionResearch_(ss, appIds, createdAt) {
   const ids = (appIds || []).map(String).filter(isReliableSteamAppId_);
   const result = {enqueued: 0, rows: []};
+  if (!steamAutoResearchEnabled_()) return Object.assign(result, {disabled: true});
   if (!ids.length) return result;
   const decisionSheet = ss.getSheetByName(HOTWORD_V2.sheets.decisions);
   const decisionCol = candidateDecisionColumnMap_(decisionSheet);
@@ -4254,16 +4385,25 @@ function g010IsP1OrP2FirstRoundType_(type) {
 
 /** Master rows for this Run that must sync into 候选决策 before Today Action. */
 function g010CollectDecisionSyncRecordsFromMaster_(ss, runId) {
+  return g010CollectEligibleDecisionSyncRecordsFromMaster_(ss, {runId: runId});
+}
+
+/**
+ * Eligible P1/P2 continueNext=是 rows for decision sync.
+ * Optional runId limits to one G010 run; omit to sync the current eligible set.
+ */
+function g010CollectEligibleDecisionSyncRecordsFromMaster_(ss, options) {
+  options = options || {};
   const sheet = ss.getSheetByName(HOTWORD_V2.sheets.master);
   if (!sheet || sheet.getLastRow() < 2) return [];
   const width = Math.max(sheet.getLastColumn(), HOTWORD_V2.masterHeaders.length);
   const headers = sheet.getRange(1, 1, 1, width).getDisplayValues()[0];
   const index = name => headers.indexOf(name);
   const runCol = index('最近Run ID');
-  if (runCol < 0) return [];
+  const targetRunId = options.runId == null ? '' : String(options.runId);
   const records = [];
   sheet.getRange(2, 1, sheet.getLastRow() - 1, width).getValues().forEach(row => {
-    if (String(row[runCol] || '').trim() !== String(runId)) return;
+    if (targetRunId && runCol >= 0 && String(row[runCol] || '').trim() !== targetRunId) return;
     if (String(row[index('进入下一步')] || '').trim() !== '是') return;
     const firstRoundType = row[index('第一轮类型')] || '';
     if (!g010IsP1OrP2FirstRoundType_(firstRoundType)) return;
@@ -9842,6 +9982,7 @@ function ensureEligibleCandidateResearchDecisions_(ss) {
 function loadPendingSteamCandidateResearchJobs_(spreadsheet) {
   const ss = spreadsheet || SpreadsheetApp.getActiveSpreadsheet();
   if (!ss) return [];
+  if (!steamAutoResearchEnabled_()) return [];
   const decisionSheet = ss.getSheetByName(HOTWORD_V2.sheets.decisions);
   const masterSheet = ss.getSheetByName(HOTWORD_V2.sheets.master);
   if (!decisionSheet || !masterSheet || decisionSheet.getLastRow() < 2 || masterSheet.getLastRow() < 2) return [];
