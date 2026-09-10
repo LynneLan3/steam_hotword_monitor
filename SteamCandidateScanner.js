@@ -4533,9 +4533,11 @@ function g010UpsertAuditRow_(ss, state, status, detail, metrics) {
   }
   if (!rowNumber) {
     sheet.appendRow(rowValues);
+    SpreadsheetApp.flush();
     return;
   }
   sheet.getRange(rowNumber, 1, 1, rowValues.length).setValues([rowValues]);
+  SpreadsheetApp.flush();
 }
 
 function g010ShouldYield_(startedAtMs, nowMs) {
