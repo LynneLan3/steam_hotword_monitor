@@ -14,9 +14,11 @@ var context = {
   normalizeDecisionStatus_: function (v) { var s = String(v || '').trim().toUpperCase(); return ['WATCH', 'BUILD', 'REJECT'].indexOf(s) >= 0 ? s : ''; },
   dateAtStart_: function (v) { var d = new Date(v); if (isNaN(d.getTime())) return null; d.setHours(0, 0, 0, 0); return d; },
   deriveHumanAction_: function () { return '继续验证'; },
-  machineResearchPending_: function (d) { return !!d && (!d.autoResearchStatus || d.autoResearchStatus === 'PENDING' || d.autoResearchStatus === 'RUNNING'); },
-  machineResearchFailed_: function (d) { return !!d && d.autoResearchStatus === 'FAILED'; },
+  steamAutoResearchEnabled_: function () { return false; },
+  machineResearchPending_: function () { return false; },
+  machineResearchFailed_: function () { return false; },
   machineResearchComplete_: function () { return false; },
+  candidateInboxHumanAction_: function () { return '检查 Google Trends'; },
   Number: Number, String: String, Date: Date, Math: Math
 };
 vm.createContext(context);
@@ -35,12 +37,12 @@ function assert(v, msg) { if (!v) throw new Error(msg); }
 function action(rec, decision) { return decide(rec, decision, today, rules); }
 var base = { continueNext: '是', gain7d: 1000 };
 
-assert(!action(base, null).include, 'non-terminal NEW stays in candidate queue');
+assert(action(base, null).include, 'manual-mode NEW without decision enters Today Action');
 assert(!action(base, { status: 'BUILD' }).include, 'BUILD suppressed');
 assert(!action(base, { status: 'REJECT' }).include, 'REJECT suppressed');
 assert(!action(base, { status: 'WATCH', lastGain: 1000, nextRecheckDate: '2026-08-25' }).include, 'WATCH not due');
 assert(!action(base, { status: 'WATCH', lastGain: 1000, nextRecheckDate: '2026-08-21' }).include, 'WATCH due without trigger remains hidden');
-assert(!action(base, { status: '', researchStatus: '已完成' }).include, 'incomplete machine research stays out');
+assert(action(base, { status: '', researchStatus: '已完成' }).include, 'manual-mode incomplete auto research still enters');
 assert(siteId('Twisted Tower™') === 'twisted-tower', 'stable Site ID');
 assert(siteId('Mortal Shell II') === 'mortal-shell-ii', 'stable Site ID 2');
 

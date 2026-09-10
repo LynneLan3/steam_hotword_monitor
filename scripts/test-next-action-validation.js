@@ -17,12 +17,16 @@ generatedLiteralValues.forEach(value => {
 });
 
 assert(
-  source.includes("'Next Action': decision.nextAction"),
+  source.includes("'Next Action': candidateDecisionEnumValue_('Next Action', decision.nextAction)"),
   'syncCandidateDecisions_ writes Next Action through the canonical row schema'
 );
 assert(
   source.includes("decision.nextAction = 'Automatic Preflight'"),
   'syncCandidateDecisions_ can emit Automatic Preflight'
+);
+assert(
+  source.includes("steamAutoResearchEnabled_()"),
+  'manual research mode gate exists for auto enqueue / pending UX'
 );
 
 console.log('PASS Next Action validation schema and generated values');

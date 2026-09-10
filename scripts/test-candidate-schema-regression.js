@@ -204,6 +204,7 @@ var sandbox = {
 vm.createContext(sandbox);
 vm.runInContext(source, sandbox);
 sandbox.refreshTodayActionsFromCandidateDecisions_ = function () { return {ok: true}; };
+sandbox.steamAutoResearchEnabled_ = function () { return true; };
 
 var migrated = sandbox.ensureCandidateDecisionSchema_(spreadsheet);
 var migratedHeaders = decisionSheet.headers;
@@ -247,7 +248,7 @@ assert(at(migratedHeaders, decisionSheet.rows[1], 'PreflightReason') === 'SERP r
 
 var rules = {RECHECK_GAIN_GROWTH_MIN: 0.30};
 var rec = {continueNext: '是', gain7d: 1000};
-assert(sandbox.decideTodayActionProjection_(rec, {status: 'BUILD'}, new Date('2026-08-26'), rules, spreadsheet).type === 'BUILD', 'unfinished BUILD remains in Today Action');
+assert(sandbox.decideTodayActionProjection_(rec, {status: 'BUILD'}, new Date('2026-08-26'), rules, spreadsheet).include === false, 'BUILD stays out of Today Action');
 assert(sandbox.decideTodayActionProjection_(rec, {status: 'REJECT'}, new Date('2026-08-26'), rules, spreadsheet).include === false, 'REJECT absent from Today Action');
 assert(sandbox.decideTodayActionProjection_(rec, {status: 'WATCH', autoResearchStatus: 'PENDING'}, new Date('2026-08-26'), rules, spreadsheet).include === false, 'pending machine research stays out of Today Action');
 assert(sandbox.decideTodayActionProjection_(rec, {status: 'WATCH', autoResearchStatus: 'COMPLETED', nextRecheckDate: '2026-09-01'}, new Date('2026-08-26'), rules, spreadsheet).type === 'WATCH_WAITING', 'WATCH_WAITING retained');

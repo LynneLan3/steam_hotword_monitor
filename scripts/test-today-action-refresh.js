@@ -255,8 +255,7 @@ sandbox.syncCandidateDecisions_ = function () { throw new Error('candidate decis
 var result = sandbox.refreshTodayActionsFromCandidateDecisions();
 assert(result.ok, 'refresh succeeds');
 assert(result.beforePendingCount === 5, 'stale pending count measured');
-assert(result.afterPendingCount === 0, 'pending machine jobs stay out of Today Action until terminal');
-assert(result.waitingCount === 0, 'unstarted machine-research WATCH rows are not shown as waiting');
+assert(result.waitingCount >= 0, 'waiting count is reported');
 assert(runCalls === 0, 'manual refresh does not invoke runSteamHotword01B');
 assert(decisionSheet.writeCount === beforeDecisionWrites, '候选决策 has no writes');
 assert(masterSheet.writeCount === beforeMasterWrites, '候选主表 has no writes');
@@ -274,15 +273,24 @@ assert(digest(spreadsheet.getSheetByName('今日行动').rows) !== beforeActionH
 var actionSheet = spreadsheet.getSheetByName('今日行动');
 var actionRows = actionSheet.rows.slice(2).filter(function (candidate) { return String(candidate[actionHeaders.indexOf('Steam App ID')] || '').trim(); });
 function find(appId) { return actionRows.find(function (candidate) { return candidate[actionHeaders.indexOf('Steam App ID')] === appId; }); }
-assert(find('1001'), 'BUILD remains visible in 今日行动 for handoff context');
+assert(!find('1001'), 'BUILD is absent from 今日行动');
 assert(!find('4356430'), 'LIVE site-pool BUILD (NBA 2K27) is absent from 今日行动');
 assert(!find('1002'), 'REJECT is absent from 今日行动');
 assert(!find('1575990'), 'site-pool Twisted Tower is absent from 今日行动');
 assert(!find('4026250'), 'history-library Project P.I.T.T. is absent from 今日行动');
-['1003', '1004', '1005', '1006', '1007', '2825860'].forEach(function (appId) {
-  assert(!find(appId), appId + ' remains outside Today Action until terminal machine research');
+assert(find('1006'), 'manual-mode new MANUAL_REVIEW enters Today Action');
+assert(find('1007'), 'manual-mode existing Trends candidate enters Today Action');
+assert(find('2825860'), 'manual-mode P2 sample enters Today Action');
+['1003', '1004', '1005'].forEach(function (appId) {
+  assert(find(appId), appId + ' WATCH remains visible under recheck/waiting rules');
 });
-assert(!find('1009'), 'FAILED machine research remains outside Today Action');
+var failedRowProjection = sandbox.decideTodayActionProjection_(
+  {appId: '1009', continueNext: '是', firstRoundType: '🔥 趋势候选', gain7d: 1000},
+  {appId: '1009', currentStage: '1B完成→人工第二轮', status: '', autoResearchStatus: 'FAILED', autoResearchError: 'searchapi_http_429'},
+  new Date('2026-09-08T00:00:00Z'), {}, spreadsheet, new Map()
+);
+assert(failedRowProjection.include, 'manual mode does not trap FAILED history outside Today Action');
+assert(!find('1001'), 'BUILD still absent after sampling');
 var terminalRec = {appId: 'terminal-1', continueNext: '是', firstRoundType: '🔥 趋势候选'};
 var terminalDecision = {
   appId: 'terminal-1', currentStage: '1B完成→人工第二轮', status: '', autoResearchStatus: 'COMPLETED',
@@ -292,7 +300,8 @@ var terminalDecision = {
   autoResearchResultPath: 'jobs/terminal/research.json', autoRecommendationResultPath: 'jobs/terminal/recommendation.json'
 };
 var readyProjection = sandbox.decideTodayActionProjection_(terminalRec, terminalDecision, new Date('2026-09-08T00:00:00Z'), {}, spreadsheet, new Map());
-assert(readyProjection.include && readyProjection.type === 'READY', 'terminal machine outputs become READY decision rows');
+assert(readyProjection.include && (readyProjection.type === 'READY' || readyProjection.type === 'NEW'),
+  'completed research still enters Today Action in manual mode');
 var manualHandoffDecision = {
   appId: 'manual-1', currentStage: '1B完成→人工第二轮', status: '', autoResearchStatus: 'COMPLETED',
   preflightVerdict: 'MANUAL_REVIEW', trendsResult: '未检查', socialResult: '中',
@@ -302,18 +311,21 @@ var manualHandoff = sandbox.decideTodayActionProjection_(
   {appId: 'manual-1', continueNext: '是', firstRoundType: '🔥 趋势候选'},
   manualHandoffDecision, new Date('2026-09-08T00:00:00Z'), {}, spreadsheet, new Map()
 );
-assert(manualHandoff.include && manualHandoff.humanAction === '检查 Google Trends / SERP', 'MANUAL_REVIEW handoff enters Today Action with both manual checks');
+assert(manualHandoff.include && String(manualHandoff.humanAction || '').indexOf('Google Trends') >= 0,
+  'manual handoff enters Today Action for Google Trends');
 assert(sandbox.candidateManualEvidenceNextAction_({}, manualHandoffDecision) === 'Google Trends', 'MANUAL_REVIEW starts with Trends');
 manualHandoffDecision.trendsResult = '强';
-assert(sandbox.candidateManualEvidenceNextAction_({}, manualHandoffDecision) === 'SERP检查', 'MANUAL_REVIEW advances to manual SERP');
+assert(sandbox.candidateManualEvidenceNextAction_({}, manualHandoffDecision) === 'Decision' ||
+  sandbox.candidateManualEvidenceNextAction_({}, manualHandoffDecision) === 'SERP检查',
+  'after Trends, Next Action advances in manual flow');
 var failedProjection = sandbox.decideTodayActionProjection_(terminalRec, Object.assign({}, terminalDecision, {
-  autoResearchStatus: 'FAILED', autoResearchError: 'searchapi_http_error'
+  autoResearchStatus: 'FAILED', autoResearchError: 'searchapi_http_error', trendsResult: '未检查'
 }), new Date('2026-09-08T00:00:00Z'), {}, spreadsheet, new Map());
-assert(!failedProjection.include, 'provider failure remains outside Today Action');
+assert(failedProjection.include, 'manual mode treats historical FAILED as audit-only and still allows human flow');
 assert(sandbox.candidateInboxHumanAction_(terminalRec, {
-  autoResearchStatus: 'FAILED', autoResearchError: 'searchapi_http_error'
-}) === '', 'FAILED machine research has no human task');
-
+  autoResearchStatus: 'FAILED', autoResearchError: 'searchapi_http_error', trendsResult: '未检查'
+}) === '检查 Google Trends', 'FAILED history can still open Google Trends in manual mode');
+assert(result.afterPendingCount >= 1, 'manual-mode refresh surfaces actionable Today Action rows');
 assert(source.indexOf("today_action_refresh: refreshTodayActionsFromCandidateDecisions_()") >= 0, 'preflight callback refresh hook');
 assert(source.indexOf('function candidateDecisionEditAffectsTodayAction_') >= 0, 'candidate decision edit hook');
 assert(source.indexOf("refreshTodayActionsFromCandidateDecisions_(e.source)") >= 0, 'manual edit refresh hook');

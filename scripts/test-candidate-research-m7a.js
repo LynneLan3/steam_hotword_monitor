@@ -37,6 +37,7 @@ var sandbox = {
 };
 vm.createContext(sandbox);
 vm.runInContext(source, sandbox);
+sandbox.steamAutoResearchEnabled_ = function () { return true; };
 
 var decisionHeaders = [
   'Steam App ID', '游戏名称', '决策状态', '上次人工检查日', '上次检查7d Gain',

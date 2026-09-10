@@ -304,7 +304,14 @@ const STEAM_CANDIDATE_RESEARCH_CHECKS = [
 const STEAM_CANDIDATE_RESEARCH_WRITE_TOKEN_PROP = 'STEAM_CANDIDATE_RESEARCH_WRITE_TOKEN';
 const STEAM_CANDIDATE_RESEARCH_EXEC_COMPLETED = 'COMPLETED';
 const STEAM_CANDIDATE_RESEARCH_EXEC_FAILED = 'FAILED';
-const STEAM_PREFLIGHT_ENABLED = true;
+// Production kill-switch for automatic preflight + research enqueue.
+// Manual Research mode: keep historical ResearchJobID / auto fields for audit,
+// but do not create new PENDING jobs or block Today Action on stale PENDING.
+const STEAM_PREFLIGHT_ENABLED = false;
+
+function steamAutoResearchEnabled_() {
+  return typeof STEAM_PREFLIGHT_ENABLED !== 'undefined' && !!STEAM_PREFLIGHT_ENABLED;
+}
 const PREFLIGHT_MAX_SERP_QUERIES_PER_CANDIDATE = 3;
 const PREFLIGHT_DEDICATED_DOMAIN_REJECT_MIN = 2;
 const STEAM_PREFLIGHT_VERDICTS = {AUTO_REJECT: true, WATCH: true, MANUAL_REVIEW: true, PREFLIGHT_ERROR: true};
@@ -935,12 +942,14 @@ function deriveFinalStatus_(decision) {
 }
 
 function machineResearchPending_(decision) {
+  if (!steamAutoResearchEnabled_()) return false;
   if (!decision) return false;
   const status = steamCandidateResearchCallbackString_(decision && decision.autoResearchStatus).toUpperCase();
   return !status || status === 'PENDING' || status === 'RUNNING';
 }
 
 function machineResearchFailed_(decision) {
+  if (!steamAutoResearchEnabled_()) return false;
   return steamCandidateResearchCallbackString_(decision && decision.autoResearchStatus).toUpperCase() === 'FAILED';
 }
 
@@ -4203,7 +4212,21 @@ function g010FinalizeRun_(ss, state, runContext, startedAt, discoveryPartial) {
   Object.assign(metrics, finalStats);
   metrics.enrichmentProcessed = Math.max(metrics.enrichmentProcessed, metrics.eligibleTotal);
   const snapshotResult = g010WriteFinalCandidateSnapshotFromMaster_(ss, state.runId, startedAt);
-  refreshTodayActionsFromCandidateDecisions_(ss, startedAt, state.runId, {});
+  const rules = loadRules_(ss);
+  const syncRecords = g010CollectDecisionSyncRecordsFromMaster_(ss, state.runId);
+  syncCandidateDecisions_(ss, syncRecords, startedAt, rules);
+  refreshTodayActionsFromCandidateDecisions_(ss, startedAt, state.runId, {
+    discoveredCount: metrics.rawTotal,
+    historyExcludedCount: metrics.historyExcluded,
+    pass1ACount: metrics.pass1A,
+    trendCount: metrics.trend,
+    earlyCount: metrics.early,
+    controlCount: metrics.control,
+    p2TrendCount: metrics.p2Trend,
+    p2EarlyCount: metrics.p2Early,
+    historyInsufficientCount: metrics.historyInsufficient,
+    anomalyCount: metrics.anomaly
+  });
   metrics.candidates = Math.max(finalStats.candidates, Number(snapshotResult && snapshotResult.persisted || 0));
   const historical = g022FinalizeHistoricalRun_(ss, state, runContext, metrics, completion, new Date(), {});
   if (!historical.ok) {
@@ -4221,6 +4244,41 @@ function g010FinalizeRun_(ss, state, runContext, startedAt, discoveryPartial) {
   if (historical.ok) g010ClearState_();
   return {status: finalStatus, runId: state.runId, metrics: metrics, completion: completion,
     historical: historical, driveExport: driveExport};
+}
+
+function g010IsP1OrP2FirstRoundType_(type) {
+  const text = String(type || '');
+  return text === '🔥 趋势候选' || text === '🌱 Early候选' ||
+    text === '🟡 Trend Watch' || text === '🟢 Early Watch';
+}
+
+/** Master rows for this Run that must sync into 候选决策 before Today Action. */
+function g010CollectDecisionSyncRecordsFromMaster_(ss, runId) {
+  const sheet = ss.getSheetByName(HOTWORD_V2.sheets.master);
+  if (!sheet || sheet.getLastRow() < 2) return [];
+  const width = Math.max(sheet.getLastColumn(), HOTWORD_V2.masterHeaders.length);
+  const headers = sheet.getRange(1, 1, 1, width).getDisplayValues()[0];
+  const index = name => headers.indexOf(name);
+  const runCol = index('最近Run ID');
+  if (runCol < 0) return [];
+  const records = [];
+  sheet.getRange(2, 1, sheet.getLastRow() - 1, width).getValues().forEach(row => {
+    if (String(row[runCol] || '').trim() !== String(runId)) return;
+    if (String(row[index('进入下一步')] || '').trim() !== '是') return;
+    const firstRoundType = row[index('第一轮类型')] || '';
+    if (!g010IsP1OrP2FirstRoundType_(firstRoundType)) return;
+    records.push({
+      appId: String(row[index('Steam App ID')] || '').trim(),
+      name: row[index('游戏名称')] || '',
+      priority: row[index('第一轮优先级')] || '',
+      firstRoundType: firstRoundType,
+      continueNext: '是',
+      gain7d: row[index('Steam 7d Gain')],
+      currentStage: row[index('当前筛选阶段')] || '',
+      nextAction: row[index('下一步动作')] || ''
+    });
+  });
+  return records.filter(rec => rec.appId);
 }
 
 function g010WriteFinalCandidateSnapshotFromMaster_(ss, runId, runTime) {
@@ -8304,19 +8362,38 @@ function decideTodayAction_(rec, decision, today, rules) {
   }
   const status = normalizeDecisionStatus_(decision && decision.status);
   if (!status) {
+    const autoResearchOn = typeof steamAutoResearchEnabled_ === 'function'
+      ? steamAutoResearchEnabled_()
+      : (typeof STEAM_PREFLIGHT_ENABLED !== 'undefined' && !!STEAM_PREFLIGHT_ENABLED);
     const autoResearchStatus = String(decision && decision.autoResearchStatus || '').trim().toUpperCase();
     const pendingResearch = typeof machineResearchPending_ === 'function'
       ? machineResearchPending_(decision)
-      : (!autoResearchStatus || autoResearchStatus === 'PENDING' || autoResearchStatus === 'RUNNING');
+      : (autoResearchOn && (!autoResearchStatus || autoResearchStatus === 'PENDING' || autoResearchStatus === 'RUNNING'));
     const failedResearch = typeof machineResearchFailed_ === 'function'
       ? machineResearchFailed_(decision)
-      : autoResearchStatus === 'FAILED';
+      : (autoResearchOn && autoResearchStatus === 'FAILED');
     const isManualReview = String(decision && decision.preflightVerdict || '').trim().toUpperCase() === 'MANUAL_REVIEW';
     if (pendingResearch) {
       return {include: false, reason: '机器研究未完成，继续留在候选队列'};
     }
     if (failedResearch) {
       return {include: false, reason: '机器研究失败，保留候选决策并等待自动重试'};
+    }
+    if (!autoResearchOn) {
+      if (candidateManualEvidenceNeedsNoProvider_(rec, decision, candidateExternalSignalIsNew_(decision))) {
+        return {include: false};
+      }
+      const manualEvidenceAction = candidateManualEvidenceNextAction_(rec, decision, candidateExternalSignalIsNew_(decision));
+      if (manualEvidenceAction === 'Recheck') return {include: false};
+      const humanAction = typeof candidateInboxHumanAction_ === 'function'
+        ? candidateInboxHumanAction_(rec, decision)
+        : '检查 Google Trends';
+      return {
+        include: true,
+        type: 'NEW',
+        reason: '人工研究模式：P1/P2 候选直接进入人工 Google Trends / SERP',
+        humanAction: humanAction || '检查 Google Trends'
+      };
     }
     if (!isManualReview && candidateManualEvidenceNeedsNoProvider_(rec, decision, candidateExternalSignalIsNew_(decision))) return {include: false};
     const manualEvidenceAction = candidateManualEvidenceNextAction_(rec, decision, candidateExternalSignalIsNew_(decision));
@@ -8379,7 +8456,7 @@ function deriveResearchStatus_(decision) {
   const status = normalizeDecisionStatus_(decision && decision.status);
   if (status) return '已完成';
   const autoStatus = String(decision && decision.autoResearchStatus || '').trim().toUpperCase();
-  if (!autoStatus) {
+  if (!autoStatus || !steamAutoResearchEnabled_()) {
     const manualFields = [decision && decision.trendsResult, decision && decision.socialResult,
       decision && decision.serpCompetition, decision && decision.keywordOpportunity];
     return manualFields.every(isUnfinishedResearchValue_) ? '待研究' : '研究中';
@@ -9620,6 +9697,9 @@ function steamCandidatePreflightDue_(decision, today) {
 function enqueueSteamCandidateResearchJobs_(ss, createdAt) {
   ss = ss || SpreadsheetApp.getActiveSpreadsheet();
   if (!ss) return { created: 0, skipped: 0 };
+  if (!steamAutoResearchEnabled_()) {
+    return { created: 0, skipped: 0, disabled: true };
+  }
   const decisionSheet = ss.getSheetByName(HOTWORD_V2.sheets.decisions);
   const masterSheet = ss.getSheetByName(HOTWORD_V2.sheets.master);
   if (!decisionSheet || !masterSheet || masterSheet.getLastRow() < 2) {
@@ -9747,7 +9827,8 @@ function ensureEligibleCandidateResearchDecisions_(ss) {
       source: row[masterCol['候选来源']] || '', firstType: row[masterCol['第一轮类型']] || '',
       currentStage: stage, researchStatus: '待研究', trendsResult: '未检查',
       socialResult: '未检查', serpCompetition: '未检查', keywordOpportunity: '未检查',
-      nextAction: 'Automatic Preflight', opportunityId: opportunityIdFromSteamCandidate_(name, appId)
+      nextAction: steamAutoResearchEnabled_() ? 'Automatic Preflight' : 'Google Trends',
+      opportunityId: opportunityIdFromSteamCandidate_(name, appId)
     };
     decisionSheet.getRange(decisionSheet.getLastRow() + 1, 1, 1, columnMap.width)
       .setValues([candidateDecisionRow_(decision, columnMap)]);
@@ -9833,22 +9914,26 @@ function syncCandidateDecisions_(ss, records, runTime, rules) {
         trendRelativeStrength: '', trendVerdict: '', trendLastChecked: '', externalSignal: '', finalResearchStage: ''};
       decisions.set(appId, decision);
     }
-    decision.name = rec.name;
+    decision.name = rec.name || decision.name;
     // Opportunity precedes Decision: create only when this candidate enters the
     // normal decision runtime, and preserve it across later refreshes/statuses.
     decision.opportunityId = decision.opportunityId || opportunityIdFromSteamCandidate_(decision.name, appId);
     const masterRow = findMasterRecord_(ss, appId);
+    const masterName = masterRow ? masterRow[2] : '';
+    const masterFirstType = masterRow ? masterRow[20] : '';
+    const masterStage = masterRow ? masterRow[25] : '';
     if (masterRow) {
       decision.firstSeen = decision.firstSeen || masterRow[28] || runTime;
       decision.source = decision.source || masterRow[4] || '';
-      decision.firstType = decision.firstType || masterRow[20] || rec.firstRoundType;
-      decision.currentStage = masterRow[25] || rec.currentStage;
     }
-    decision.firstType = decision.firstType || rec.firstRoundType;
-    decision.currentStage = decision.currentStage || rec.currentStage;
+    // Steam dynamic state always refreshes from the current master / run record.
+    // Never freeze an old 第一轮类型 / 当前Steam阶段 / 游戏名 across later runs.
+    decision.name = rec.name || masterName || decision.name;
+    decision.firstType = rec.firstRoundType || masterFirstType || decision.firstType;
+    decision.currentStage = rec.currentStage || masterStage || decision.currentStage;
     const isHumanStage = decision.currentStage === '1B完成→人工第二轮';
     decision.researchStatus = isHumanStage ? deriveResearchStatus_(decision) : '';
-    const actionRec = {gain7d: rec.gain7d, firstRoundType: rec.firstRoundType};
+    const actionRec = {gain7d: rec.gain7d, firstRoundType: rec.firstRoundType || decision.firstType};
     if (decision.status === 'BUILD') {
       decision.nextAction = nextActionForBuildDecision_(
         appId, decision.opportunityId, siteCompletionIndex);
@@ -9858,8 +9943,10 @@ function syncCandidateDecisions_(ss, records, runTime, rules) {
     else if (STEAM_PREFLIGHT_ENABLED && decision.preflightVerdict === 'MANUAL_REVIEW') decision.nextAction = candidateManualEvidenceNextAction_(actionRec, decision, candidateExternalSignalIsNew_(decision));
     else if (STEAM_PREFLIGHT_ENABLED && decision.preflightVerdict === 'WATCH') decision.nextAction = 'Recheck';
     else if (STEAM_PREFLIGHT_ENABLED && (!decision.preflightVerdict || decision.preflightVerdict === 'PENDING' || decision.preflightVerdict === 'PREFLIGHT_ERROR')) decision.nextAction = 'Automatic Preflight';
-    else if (!decision.nextAction || (decision.nextAction === 'Keyword Research' && decision.researchStatus === '待研究')) decision.nextAction = candidateManualEvidenceNextAction_(actionRec, decision, candidateExternalSignalIsNew_(decision));
-    if (decision.status && decision.status !== decision.lastCheckedStatus) {
+    else if (!decision.nextAction || decision.nextAction === 'Automatic Preflight' ||
+        (decision.nextAction === 'Keyword Research' && decision.researchStatus === '待研究')) {
+      decision.nextAction = candidateManualEvidenceNextAction_(actionRec, decision, candidateExternalSignalIsNew_(decision));
+    }    if (decision.status && decision.status !== decision.lastCheckedStatus) {
       decision.lastCheckedDate = runTime;
       decision.lastGain = rec.gain7d;
       decision.lastType = rec.firstRoundType;
@@ -11497,23 +11584,9 @@ function decideTodayActionProjection_(rec, decision, today, rules, ss, siteCompl
   const status = normalizeDecisionStatus_(decision && decision.status);
   if (status === 'REJECT') return {include: false, reason: 'Decision=REJECT，只保留在候选决策历史账本'};
   if (status === 'BUILD') {
-    const complete = findSitePoolSiteCreationComplete_(
-      siteCompletionIndex,
-      decision && (decision.appId || (rec && rec.appId)),
-      decision && decision.opportunityId
-    );
-    if (complete) {
-      return {
-        include: false,
-        reason: 'Site Creation已完成（站点项目池），不再进入今日行动 BUILD 队列'
-      };
-    }
     return {
-      include: true,
-      isCompleted: true,
-      type: 'BUILD',
-      humanAction: '进入 Site Creation',
-      reason: 'Decision=BUILD，展示机器决定与推荐域名'
+      include: false,
+      reason: 'Decision=BUILD，保留在候选决策/站点项目池，不再进入今日行动'
     };
   }
   // Pending and failed work stay in the candidate queue; only completed
@@ -11625,18 +11698,26 @@ function refreshTodayActionsFromCandidateDecisions_(spreadsheet, runTime, runId,
   }
   sampledActions.sort(compareActions_);
 
-  const summaryCounts = Object.assign({
-    discoveredCount: masterRecords.size,
-    historyExcludedCount: handledExcludedCount,
-    pass1ACount: Array.from(masterRecords.values()).filter(rec => rec.continueNext === '是').length,
-    trendCount: Array.from(masterRecords.values()).filter(rec => rec.firstRoundType === '🔥 趋势候选').length,
-    earlyCount: Array.from(masterRecords.values()).filter(rec => rec.firstRoundType === '🌱 Early候选').length,
-    controlCount: Array.from(masterRecords.values()).filter(rec => rec.firstRoundType === '🏢 大盘对照').length,
-    p2TrendCount: Array.from(masterRecords.values()).filter(rec => rec.firstRoundType === '🟡 Trend Watch').length,
-    p2EarlyCount: Array.from(masterRecords.values()).filter(rec => rec.firstRoundType === '🟢 Early Watch').length,
-    anomalyCount: 0
-  }, counts || {});
-  refreshTodayAction_(ss, sampledActions, now, runId || todayActionRefreshRunId_(ss, now), summaryCounts);
+  const runCountsProvided = todayActionHasRunCounts_(counts);
+  const preservedSummary = readTodayActionSummaryCounts_(actionSheet);
+  const preservedRunId = readTodayActionRunId_(actionSheet);
+  const summaryCounts = runCountsProvided
+    ? Object.assign({}, counts)
+    : (preservedSummary || {
+      discoveredCount: '',
+      historyExcludedCount: '',
+      pass1ACount: '',
+      trendCount: '',
+      earlyCount: '',
+      controlCount: ''
+    });
+  refreshTodayAction_(
+    ss,
+    sampledActions,
+    now,
+    runId || preservedRunId || todayActionRefreshRunId_(ss, now),
+    summaryCounts
+  );
   if (typeof Logger !== 'undefined' && Logger.log && (handledExcludedCount || buildCompletedExcludedCount)) {
     Logger.log(JSON.stringify({
       todayActionHandledReasonBreakdown: handledReasonBreakdown,
@@ -11705,10 +11786,9 @@ function limitTodayActionSamples_(actions, rules) {
   pending.forEach(rec => {
     if (rec.firstRoundType === '🏢 大盘对照' && !selectedSet.has(rec)) selected.push(rec);
   });
-  // BUILD is a completed machine decision, but remains visible as a handoff
-  // reference so the domain recommendation is actionable from 今日行动.
-  return dedupeTodayActionByAppId_(waiting.concat(selected).concat(pending.filter(rec =>
-    rec.todayAction && rec.todayAction.type === 'BUILD')));
+  // BUILD / REJECT stay in 候选决策 (and Site Pool for BUILD); never re-inject
+  // completed decisions into the live Today Action queue.
+  return dedupeTodayActionByAppId_(waiting.concat(selected));
 }
 
 function dedupeTodayActionByAppId_(actions) {
@@ -11816,6 +11896,46 @@ function runBuildDecisionDomainRefresh() {
 function todayActionRefreshRunId_(ss, runTime) {
   const stamp = todayActionDateText_(runTime, ss).replace(/-/g, '') || 'unknown';
   return 'TODAY-ACTION-' + stamp;
+}
+
+function todayActionHasRunCounts_(counts) {
+  if (!counts || typeof counts !== 'object') return false;
+  return ['discoveredCount', 'historyExcludedCount', 'pass1ACount', 'trendCount', 'earlyCount', 'controlCount']
+    .some(key => counts[key] !== undefined && counts[key] !== null && counts[key] !== '');
+}
+
+function readTodayActionRunId_(sheet) {
+  if (!sheet || sheet.getMaxRows() < 2) return '';
+  try {
+    return String(sheet.getRange('B2').getDisplayValue ? sheet.getRange('B2').getDisplayValue() :
+      sheet.getRange('B2').getValues()[0][0] || '').trim();
+  } catch (err) {
+    return '';
+  }
+}
+
+function readTodayActionSummaryCounts_(sheet) {
+  if (!sheet || sheet.getMaxRows() < 2) return null;
+  try {
+    const value = a1 => {
+      const range = sheet.getRange(a1);
+      if (range.getDisplayValue) return range.getDisplayValue();
+      return range.getValues()[0][0];
+    };
+    const runId = String(value('B2') || '').trim();
+    const discovered = value('F2');
+    if (!runId && (discovered === '' || discovered == null)) return null;
+    return {
+      discoveredCount: discovered,
+      historyExcludedCount: value('H2'),
+      pass1ACount: value('J2'),
+      trendCount: value('L2'),
+      earlyCount: value('N2'),
+      controlCount: value('P2')
+    };
+  } catch (err) {
+    return null;
+  }
 }
 
 function countTodayActionRows_(sheet) {

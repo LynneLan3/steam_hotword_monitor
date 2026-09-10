@@ -257,7 +257,7 @@ var pendingProjection = sandbox.decideTodayActionProjection_(
   {status: 'BUILD', appId: '5000001'},
   new Date('2026-09-05T08:00:00Z'), {}, spreadsheet, index
 );
-assert(pendingProjection.include === true && pendingProjection.type === 'BUILD', 'pending BUILD remains visible');
+assert(pendingProjection.include === false, 'BUILD no longer enters Today Action');
 
 masterRows.push(master('4513480', 'Scarlet Skips'));
 decisionRows.push(decision('4513480', 'Scarlet Skips'));
@@ -318,7 +318,7 @@ function find(appId) {
 assert(!find('4356430'), 'NBA 2K27 disappears from 今日行动');
 assert(!find('3219630'), 'Halloween: The Game disappears from 今日行动');
 assert(!find('3848900'), 'Sucker disappears after backfill');
-assert(find('5000001'), 'unbuilt BUILD remains');
+assert(!find('5000001'), 'unbuilt BUILD stays out of 今日行动');
 assert(find('2445260') && find('2445260')[actionHeaders.indexOf('行动类型')] === 'WATCH_WAITING', 'Tyr stays WATCH');
 
 var halloweenDecision = spreadsheet.getSheetByName('候选决策').rows.find(function (candidate) {
