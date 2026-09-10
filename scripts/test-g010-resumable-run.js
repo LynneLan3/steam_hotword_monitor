@@ -39,7 +39,8 @@ assert(recovery.state.nextPage === 13, 'failed page remains nextPage=13');
 assert(recovery.state.runId === '20260830-142107', '403 recovery keeps original Run ID');
 assert(recovery.continuationDelayMs >= 180000, '403 recovery is delayed');
 assert(source.indexOf("g010UpsertAuditRow_(ss, state, 'PARTIAL'") >= 0, 'PARTIAL run upserts audit row');
-assert(source.indexOf('state.nextPage += 1; g010WriteState_(state);') >= 0, 'successful recovery advances after page write');
+assert(source.indexOf('state.nextPage += 1;') >= 0 && source.indexOf('g010WriteState_(state);') >= 0,
+  'successful recovery advances after page write');
 assert(source.indexOf("targetRunId = '20260830-142107'") >= 0, 'manual recovery targets confirmed Run ID');
 assert(source.indexOf("targetPage = 13") >= 0, 'manual recovery targets failed page 13');
 assert(source.indexOf("function stopG010CurrentRun()") >= 0, 'stop action exists');
@@ -55,4 +56,9 @@ assert(healthy.health === 'HEALTHY' && healthy.action === 'KEEP', 'recent progre
 assert(source.indexOf('g010RearmContinuation_') >= 0, 'stale recovery helper exists');
 assert(source.indexOf('oldTriggers.forEach(trigger => ScriptApp.deleteTrigger(trigger));') >= 0,
   'stale re-arm deletes old triggers after create');
+assert(source.indexOf('function runG010Supervisor_') >= 0, 'supervisor recovers orphaned active runs');
+assert(source.indexOf("G010_ACTIVE_PHASES = ['DISCOVERY', 'ELIGIBILITY', 'ENRICHMENT']") >= 0,
+  'kick/supervisor cover discovery and enrichment');
+assert(source.indexOf('g010HasTimeForExpensiveOp_') >= 0, 'remaining-time guard exists');
+assert(sandbox.g010ShouldYield_(0, 240000), 'budget helper still yields at 240s');
 console.log('PASS scripts/test-g010-resumable-run.js (discovery yield, Run ID, eligibility transition, UNCHANGED skip, enrichment yield, DONE cleanup)');

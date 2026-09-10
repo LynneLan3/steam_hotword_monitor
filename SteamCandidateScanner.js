@@ -336,7 +336,9 @@ const G010_DISCOVERY_TARGET_UNIQUE = 250;
 const G010_PAGE_RECOVERY_MAX_ATTEMPTS = 3;
 const G010_PAGE_RECOVERY_WINDOW_MS = 30 * 60 * 1000;
 const G010_ENRICHMENT_CHUNK_SIZE = 35;
-const G010_EXECUTION_BUDGET_MS = 330000;
+// Soft segment budget. Leave a real reserve before Apps Script's hard ~6min cut.
+const G010_EXECUTION_BUDGET_MS = 240000;
+const G010_REMAINING_TIME_RESERVE_MS = 75000;
 const G010_STATE_KEYS = {
   runId: 'G010_RUN_ID', phase: 'G010_PHASE', source: 'G010_SOURCE',
   nextPage: 'G010_NEXT_PAGE', enrichmentCursor: 'G010_ENRICHMENT_CURSOR',
@@ -351,12 +353,15 @@ const G010_STATE_KEYS = {
   ledgerAppended: 'G010_RAW_LEDGER_APPENDED', ledgerDuplicates: 'G010_RAW_LEDGER_DUPLICATES'
 };
 const G010_CONTINUATION_HANDLER = 'runG010Continuation_';
+const G010_SUPERVISOR_HANDLER = 'runG010Supervisor_';
 const G010_DAILY_HANDLER = 'runSteamHotwordDaily_';
 const G010_403_CONTINUATION_DELAY_MS = 3 * 60 * 1000;
 const G010_ENRICHMENT_CONTINUATION_DELAY_MS = 45 * 1000;
 const G010_CONTINUATION_STALE_MS = 10 * 60 * 1000;
 const G010_CONTINUATION_TTL_MS = 12 * 60 * 60 * 1000;
+const G010_SUPERVISOR_EVERY_MINUTES = 5;
 const G010_ABANDON_RUN_IDS = ['20260831-084334'];
+const G010_ACTIVE_PHASES = ['DISCOVERY', 'ELIGIBILITY', 'ENRICHMENT'];
 
 
 // ============================================================================
@@ -391,6 +396,10 @@ function doGet(e) {
   }
   if (action === 'g010ContinueSegment') {
     return ContentService.createTextOutput(JSON.stringify(g010ContinueActiveRunOnce_()))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+  if (action === 'g010ReadState') {
+    return ContentService.createTextOutput(JSON.stringify(g010ReadStateReadback_()))
       .setMimeType(ContentService.MimeType.JSON);
   }
   if (action === 'g022Readback') {
@@ -437,6 +446,16 @@ function doGet(e) {
     const refresh = refreshTodayActionsFromCandidateDecisions_(ss);
     return ContentService
       .createTextOutput(JSON.stringify(Object.assign({}, refresh, {reconcile: reconcile})))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+  if (action === 'reconcileSteamCandidateResearchPendingBacklogProduction') {
+    return ContentService
+      .createTextOutput(JSON.stringify(reconcileSteamCandidateResearchPendingBacklogProduction()))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+  if (action === 'inspectSteamCandidateResearchPendingBacklogProduction') {
+    return ContentService
+      .createTextOutput(JSON.stringify(inspectSteamCandidateResearchPendingBacklogProduction()))
       .setMimeType(ContentService.MimeType.JSON);
   }
   if (action === 'reconcileBuildSitePoolProduction') {
@@ -2941,6 +2960,20 @@ function inspectSteamCandidateResearchPendingBacklog() {
   return inspectSteamCandidateResearchPendingBacklog_(SpreadsheetApp.getActiveSpreadsheet());
 }
 
+/** Production entry: open the live workbook by ID, then reconcile + refresh Today Action. */
+function reconcileSteamCandidateResearchPendingBacklogProduction() {
+  return reconcileSteamCandidateResearchPendingBacklog_(
+    SpreadsheetApp.openById(QUALIFICATION_ELIGIBILITY_PRODUCTION_SHEET_ID)
+  );
+}
+
+/** Production read-only preview of pending close/preserve counts. */
+function inspectSteamCandidateResearchPendingBacklogProduction() {
+  return inspectSteamCandidateResearchPendingBacklog_(
+    SpreadsheetApp.openById(QUALIFICATION_ELIGIBILITY_PRODUCTION_SHEET_ID)
+  );
+}
+
 function backfillMachineRecommendationReasons_(ss) {
   const sheet = ss.getSheetByName(HOTWORD_V2.sheets.decisions);
   const result = {updated: 0, rows: []};
@@ -4509,6 +4542,16 @@ function g010ShouldYield_(startedAtMs, nowMs) {
   return Number(nowMs) - Number(startedAtMs) >= G010_EXECUTION_BUDGET_MS;
 }
 
+function g010RemainingMs_(startedAtMs, nowMs) {
+  return (Number(startedAtMs) + G010_EXECUTION_BUDGET_MS) - Number(nowMs);
+}
+
+/** True when enough soft-budget remains to start an expensive op (Steam/GP/sheet). */
+function g010HasTimeForExpensiveOp_(startedAtMs, nowMs, reserveMs) {
+  const reserve = reserveMs == null ? G010_REMAINING_TIME_RESERVE_MS : Number(reserveMs);
+  return g010RemainingMs_(startedAtMs, nowMs) >= reserve;
+}
+
 function g010ContinuationState_(state) {
   return Object.assign({}, state, {runId: state.runId});
 }
@@ -4564,15 +4607,98 @@ function g010ContinueActiveRunOnce_() {
   return runG010Continuation_();
 }
 
+function g010IsActiveResumablePhase_(phase) {
+  return G010_ACTIVE_PHASES.indexOf(String(phase || '').toUpperCase()) >= 0;
+}
+
+/** Lightweight readback for recovery: ScriptProperties + trigger health. */
+function g010ReadStateReadback_() {
+  const state = g010ReadState_();
+  const triggers = ScriptApp.getProjectTriggers();
+  const continuation = triggers.filter(trigger => trigger.getHandlerFunction() === G010_CONTINUATION_HANDLER);
+  const supervisor = triggers.filter(trigger => trigger.getHandlerFunction() === G010_SUPERVISOR_HANDLER);
+  return {
+    state: state,
+    continuationTriggerCount: continuation.length,
+    supervisorTriggerCount: supervisor.length,
+    codeMarkers: {
+      executionBudgetMs: G010_EXECUTION_BUDGET_MS,
+      remainingReserveMs: G010_REMAINING_TIME_RESERVE_MS,
+      supervisorHandler: G010_SUPERVISOR_HANDLER
+    }
+  };
+}
+
+/**
+ * Repair missing continuation for any active G010 phase.
+ * Does not start a new daily Run.
+ */
 function g010MaybeKickPartialRun_() {
   const state = g010ReadState_();
-  if (!state || String(state.phase || '').toUpperCase() !== 'ENRICHMENT') return {kicked: false};
+  if (!state) return {kicked: false, reason: 'no-active-state'};
+  if (!g010IsActiveResumablePhase_(state.phase)) {
+    return {kicked: false, reason: 'terminal-or-unsupported-phase', phase: state.phase, runId: state.runId};
+  }
+  g010EnsureSupervisorTrigger_();
   const triggers = ScriptApp.getProjectTriggers().filter(trigger =>
     trigger.getHandlerFunction() === G010_CONTINUATION_HANDLER
   );
-  if (triggers.length) return {kicked: false, triggerCount: triggers.length};
+  if (triggers.length) {
+    return {
+      kicked: false, reason: 'continuation-present', triggerCount: triggers.length,
+      runId: state.runId, phase: state.phase, nextPage: state.nextPage,
+      enrichmentCursor: state.enrichmentCursor
+    };
+  }
   g010RearmContinuationForPhase_(state.phase);
-  return {kicked: true, runId: state.runId, enrichmentCursor: state.enrichmentCursor};
+  return {
+    kicked: true, runId: state.runId, phase: state.phase,
+    nextPage: state.nextPage, enrichmentCursor: state.enrichmentCursor
+  };
+}
+
+/**
+ * Recurring recovery only: if an incomplete active G010 state exists and no
+ * owner holds ScriptLock, run one continuation segment. Never starts a new Run.
+ */
+function runG010Supervisor_() {
+  const state = g010ReadState_();
+  if (!state) return {status: 'IDLE', reason: 'no-active-state'};
+  if (!g010IsActiveResumablePhase_(state.phase)) {
+    return {status: 'IDLE', reason: 'terminal-or-unsupported-phase', phase: state.phase, runId: state.runId};
+  }
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(1000)) {
+    return {status: 'SKIPPED', reason: 'LOCKED', runId: state.runId, phase: state.phase};
+  }
+  lock.releaseLock();
+  // Owner path acquires its own lock inside runSteamHotword01B.
+  return runG010Continuation_();
+}
+
+function g010EnsureSupervisorTrigger_() {
+  const existing = ScriptApp.getProjectTriggers().filter(trigger =>
+    trigger.getHandlerFunction() === G010_SUPERVISOR_HANDLER
+  );
+  existing.slice(1).forEach(trigger => ScriptApp.deleteTrigger(trigger));
+  if (existing.length) return {created: false, count: 1};
+  ScriptApp.newTrigger(G010_SUPERVISOR_HANDLER).timeBased()
+    .everyMinutes(G010_SUPERVISOR_EVERY_MINUTES).create();
+  return {created: true, count: 1};
+}
+
+/** One-time current-run index for a discovery segment (not per page). */
+function g010InitDiscoverySegmentIndex_(ss, runId) {
+  const rawRecords = g010RawRecordsForRun_(ss, runId);
+  return {
+    seenAppIds: new Set(rawRecords.map(rec => String(rec.appId))),
+    rawRecords: rawRecords,
+    previousRawIndex: g010PreviousRawIndex_(ss, runId),
+    existingObservationIds: null,
+    snapshotFullScans: 1,
+    previousIndexScans: 1,
+    ledgerFullScans: 0
+  };
 }
 
 function g010RawRecordsForRun_(ss, runId) {
@@ -4721,19 +4847,25 @@ function g010HistoricalRawLedgerRow_(rec, runTime, runId, source) {
 }
 
 /** Append-only batch writer. It only examines identities from the current Run. */
-function g010AppendHistoricalRawLedger_(records, runTime, runId) {
+function g010AppendHistoricalRawLedger_(records, runTime, runId, options) {
+  options = options || {};
   const ledger = g010EnsureHistoricalRawLedger_();
   const headers = HOTWORD_V2.historicalRawLedger.headers;
   const idColumn = headers.indexOf('Observation ID');
   const runColumn = headers.indexOf('Run ID');
-  const existing = new Set();
+  let existing = options.existingObservationIds;
+  let scannedLedgerForDuplicates = false;
   const sheet = ledger.sheet;
-  if (sheet.getLastRow() >= 2) {
-    const rowCount = sheet.getLastRow() - 1;
-    const values = sheet.getRange(2, 1, rowCount, Math.max(idColumn, runColumn) + 1).getDisplayValues();
-    values.forEach(row => {
-      if (String(row[runColumn] || '').trim() === String(runId)) existing.add(String(row[idColumn] || '').trim());
-    });
+  if (!existing) {
+    existing = new Set();
+    if (sheet.getLastRow() >= 2) {
+      scannedLedgerForDuplicates = true;
+      const rowCount = sheet.getLastRow() - 1;
+      const values = sheet.getRange(2, 1, rowCount, Math.max(idColumn, runColumn) + 1).getDisplayValues();
+      values.forEach(row => {
+        if (String(row[runColumn] || '').trim() === String(runId)) existing.add(String(row[idColumn] || '').trim());
+      });
+    }
   }
   const rows = [];
   let duplicates = 0;
@@ -4748,7 +4880,14 @@ function g010AppendHistoricalRawLedger_(records, runTime, runId) {
     rows.push(g010HistoricalRawLedgerRow_(rec, runTime, runId, source));
   });
   if (rows.length) sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, headers.length).setValues(rows);
-  return {appended: rows.length, duplicates: duplicates, spreadsheetId: ledger.id, spreadsheetUrl: ledger.url};
+  return {
+    appended: rows.length,
+    duplicates: duplicates,
+    spreadsheetId: ledger.id,
+    spreadsheetUrl: ledger.url,
+    existingObservationIds: existing,
+    scannedLedgerForDuplicates: scannedLedgerForDuplicates
+  };
 }
 
 function ensureOpportunityPreflightColumns_(sheet) {
@@ -4769,10 +4908,11 @@ function ensureOpportunityPreflightColumns_(sheet) {
   return {headers: headers, width: lastColumn};
 }
 
-function g010AppendRawPage_(ss, records, runTime, runId) {
+function g010AppendRawPage_(ss, records, runTime, runId, options) {
+  options = options || {};
   const sheet = ss.getSheetByName(HOTWORD_V2.sheets.snapshot);
   ensureOpportunityPreflightColumns_(sheet);
-  const previousRaw = g010PreviousRawIndex_(ss, runId);
+  const previousRaw = options.previousRawIndex || g010PreviousRawIndex_(ss, runId);
   (records || []).forEach(rec => {
     const preflight = firstSeenOpportunityPreflight_(rec, previousRaw.get(String(rec.appId)));
     rec.opportunityPreflightStatus = preflight.status;
@@ -4782,11 +4922,16 @@ function g010AppendRawPage_(ss, records, runTime, runId) {
   const headers = sheet.getRange(1, 1, 1, width).getDisplayValues()[0];
   const runCol = headers.indexOf('Run ID');
   const appIdCol = headers.indexOf('Steam App ID');
-  const seen = new Set();
-  if (sheet.getLastRow() >= 2 && runCol >= 0 && appIdCol >= 0) {
-    sheet.getRange(2, 1, sheet.getLastRow() - 1, width).getValues().forEach(row => {
-      if (String(row[runCol] || '').trim() === String(runId)) seen.add(String(row[appIdCol] || '').trim());
-    });
+  let seen = options.seenAppIds;
+  let scannedSnapshotForSeen = false;
+  if (!seen) {
+    seen = new Set();
+    if (sheet.getLastRow() >= 2 && runCol >= 0 && appIdCol >= 0) {
+      scannedSnapshotForSeen = true;
+      sheet.getRange(2, 1, sheet.getLastRow() - 1, width).getValues().forEach(row => {
+        if (String(row[runCol] || '').trim() === String(runId)) seen.add(String(row[appIdCol] || '').trim());
+      });
+    }
   }
   const unique = (records || []).filter(rec => {
     const id = String(rec.appId || '').trim();
@@ -4794,13 +4939,20 @@ function g010AppendRawPage_(ss, records, runTime, runId) {
     seen.add(id);
     return true;
   });
-  if (!unique.length) return {persisted: 0, rowByAppId: {}};
+  if (!unique.length) {
+    return {persisted: 0, rowByAppId: {}, seenAppIds: seen, scannedSnapshotForSeen: scannedSnapshotForSeen};
+  }
   const firstRow = sheet.getLastRow() + 1;
   sheet.getRange(firstRow, 1, unique.length, snapshotRow_(unique[0], runTime, runId).length)
     .setValues(unique.map(rec => snapshotRow_(rec, runTime, runId)));
   const rowByAppId = {};
   unique.forEach((rec, index) => { rowByAppId[String(rec.appId)] = firstRow + index; });
-  return {persisted: unique.length, rowByAppId: rowByAppId};
+  return {
+    persisted: unique.length,
+    rowByAppId: rowByAppId,
+    seenAppIds: seen,
+    scannedSnapshotForSeen: scannedSnapshotForSeen
+  };
 }
 
 function g010EnrichChunk_(ss, records, runId, runTime, warnings, runContext) {
@@ -4813,6 +4965,12 @@ function g010EnrichChunk_(ss, records, runId, runTime, warnings, runContext) {
   partition.hits.forEach(rec => { rec._gpDailyCache = cache.get(String(rec.appId)); });
   gpStats.cacheHits = Number(gpStats.cacheHits || 0) + partition.hits.length;
   const context = {ss: ss, runId: runId, runTime: runTime, refreshReason: 'POLICY_MISS', attemptBuffer: []};
+  const segmentStartedAt = runContext && runContext.segmentStartedAtMs != null
+    ? runContext.segmentStartedAtMs
+    : (runTime instanceof Date ? runTime.getTime() : Date.now());
+  if (partition.misses.length && !g010HasTimeForExpensiveOp_(segmentStartedAt, Date.now())) {
+    throw new Error('G010_YIELD_BEFORE_GP_BATCH');
+  }
   const latestMap = fetchGamesPopularityLatestBatch_(partition.misses, gpKey, warnings, gpStats, context);
   records.forEach(rec => {
     if (rec._gpDailyCache) {
@@ -4840,6 +4998,9 @@ function g010EnrichChunk_(ss, records, runId, runTime, warnings, runContext) {
   const released = records.filter(rec => rec.releaseStage === '已发售' && isFiniteNumber_(Number(rec.daysToRelease)) &&
     Math.abs(Number(rec.daysToRelease)) <= Number(rules.RELEASED_DAYS_MAX) &&
     (!isFiniteNumber_(rec.reviews) || !isFiniteNumber_(rec.rating)));
+  if (released.length && !g010HasTimeForExpensiveOp_(segmentStartedAt, Date.now())) {
+    throw new Error('G010_YIELD_BEFORE_REVIEW_BATCH');
+  }
   const reviews = fetchSteamReviewSummaryBatch_(released, warnings);
   released.forEach(rec => {
     const summary = reviews.get(rec.appId);
@@ -4972,19 +5133,21 @@ function runSteamHotword01B(options) {
       g010WriteState_(state);
     }
     ensureSteamHotwordV2ForRun_(ss, {fullSetup: false});
-    if (state && !options.forceNewRun && (state.phase === 'ENRICHMENT' || Number(state.enrichmentCursor) > 0)) {
+    try { g010EnsureSupervisorTrigger_(); } catch (supervisorErr) { /* non-blocking */ }
+    if (state && !options.forceNewRun && g010IsActiveResumablePhase_(state.phase)) {
       const pendingTriggers = ScriptApp.getProjectTriggers().filter(trigger =>
         trigger.getHandlerFunction() === G010_CONTINUATION_HANDLER
       );
       if (!pendingTriggers.length) g010RearmContinuationForPhase_(state.phase);
     }
+    let discoveryIndex = null;
     auditMetrics = function () {
       if (!runContext && (state.phase === 'ENRICHMENT' || state.enrichmentCursor > 0 || state.controlCursor > 0 || state.phase === 'ELIGIBILITY')) {
         runContext = g010BuildRunContext_(ss, state, startedAt, tz);
       } else if (!runContext && state.phase === 'DISCOVERY' && state.nextPage > 1) {
-        const rawOnly = g010RawRecordsForRun_(ss, state.runId);
+        if (!discoveryIndex) discoveryIndex = g010InitDiscoverySegmentIndex_(ss, state.runId);
         return g010RunMetrics_(state, {
-          rawRecords: rawOnly, eligible: [], historyExcluded: 0, stats: g010EmptyRunStats_()
+          rawRecords: discoveryIndex.rawRecords, eligible: [], historyExcluded: 0, stats: g010EmptyRunStats_()
         }, startedAt, state.runStartedAt);
       }
       return g010RunMetrics_(state, runContext, startedAt, state.runStartedAt);
@@ -5007,6 +5170,8 @@ function runSteamHotword01B(options) {
           continue;
         }
         if (Number(state.nextRetryAt || 0) > Date.now()) break;
+        // Do not start Steam fetch / ledger / snapshot work inside the reserve window.
+        if (!g010HasTimeForExpensiveOp_(startedAt.getTime(), Date.now())) break;
         const url = state.nextPage === 1
           ? source.url
           : source.url + (source.url.indexOf('?') >= 0 ? '&' : '?') + 'page=' + state.nextPage;
@@ -5075,7 +5240,13 @@ function runSteamHotword01B(options) {
           g010WriteState_(state);
           continue;
         }
-        const seenAppIds = new Set(g010RawRecordsForRun_(ss, state.runId).map(rec => String(rec.appId)));
+        if (!g010HasTimeForExpensiveOp_(startedAt.getTime(), Date.now())) {
+          // Page was fetched but reserve is gone: yield before large sheet/ledger writes.
+          // nextPage stays put so continuation retries this page; appends are idempotent.
+          break;
+        }
+        if (!discoveryIndex) discoveryIndex = g010InitDiscoverySegmentIndex_(ss, state.runId);
+        const seenAppIds = discoveryIndex.seenAppIds;
         const records = items.map((item, idx) => {
           item._sourceRank = (state.nextPage - 1) * 50 + idx + 1; item._sourcePage = state.nextPage;
           const rec = createCandidateRecord_({appId: String(item.appId), name: item.name, url: item.url,
@@ -5096,7 +5267,11 @@ function runSteamHotword01B(options) {
           if (options.fromContinuation && !g010ContinuationOwnsActiveRun_(state)) {
             return {status: 'SKIPPED', runId: state.runId, reason: 'stale-continuation-before-raw-write'};
           }
-          const ledgerResult = g010AppendHistoricalRawLedger_(records, startedAt, state.runId);
+          const ledgerResult = g010AppendHistoricalRawLedger_(records, startedAt, state.runId, {
+            existingObservationIds: discoveryIndex.existingObservationIds
+          });
+          discoveryIndex.existingObservationIds = ledgerResult.existingObservationIds;
+          if (ledgerResult.scannedLedgerForDuplicates) discoveryIndex.ledgerFullScans += 1;
           state.ledgerAppended = Math.max(0, Number(state.ledgerAppended || 0)) + ledgerResult.appended;
           state.ledgerDuplicates = Math.max(0, Number(state.ledgerDuplicates || 0)) + ledgerResult.duplicates;
         } catch (ledgerErr) {
@@ -5108,14 +5283,22 @@ function runSteamHotword01B(options) {
         if (options.fromContinuation && !g010ContinuationOwnsActiveRun_(state)) {
           return {status: 'SKIPPED', runId: state.runId, reason: 'stale-continuation-before-snapshot-write'};
         }
-        g010AppendRawPage_(ss, records, startedAt, state.runId);
+        const appendResult = g010AppendRawPage_(ss, records, startedAt, state.runId, {
+          seenAppIds: discoveryIndex.seenAppIds,
+          previousRawIndex: discoveryIndex.previousRawIndex
+        });
+        if (appendResult.scannedSnapshotForSeen) discoveryIndex.snapshotFullScans += 1;
+        if (appendResult.persisted) {
+          records.forEach(rec => {
+            if (appendResult.rowByAppId[String(rec.appId)]) discoveryIndex.rawRecords.push(rec);
+          });
+        }
         if (ledgerErrorMessage) {
-          const rawAfterFailure = g010RawRecordsForRun_(ss, state.runId);
           g010UpsertAuditRow_(ss, state, 'PARTIAL',
             'RAW_LEDGER_WRITE_FAILED source=' + state.source + ' page=' + state.nextPage +
             ' (business raw persisted; discovery will not be repeated) | ' + ledgerErrorMessage,
             g010RunMetrics_(state, {
-              rawRecords: rawAfterFailure, eligible: [], historyExcluded: 0, stats: g010EmptyRunStats_()
+              rawRecords: discoveryIndex.rawRecords, eligible: [], historyExcluded: 0, stats: g010EmptyRunStats_()
             }, startedAt, state.runStartedAt));
         }
         g010RecordDiscoveryPage_(state, source.name, state.nextPage, items.length, newCount);
@@ -5145,7 +5328,11 @@ function runSteamHotword01B(options) {
         continue;
       }
       if (state.phase === 'ENRICHMENT') {
-        if (!runContext) runContext = g010BuildRunContext_(ss, state, startedAt, tz);
+        if (!runContext) {
+          if (!g010HasTimeForExpensiveOp_(startedAt.getTime(), Date.now())) break;
+          runContext = g010BuildRunContext_(ss, state, startedAt, tz);
+          runContext.segmentStartedAtMs = startedAt.getTime();
+        }
         const eligible = runContext.eligible;
         const controls = runContext.controls;
         if (state.enrichmentCursor >= eligible.length && state.controlCursor >= controls.length) {
@@ -5155,20 +5342,27 @@ function runSteamHotword01B(options) {
           const result = g010FinalizeRun_(ss, state, runContext, startedAt, discoveryPartial);
           return Object.assign({eligible: eligible.length, rawUnique: runContext.rawRecords.length, discoveryPartial: discoveryPartial}, result);
         }
-        if (state.enrichmentCursor < eligible.length) {
-          const chunk = eligible.slice(state.enrichmentCursor, state.enrichmentCursor + G010_ENRICHMENT_CHUNK_SIZE);
-          g010EnrichChunk_(ss, chunk, state.runId, startedAt, warnings, runContext);
-          state.enrichmentCursor += chunk.length;
-        } else {
-          const chunk = controls.slice(state.controlCursor, state.controlCursor + G010_ENRICHMENT_CHUNK_SIZE);
-          g010EnrichControlChunk_(ss, chunk, state.runId, startedAt, warnings, runContext);
-          state.controlCursor += chunk.length;
-          state.controlData = state.controlData || {};
-          chunk.forEach(rec => { state.controlData[String(rec.appId)] = {
-            followers: rec.followers, baselineFollowers: rec.baselineFollowers, gain7d: rec.gain7d,
-            growthRate: rec.growthRate, coverageDays: rec.coverageDays,
-            _gpEnrichmentFresh: rec._gpEnrichmentFresh, _gpEnrichmentFailed: rec._gpEnrichmentFailed
-          }; });
+        if (!g010HasTimeForExpensiveOp_(startedAt.getTime(), Date.now())) break;
+        try {
+          if (state.enrichmentCursor < eligible.length) {
+            const chunk = eligible.slice(state.enrichmentCursor, state.enrichmentCursor + G010_ENRICHMENT_CHUNK_SIZE);
+            g010EnrichChunk_(ss, chunk, state.runId, startedAt, warnings, runContext);
+            state.enrichmentCursor += chunk.length;
+          } else {
+            const chunk = controls.slice(state.controlCursor, state.controlCursor + G010_ENRICHMENT_CHUNK_SIZE);
+            g010EnrichControlChunk_(ss, chunk, state.runId, startedAt, warnings, runContext);
+            state.controlCursor += chunk.length;
+            state.controlData = state.controlData || {};
+            chunk.forEach(rec => { state.controlData[String(rec.appId)] = {
+              followers: rec.followers, baselineFollowers: rec.baselineFollowers, gain7d: rec.gain7d,
+              growthRate: rec.growthRate, coverageDays: rec.coverageDays,
+              _gpEnrichmentFresh: rec._gpEnrichmentFresh, _gpEnrichmentFailed: rec._gpEnrichmentFailed
+            }; });
+          }
+        } catch (enrichErr) {
+          const enrichMessage = String(enrichErr && enrichErr.message || enrichErr || '');
+          if (/^G010_YIELD_BEFORE_/.test(enrichMessage)) break;
+          throw enrichErr;
         }
         state.updatedAt = Date.now();
         g010WriteState_(state);
@@ -11742,6 +11936,7 @@ function installDailyHotwordTrigger() {
     .everyDays(1)
     .atHour(Math.max(0, Math.min(23, Math.floor(Number(rules.DAILY_HOUR || 8)))))
     .create();
+  g010EnsureSupervisorTrigger_();
 
   safeToast_('每日自动任务已安装。以后只需查看“今日行动”。', 'Steam 0→1B', 7);
 }

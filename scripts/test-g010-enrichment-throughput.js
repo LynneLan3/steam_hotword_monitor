@@ -9,7 +9,7 @@ var source = fs.readFileSync(path.join(__dirname, '..', 'SteamCandidateScanner.j
 function assert(value, label) { if (!value) throw new Error(label); }
 
 assert(/const G010_ENRICHMENT_CHUNK_SIZE = 35/.test(source), 'enrichment chunk size increased');
-assert(/const G010_EXECUTION_BUDGET_MS = 330000/.test(source), 'execution budget extended to 5.5 min');
+assert(/const G010_EXECUTION_BUDGET_MS = 240000/.test(source), 'execution budget is 4 min with reserve');
 assert(/function ensureSteamHotwordV2ForRun_/.test(source), 'minimal setup path exists');
 assert(/ensureSteamHotwordV2ForRun_\(ss, \{fullSetup: false\}\)/.test(source), 'G010 uses minimal setup');
 assert(!/setupSteamHotwordV2\(\);[\s\S]{0,120}g010UpsertAuditRow_/.test(source), 'full setup not called in G010 path');

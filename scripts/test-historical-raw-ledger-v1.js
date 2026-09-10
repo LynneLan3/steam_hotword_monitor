@@ -118,6 +118,6 @@ const completion = sandbox.g010EvaluateRunCompletion_({
 assert.strictEqual(completion.status, 'PARTIAL', 'ledger failure cannot be reported as SUCCESS');
 assert(completion.issues.includes('RAW_LEDGER_WRITE_FAILED'), 'ledger failure has explicit run status');
 
-assert(source.indexOf('g010AppendHistoricalRawLedger_(records, startedAt, state.runId)') < source.indexOf('g010AppendRawPage_(ss, records, startedAt, state.runId)'),
+assert(source.indexOf('g010AppendHistoricalRawLedger_(records, startedAt, state.runId') < source.indexOf('g010AppendRawPage_(ss, records, startedAt, state.runId'),
   'daily order is ledger append before compatible business raw persistence');
 console.log('PASS scripts/test-historical-raw-ledger-v1.js');
